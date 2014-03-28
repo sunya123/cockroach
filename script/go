@@ -1,0 +1,5 @@
+#! /bin/bash
+
+# Wraps the go tool to set the required C go flags. 
+
+CGO_CFLAGS="-I../gorocks/rocksdb/include" CGO_LDFLAGS="-L../gorocks/rocksdb -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy" go "$@"

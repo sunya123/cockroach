@@ -24,3 +24,5 @@ _testmain.go
 *.exe
 
 .DS_Store
+
+disk/rocksdb/testdb
