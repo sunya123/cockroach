@@ -26,5 +26,6 @@ type Replica struct {
 }
 
 // DiskCapacity contains capacity information for a storage device.
+// TODO(shawn) replace with disk.Capacity
 type DiskCapacity struct {
 }

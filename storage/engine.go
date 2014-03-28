@@ -17,6 +17,8 @@
 
 package storage
 
+// TODO(shawn) replace this in favour of disk.KV
+
 // Engine is the interface that wraps the core operations of a
 // key/value store.
 type Engine interface {

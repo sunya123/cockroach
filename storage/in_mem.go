@@ -17,6 +17,8 @@
 
 package storage
 
+// TODO(shawn) replace this in favour of disk.mem
+
 import "sync"
 
 // InMem a simple, in-memory key-value store.

@@ -30,3 +30,5 @@ an engine for data stored to local disk using RocksDB, a variant of
 LevelDB.
 */
 package storage
+
+// TODO(shawn) propose renaming 'storage' to 'cluster'.

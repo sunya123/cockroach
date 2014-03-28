@@ -17,12 +17,14 @@
 
 package storage
 
+// TODO(shawn): migrate to the one's defined in package disk
 type Key []byte
 
 // Value specifies the value at a key. Multiple values at the same key
 // are supported based on timestamp. Values which have been overwritten
 // have an associated expiration, after which they will be permanently
 // deleted.
+// TODO(shawn): migrate to the one's defined in package disk
 type Value struct {
 	// Bytes is the byte string value.
 	Bytes []byte

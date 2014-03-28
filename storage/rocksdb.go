@@ -17,6 +17,8 @@
 
 package storage
 
+// TODO(shawn) replace this in favour of disk.rocksdb
+
 import (
 	"log"
 	"syscall"
