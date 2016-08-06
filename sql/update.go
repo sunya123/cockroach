@@ -23,8 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/privilege"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/tracing"
+	"github.com/pkg/errors"
 )
 
 // editNode (Base, Run) is shared between all row updating
@@ -39,7 +39,7 @@ type editNodeBase struct {
 	autoCommit bool
 }
 
-func (p *planner) makeEditNode(t parser.TableExpr, r parser.ReturningExprs, desiredTypes []parser.Datum, autoCommit bool, priv privilege.Kind) (editNodeBase, error) {
+func (p *planner) makeEditNode(t parser.TableExpr, autoCommit bool, priv privilege.Kind) (editNodeBase, error) {
 	tableDesc, err := p.getAliasedTableLease(t)
 	if err != nil {
 		return editNodeBase{}, err
@@ -49,14 +49,8 @@ func (p *planner) makeEditNode(t parser.TableExpr, r parser.ReturningExprs, desi
 		return editNodeBase{}, err
 	}
 
-	rh, err := p.makeReturningHelper(r, desiredTypes, tableDesc.Name, tableDesc.Columns)
-	if err != nil {
-		return editNodeBase{}, err
-	}
-
 	return editNodeBase{
 		p:          p,
-		rh:         rh,
 		tableDesc:  tableDesc,
 		autoCommit: autoCommit,
 	}, nil
@@ -66,29 +60,54 @@ func (p *planner) makeEditNode(t parser.TableExpr, r parser.ReturningExprs, desi
 // row-modifying statements.
 type editNodeRun struct {
 	rows      planNode
-	err       error
 	tw        tableWriter
 	resultRow parser.DTuple
-	done      bool
+
+	explain explainMode
 }
 
-func (r *editNodeRun) buildEditNodePlan(en *editNodeBase, rows planNode, tw tableWriter) {
+func (r *editNodeRun) initEditNode(en *editNodeBase, rows planNode, re parser.ReturningExprs, desiredTypes []parser.Datum) error {
+	r.rows = rows
+
+	rh, err := en.p.makeReturningHelper(re, desiredTypes, en.tableDesc.Name, en.tableDesc.Columns)
+	if err != nil {
+		return err
+	}
+	en.rh = rh
+
+	return nil
+}
+
+func (r *editNodeRun) expandEditNodePlan(en *editNodeBase, tw tableWriter) error {
+	if err := en.rh.expandPlans(); err != nil {
+		return err
+	}
+
 	if sqlbase.IsSystemConfigID(en.tableDesc.GetID()) {
 		// Mark transaction as operating on the system DB.
 		en.p.txn.SetSystemConfigTrigger()
 	}
 
-	r.rows = rows
+	if err := tw.expand(); err != nil {
+		return err
+	}
+
 	r.tw = tw
+	return r.rows.expandPlan()
+}
+
+func (r *editNodeRun) startEditNode() error {
+	if err := r.tw.start(); err != nil {
+		return err
+	}
+
+	return r.rows.Start()
 }
 
 type updateNode struct {
 	// The following fields are populated during makePlan.
 	editNodeBase
-	defaultExprs []parser.TypedExpr
-	n            *parser.Update
-	desiredTypes []parser.Datum
-
+	n             *parser.Update
 	updateCols    []sqlbase.ColumnDescriptor
 	updateColsIdx map[sqlbase.ColumnID]int // index in updateCols slice
 	tw            tableUpdater
@@ -108,18 +127,23 @@ type updateNode struct {
 func (p *planner) Update(n *parser.Update, desiredTypes []parser.Datum, autoCommit bool) (planNode, error) {
 	tracing.AnnotateTrace()
 
-	en, err := p.makeEditNode(n.Table, n.Returning, desiredTypes, autoCommit, privilege.UPDATE)
+	en, err := p.makeEditNode(n.Table, autoCommit, privilege.UPDATE)
 	if err != nil {
 		return nil, err
 	}
 
-	exprs := make([]parser.UpdateExpr, len(n.Exprs))
+	exprs := make([]*parser.UpdateExpr, len(n.Exprs))
 	for i, expr := range n.Exprs {
-		exprs[i] = *expr
+		// Replace the sub-query nodes.
+		newExpr, err := p.replaceSubqueries(expr.Expr, len(expr.Names))
+		if err != nil {
+			return nil, err
+		}
+		exprs[i] = &parser.UpdateExpr{Tuple: expr.Tuple, Expr: newExpr, Names: expr.Names}
 	}
 
 	// Determine which columns we're inserting into.
-	names, err := p.namesForExprs(n.Exprs)
+	names, err := p.namesForExprs(exprs)
 	if err != nil {
 		return nil, err
 	}
@@ -129,19 +153,23 @@ func (p *planner) Update(n *parser.Update, desiredTypes []parser.Datum, autoComm
 		return nil, err
 	}
 
-	defaultExprs, err := makeDefaultExprs(updateCols, &p.parser, p.evalCtx)
+	defaultExprs, err := makeDefaultExprs(updateCols, &p.parser, &p.evalCtx)
 	if err != nil {
 		return nil, err
 	}
 
 	var requestedCols []sqlbase.ColumnDescriptor
-	if len(en.rh.exprs) > 0 || len(en.tableDesc.Checks) > 0 {
+	if len(n.Returning) > 0 || len(en.tableDesc.Checks) > 0 {
 		// TODO(dan): This could be made tighter, just the rows needed for RETURNING
 		// exprs.
 		requestedCols = en.tableDesc.Columns
 	}
 
-	ru, err := makeRowUpdater(en.tableDesc, updateCols, requestedCols)
+	fkTables := TablesNeededForFKs(*en.tableDesc, CheckUpdates)
+	if err := p.fillFKTableMap(fkTables); err != nil {
+		return nil, err
+	}
+	ru, err := makeRowUpdater(p.txn, en.tableDesc, fkTables, updateCols, requestedCols, rowUpdaterDefault)
 	if err != nil {
 		return nil, err
 	}
@@ -160,9 +188,10 @@ func (p *planner) Update(n *parser.Update, desiredTypes []parser.Datum, autoComm
 	// Remember the index where the targets for exprs start.
 	exprTargetIdx := len(targets)
 	desiredTypesFromSelect := make([]parser.Datum, len(targets), len(targets)+len(exprs))
-	for _, expr := range n.Exprs {
+	for _, expr := range exprs {
 		if expr.Tuple {
-			if t, ok := expr.Expr.(*parser.Tuple); ok {
+			switch t := expr.Expr.(type) {
+			case (*parser.Tuple):
 				for _, e := range t.Exprs {
 					typ := updateCols[i].Type.ToDatumType()
 					e := fillDefault(e, typ, i, defaultExprs)
@@ -170,6 +199,8 @@ func (p *planner) Update(n *parser.Update, desiredTypes []parser.Datum, autoComm
 					desiredTypesFromSelect = append(desiredTypesFromSelect, typ)
 					i++
 				}
+			default:
+				return nil, fmt.Errorf("cannot use this expression to assign multiple columns: %s", expr.Expr)
 			}
 		} else {
 			typ := updateCols[i].Type.ToDatumType()
@@ -180,42 +211,35 @@ func (p *planner) Update(n *parser.Update, desiredTypes []parser.Datum, autoComm
 		}
 	}
 
-	// TODO(knz): Until we split the creation of the node from Start()
-	// for the SelectClause too, we cannot cache this. This is because
-	// this node's initSelect() method both does type checking and also
-	// performs index selection. We cannot perform index selection
-	// properly until the placeholder values are known.
 	rows, err := p.SelectClause(&parser.SelectClause{
 		Exprs: targets,
-		From:  []parser.TableExpr{n.Table},
+		From:  &parser.From{Tables: []parser.TableExpr{n.Table}},
 		Where: n.Where,
-	}, nil, nil, desiredTypesFromSelect)
+	}, nil, nil, desiredTypesFromSelect, publicAndNonPublicColumns)
 	if err != nil {
 		return nil, err
 	}
 
-	// ValArgs have their types populated in the above Select if they are part
+	// Placeholders have their types populated in the above Select if they are part
 	// of an expression ("SET a = 2 + $1") in the type check step where those
 	// types are inferred. For the simpler case ("SET a = $1"), populate them
 	// using checkColumnType. This step also verifies that the expression
 	// types match the column types.
-	for i, target := range rows.(*selectNode).render[exprTargetIdx:] {
+	sel := rows.(*selectTopNode).source.(*selectNode)
+	for i, target := range sel.render[exprTargetIdx:] {
 		// DefaultVal doesn't implement TypeCheck
 		if _, ok := target.(parser.DefaultVal); ok {
 			continue
 		}
-		typedTarget, err := parser.TypeCheck(target, p.evalCtx.Args, updateCols[i].Type.ToDatumType())
+		// TODO(nvanbenschoten) isn't this TypeCheck redundant with the call to SelectClause?
+		typedTarget, err := parser.TypeCheck(target, &p.semaCtx, updateCols[i].Type.ToDatumType())
 		if err != nil {
 			return nil, err
 		}
-		err = sqlbase.CheckColumnType(updateCols[i], typedTarget.ReturnType(), p.evalCtx.Args)
+		err = sqlbase.CheckColumnType(updateCols[i], typedTarget.ReturnType(), p.semaCtx.Placeholders)
 		if err != nil {
 			return nil, err
 		}
-	}
-
-	if err := en.rh.TypeCheck(); err != nil {
-		return nil, err
 	}
 
 	updateColsIdx := make(map[sqlbase.ColumnID]int, len(ru.updateCols))
@@ -226,8 +250,6 @@ func (p *planner) Update(n *parser.Update, desiredTypes []parser.Datum, autoComm
 	un := &updateNode{
 		n:             n,
 		editNodeBase:  en,
-		desiredTypes:  desiredTypesFromSelect,
-		defaultExprs:  defaultExprs,
 		updateCols:    ru.updateCols,
 		updateColsIdx: updateColsIdx,
 		tw:            tw,
@@ -235,86 +257,40 @@ func (p *planner) Update(n *parser.Update, desiredTypes []parser.Datum, autoComm
 	if err := un.checkHelper.init(p, en.tableDesc); err != nil {
 		return nil, err
 	}
+	if err := un.run.initEditNode(&un.editNodeBase, rows, n.Returning, desiredTypes); err != nil {
+		return nil, err
+	}
 	return un, nil
 }
 
 func (u *updateNode) expandPlan() error {
-	exprs := make([]parser.UpdateExpr, len(u.n.Exprs))
-	for i, expr := range u.n.Exprs {
-		exprs[i] = *expr
-	}
-
-	// Expand the sub-queries and construct the real list of targets.
-	for i, expr := range exprs {
-		newExpr, eErr := u.p.expandSubqueries(expr.Expr, len(expr.Names))
-		if eErr != nil {
-			return eErr
-		}
-		exprs[i].Expr = newExpr
-	}
-
-	targets := sqlbase.ColumnsSelectors(u.tw.ru.fetchCols)
-	i := 0
-	for _, expr := range exprs {
-		if expr.Tuple {
-			switch t := expr.Expr.(type) {
-			case *parser.Tuple:
-				for _, e := range t.Exprs {
-					e = fillDefault(e, u.desiredTypes[i], i, u.defaultExprs)
-					targets = append(targets, parser.SelectExpr{Expr: e})
-					i++
-				}
-			case *parser.DTuple:
-				for _, e := range *t {
-					targets = append(targets, parser.SelectExpr{Expr: e})
-					i++
-				}
-			}
-		} else {
-			e := fillDefault(expr.Expr, u.desiredTypes[i], i, u.defaultExprs)
-			targets = append(targets, parser.SelectExpr{Expr: e})
-			i++
-		}
-	}
-
-	// Create the workhorse select clause for rows that need updating.
-	// TODO(knz): See comment above in Update().
-	rows, err := u.p.SelectClause(&parser.SelectClause{
-		Exprs: targets,
-		From:  []parser.TableExpr{u.n.Table},
-		Where: u.n.Where,
-	}, nil, nil, u.desiredTypes)
-	if err != nil {
-		return err
-	}
-
-	if err := rows.expandPlan(); err != nil {
-		return err
-	}
-
-	u.run.buildEditNodePlan(&u.editNodeBase, rows, &u.tw)
-	return nil
+	return u.run.expandEditNodePlan(&u.editNodeBase, &u.tw)
 }
 
 func (u *updateNode) Start() error {
-	if err := u.run.rows.Start(); err != nil {
+	if err := u.rh.startPlans(); err != nil {
+		return err
+	}
+
+	if err := u.run.startEditNode(); err != nil {
 		return err
 	}
 
 	return u.run.tw.init(u.p.txn)
 }
 
-func (u *updateNode) Next() bool {
-	if u.run.done || u.run.err != nil {
-		return false
+func (u *updateNode) Next() (bool, error) {
+	next, err := u.run.rows.Next()
+	if !next {
+		if err == nil {
+			// We're done. Finish the batch.
+			err = u.tw.finalize(u.p.ctx())
+		}
+		return false, err
 	}
 
-	if !u.run.rows.Next() {
-		// We're done. Finish the batch.
-		err := u.tw.finalize()
-		u.run.err = err
-		u.run.done = true
-		return false
+	if u.run.explain == explainDebug {
+		return true, nil
 	}
 
 	tracing.AnnotateTrace()
@@ -328,65 +304,57 @@ func (u *updateNode) Next() bool {
 
 	u.checkHelper.loadRow(u.tw.ru.fetchColIDtoRowIndex, oldValues, false)
 	u.checkHelper.loadRow(u.updateColsIdx, updateValues, true)
-	if err := u.checkHelper.check(u.p.evalCtx); err != nil {
-		u.run.err = err
-		return false
+	if err := u.checkHelper.check(&u.p.evalCtx); err != nil {
+		return false, err
 	}
 
 	// Ensure that the values honor the specified column widths.
 	for i := range updateValues {
-		if err := sqlbase.CheckValueWidth(u.updateCols[i], updateValues[i]); err != nil {
-			u.run.err = err
-			return false
+		if err := sqlbase.CheckValueWidth(u.tw.ru.updateCols[i], updateValues[i]); err != nil {
+			return false, err
 		}
 	}
 
 	// Update the row values.
-	for i, col := range u.updateCols {
+	for i, col := range u.tw.ru.updateCols {
 		val := updateValues[i]
 		if !col.Nullable && val == parser.DNull {
-			u.run.err = newNonNullViolationError(col.Name)
-			return false
+			return false, sqlbase.NewNonNullViolationError(col.Name)
 		}
 	}
 
-	newValues, err := u.tw.row(append(oldValues, updateValues...))
+	newValues, err := u.tw.row(u.p.ctx(), append(oldValues, updateValues...))
 	if err != nil {
-		u.run.err = err
-		return false
+		return false, err
 	}
 
 	resultRow, err := u.rh.cookResultRow(newValues)
 	if err != nil {
-		u.run.err = err
-		return false
+		return false, err
 	}
 	u.run.resultRow = resultRow
 
-	return true
+	return true, nil
 }
 
 // namesForExprs expands names in the tuples and subqueries in exprs.
 func (p *planner) namesForExprs(exprs parser.UpdateExprs) (parser.QualifiedNames, error) {
 	var names parser.QualifiedNames
 	for _, expr := range exprs {
-		// TODO(knz): We need to (attempt to) expand subqueries here already
-		// so that it retrieves the column names. But then we need to do
-		// it again when the placeholder values are known below.
-		newExpr, eErr := p.expandSubqueries(expr.Expr, len(expr.Names))
-		if eErr != nil {
-			return nil, eErr
-		}
+		newExpr := expr.Expr
 
 		if expr.Tuple {
 			n := 0
+			if s, ok := newExpr.(*subquery); ok {
+				newExpr = s.typ
+			}
 			switch t := newExpr.(type) {
 			case *parser.Tuple:
 				n = len(t.Exprs)
 			case *parser.DTuple:
 				n = len(*t)
 			default:
-				return nil, util.Errorf("unsupported tuple assignment: %T", newExpr)
+				return nil, errors.Errorf("unsupported tuple assignment: %T", newExpr)
 			}
 			if len(expr.Names) != n {
 				return nil, fmt.Errorf("number of columns (%d) does not match number of values (%d)",
@@ -417,6 +385,10 @@ func (u *updateNode) Values() parser.DTuple {
 }
 
 func (u *updateNode) MarkDebug(mode explainMode) {
+	if mode != explainDebug {
+		panic(fmt.Sprintf("unknown debug mode %d", mode))
+	}
+	u.run.explain = mode
 	u.run.rows.MarkDebug(mode)
 }
 
@@ -428,15 +400,11 @@ func (u *updateNode) Ordering() orderingInfo {
 	return u.run.rows.Ordering()
 }
 
-func (u *updateNode) Err() error {
-	return u.run.err
-}
-
 func (u *updateNode) ExplainPlan(v bool) (name, description string, children []planNode) {
 	var buf bytes.Buffer
 	if v {
 		fmt.Fprintf(&buf, "set %s (", u.tableDesc.Name)
-		for i, col := range u.updateCols {
+		for i, col := range u.tw.ru.updateCols {
 			if i > 0 {
 				fmt.Fprintf(&buf, ", ")
 			}
@@ -451,16 +419,19 @@ func (u *updateNode) ExplainPlan(v bool) (name, description string, children []p
 		}
 		fmt.Fprintf(&buf, ")")
 	}
-	return "update", buf.String(), []planNode{u.run.rows}
+
+	subplans := []planNode{u.run.rows}
+	for _, e := range u.rh.exprs {
+		subplans = u.p.collectSubqueryPlans(e, subplans)
+	}
+
+	return "update", buf.String(), subplans
 }
 
 func (u *updateNode) ExplainTypes(regTypes func(string, string)) {
 	cols := u.rh.columns
 	for i, rexpr := range u.rh.exprs {
 		regTypes(fmt.Sprintf("returning %s", cols[i].Name), parser.AsStringWithFlags(rexpr, parser.FmtShowTypes))
-	}
-	for i, dexpr := range u.defaultExprs {
-		regTypes(fmt.Sprintf("default %d", i), parser.AsStringWithFlags(dexpr, parser.FmtShowTypes))
 	}
 }
 

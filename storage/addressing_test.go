@@ -19,17 +19,19 @@ package storage
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"testing"
 
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/testutils"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
 )
@@ -139,7 +141,7 @@ func TestUpdateRangeAddressing(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Scan meta keys directly from engine.
-		kvs, _, err := engine.MVCCScan(context.Background(), store.Engine(), keys.MetaMin, keys.MetaMax, 0, roachpb.MaxTimestamp, true, nil)
+		kvs, _, err := engine.MVCCScan(context.Background(), store.Engine(), keys.MetaMin, keys.MetaMax, math.MaxInt64, hlc.MaxTimestamp, true, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -177,16 +179,16 @@ func TestUpdateRangeAddressing(t *testing.T) {
 
 		if test.split {
 			if log.V(1) {
-				log.Infof("test case %d: split %q-%q at %q", i, left.StartKey, right.EndKey, left.EndKey)
+				log.Infof(context.Background(), "test case %d: split %q-%q at %q", i, left.StartKey, right.EndKey, left.EndKey)
 			}
 		} else {
 			if log.V(1) {
-				log.Infof("test case %d: merge %q-%q + %q-%q", i, left.StartKey, left.EndKey, left.EndKey, right.EndKey)
+				log.Infof(context.Background(), "test case %d: merge %q-%q + %q-%q", i, left.StartKey, left.EndKey, left.EndKey, right.EndKey)
 			}
 		}
 		for _, meta := range metas {
 			if log.V(1) {
-				log.Infof("%q", meta.key)
+				log.Infof(context.Background(), "%q", meta.key)
 			}
 		}
 

@@ -17,20 +17,14 @@
 package sql
 
 import (
+	"bytes"
 	"fmt"
+	"sort"
 
+	"github.com/cockroachdb/cockroach/sql/parser"
+	"github.com/cockroachdb/cockroach/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/util/encoding"
 )
-
-// columnOrdering is used to describe a desired column ordering. For example,
-//     []columnOrderInfo{ {3, true}, {1, false} }
-// represents an ordering first by column 3 (descending), then by column 1 (ascending).
-type columnOrdering []columnOrderInfo
-
-type columnOrderInfo struct {
-	colIdx    int
-	direction encoding.Direction
-}
 
 // orderingInfo describes the column ordering on a set of results.
 //
@@ -55,10 +49,65 @@ type orderingInfo struct {
 	exactMatchCols map[int]struct{}
 
 	// ordering of any other columns (the columns in exactMatchCols do not appear in this ordering).
-	ordering columnOrdering
+	ordering sqlbase.ColumnOrdering
 
 	// true if we know that all the value tuples for the columns in `ordering` are distinct.
 	unique bool
+}
+
+// Format pretty-prints the orderingInfo to a stream.
+// If columns is not nil, column names are printed instead of column indexes.
+func (ord orderingInfo) Format(buf *bytes.Buffer, columns []ResultColumn) {
+	sep := ""
+
+	// Print the exact match columns. We sort them to ensure
+	// a deterministic output order.
+	cols := make([]int, 0, len(ord.exactMatchCols))
+	for i := range ord.exactMatchCols {
+		cols = append(cols, i)
+	}
+	sort.Ints(cols)
+
+	for _, i := range cols {
+		buf.WriteString(sep)
+		sep = ","
+
+		buf.WriteByte('=')
+		if columns == nil || i >= len(columns) {
+			fmt.Fprintf(buf, "%d", i)
+		} else {
+			parser.Name(columns[i].Name).Format(buf, parser.FmtSimple)
+		}
+	}
+
+	// Print the ordering columns and for each their sort order.
+	for _, o := range ord.ordering {
+		buf.WriteString(sep)
+		sep = ","
+
+		prefix := byte('+')
+		if o.Direction == encoding.Descending {
+			prefix = '-'
+		}
+		buf.WriteByte(prefix)
+		if columns == nil || o.ColIdx >= len(columns) {
+			fmt.Fprintf(buf, "%d", o.ColIdx)
+		} else {
+			parser.Name(columns[o.ColIdx].Name).Format(buf, parser.FmtSimple)
+		}
+	}
+
+	if ord.unique {
+		buf.WriteString(sep)
+		buf.WriteString("unique")
+	}
+}
+
+// AsString pretty-prints the orderingInfo to a string.
+func (ord orderingInfo) AsString(columns []ResultColumn) string {
+	var buf bytes.Buffer
+	ord.Format(&buf, columns)
+	return buf.String()
 }
 
 func (ord orderingInfo) isEmpty() bool {
@@ -78,15 +127,15 @@ func (ord *orderingInfo) addColumn(colIdx int, dir encoding.Direction) {
 	}
 	// If unique is true, there are no "ties" to break with adding more columns.
 	if !ord.unique {
-		ord.ordering = append(ord.ordering, columnOrderInfo{colIdx, dir})
+		ord.ordering = append(ord.ordering, sqlbase.ColumnOrderInfo{ColIdx: colIdx, Direction: dir})
 	}
 }
 
-// Computes how long of a prefix of a desired columnOrdering is matched by an existing ordering. If
+// Computes how long of a prefix of a desired ColumnOrdering is matched by an existing ordering. If
 // reverse is set, we assume the reverse of the existing ordering.
 //
 // Returns a value between 0 and len(desired).
-func computeOrderingMatch(desired columnOrdering, existing orderingInfo, reverse bool) int {
+func computeOrderingMatch(desired sqlbase.ColumnOrdering, existing orderingInfo, reverse bool) int {
 	// position in existing.ordering
 	pos := 0
 	for i, col := range desired {
@@ -94,7 +143,7 @@ func computeOrderingMatch(desired columnOrdering, existing orderingInfo, reverse
 			ci := existing.ordering[pos]
 
 			// Check that the next column matches. Note: "!=" acts as logical XOR.
-			if ci.colIdx == col.colIdx && (ci.direction == col.direction) != reverse {
+			if ci.ColIdx == col.ColIdx && (ci.Direction == col.Direction) != reverse {
 				pos++
 				continue
 			}
@@ -105,7 +154,7 @@ func computeOrderingMatch(desired columnOrdering, existing orderingInfo, reverse
 			return len(desired)
 		}
 		// If the column did not match, check if it is one of the exact match columns.
-		if _, ok := existing.exactMatchCols[col.colIdx]; !ok {
+		if _, ok := existing.exactMatchCols[col.ColIdx]; !ok {
 			// Everything matched up to this point.
 			return i
 		}

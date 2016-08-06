@@ -17,12 +17,13 @@
 package kv
 
 import (
-	"errors"
 	"net"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 
@@ -32,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
+	"github.com/cockroachdb/cockroach/util/netutil"
 	"github.com/cockroachdb/cockroach/util/stop"
 )
 
@@ -47,7 +49,7 @@ func newNodeTestContext(clock *hlc.Clock, stopper *stop.Stopper) *rpc.Context {
 func newTestServer(t *testing.T, ctx *rpc.Context) (*grpc.Server, net.Listener) {
 	s := rpc.NewServer(ctx)
 
-	ln, err := util.ListenAndServeGRPC(ctx.Stopper, s, util.TestAddr)
+	ln, err := netutil.ListenAndServeGRPC(ctx.Stopper, s, util.TestAddr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +66,10 @@ func (n Node) Batch(ctx context.Context, args *roachpb.BatchRequest) (*roachpb.B
 	return &roachpb.BatchResponse{}, nil
 }
 func (n Node) PollFrozen(_ context.Context, _ *roachpb.PollFrozenRequest) (*roachpb.PollFrozenResponse, error) {
+	panic("unimplemented")
+}
+
+func (n Node) Reserve(_ context.Context, _ *roachpb.ReservationRequest) (*roachpb.ReservationResponse, error) {
 	panic("unimplemented")
 }
 
@@ -122,28 +128,25 @@ func TestRetryableError(t *testing.T) {
 	s, ln := newTestServer(t, serverContext)
 	roachpb.RegisterInternalServer(s, Node(0))
 
-	conn, err := clientContext.GRPCDial(ln.Addr().String())
-	if err != nil {
+	addr := ln.Addr().String()
+	if _, err := clientContext.GRPCDial(addr); err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.Background()
-	waitForConnState := func(desiredState grpc.ConnectivityState) {
-		clientState, err := conn.State()
-		for clientState != desiredState {
-			if err != nil {
-				t.Fatal(err)
-			}
-			if clientState == grpc.Shutdown {
-				t.Fatalf("%v has unexpectedly shut down", conn)
-			}
-			clientState, err = conn.WaitForStateChange(ctx, clientState)
-		}
-	}
 	// Wait until the client becomes healthy and shut down the server.
-	waitForConnState(grpc.Ready)
+	util.SucceedsSoon(t, func() error {
+		if !clientContext.IsConnHealthy(addr) {
+			return errors.Errorf("client not yet healthy")
+		}
+		return nil
+	})
 	serverStopper.Stop()
 	// Wait until the client becomes unhealthy.
-	waitForConnState(grpc.TransientFailure)
+	util.SucceedsSoon(t, func() error {
+		if clientContext.IsConnHealthy(addr) {
+			return errors.Errorf("client not yet unhealthy")
+		}
+		return nil
+	})
 
 	opts := SendOptions{
 		SendNextTimeout: 100 * time.Millisecond,
@@ -240,7 +243,7 @@ func TestSendNext_AllSlow(t *testing.T) {
 	doneChans[1] <- BatchCall{
 		Reply: &roachpb.BatchResponse{
 			BatchResponse_Header: roachpb.BatchResponse_Header{
-				Now: roachpb.Timestamp{Logical: 42},
+				Now: hlc.Timestamp{Logical: 42},
 			},
 		},
 		Err: nil,
@@ -410,70 +413,93 @@ func TestClientNotReady(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 
-	// Construct a server that listens but doesn't do anything. Notice that we
-	// never start accepting connections on the listener.
+	// Construct a server that listens but doesn't do anything. Note that we
+	// don't accept any connections on the listener.
 	ln, err := net.Listen(util.TestAddr.Network(), util.TestAddr.String())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close()
+	addr := ln.Addr()
+	addrs := []net.Addr{addr}
 
-	opts := SendOptions{
-		SendNextTimeout: 100 * time.Nanosecond,
-		Timeout:         100 * time.Nanosecond,
-		Context:         context.Background(),
-	}
+	{
+		// Send RPC to an address where no server is running.
+		nodeContext := newNodeTestContext(nil, stopper)
+		if _, err := sendBatch(SendOptions{
+			SendNextTimeout: 100 * time.Nanosecond,
+			Timeout:         100 * time.Nanosecond,
+			Context:         context.Background(),
+		}, addrs, nodeContext); !testutils.IsError(err, "context deadline exceeded") {
+			t.Fatalf("unexpected error: %v", err)
+		}
 
-	// Send RPC to an address where no server is running.
-	nodeContext := newNodeTestContext(nil, stopper)
-	if _, err := sendBatch(opts, []net.Addr{ln.Addr()}, nodeContext); err == nil {
-		t.Fatalf("Unexpected success")
-	}
-
-	// Send the RPC again with no timeout. We create a new node context to ensure
-	// there is a new connection.
-	nodeContext = newNodeTestContext(nil, stopper)
-	opts.SendNextTimeout = 0
-	opts.Timeout = 0
-	c := make(chan error)
-	sent := make(chan struct{})
-
-	// Start a goroutine to accept the connection from the client. We'll close
-	// the sent channel after receiving the connection, thus ensuring that the
-	// RPC was sent before we closed the connection. We intentionally do not
-	// close the server connection as doing so triggers other gRPC code paths.
-	go func() {
-		_, err := ln.Accept()
-		if err != nil {
-			c <- err
+		// Do a dance to convince GRPC to close the connection.
+		if conn, err := ln.Accept(); err != nil {
+			t.Fatal(err)
 		} else {
-			close(sent)
+			// The connection is cached in the RPC context.
+			grpcConn, err := nodeContext.GRPCDial(addr.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := grpcConn.Close(); err != nil && err != grpc.ErrClientConnClosing {
+				t.Fatal(err)
+			}
+
+			// Just in case, close it from the server as well.
+			if err := conn.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	errCh := make(chan error)
+	connected := make(chan struct{})
+
+	// Accept a single connection from the client.
+	go func() {
+		if _, err := ln.Accept(); err != nil {
+			errCh <- err
+		} else {
+			close(connected)
 		}
 	}()
+
+	// Send the RPC again with no timeout. We create a new node context to ensure
+	// there is a new connection; we could reuse the old connection by not
+	// closing it, but by the time we reach this point in the test, GRPC may have
+	// attempted to reconnect enough times to make the backoff long enough to
+	// time out the test.
+	nodeContext := newNodeTestContext(nil, stopper)
+
 	go func() {
-		_, err := sendBatch(opts, []net.Addr{ln.Addr()}, nodeContext)
-		if !testutils.IsError(err, "failed as client connection was closed") {
-			c <- util.Errorf("unexpected error: %v", err)
+		_, err := sendBatch(SendOptions{
+			Context: context.Background(),
+		}, addrs, nodeContext)
+		if !testutils.IsError(err, "connection is closing|failed fast due to transport failure") {
+			errCh <- errors.Wrap(err, "unexpected error")
+		} else {
+			close(errCh)
 		}
-		close(c)
 	}()
 
 	select {
-	case err := <-c:
-		t.Fatalf("Unexpected end of rpc call: %v", err)
-	case <-sent:
+	case err := <-errCh:
+		t.Fatalf("unexpected error: %v", err)
+	case <-connected:
 	}
 
-	// Grab the client for our invalid address and close it. This will cause the
-	// blocked ping RPC to finish.
-	conn, err := nodeContext.GRPCDial(ln.Addr().String())
+	// Grab the cached connection and close it. This will cause the blocked RPC
+	// to finish.
+	grpcConn, err := nodeContext.GRPCDial(addr.String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := conn.Close(); err != nil {
+	if err := grpcConn.Close(); err != nil && err != grpc.ErrClientConnClosing {
 		t.Fatal(err)
 	}
-	if err := <-c; err != nil {
+	for err := range errCh {
 		t.Fatal(err)
 	}
 }
@@ -571,6 +597,69 @@ func TestComplexScenarios(t *testing.T) {
 			if err == nil {
 				t.Errorf("%d: unexpected success", i)
 			}
+		}
+	}
+}
+
+// TestSplitHealthy tests that the splitHealthy helper function sorts healthy
+// nodes before unhealthy nodes.
+func TestSplitHealthy(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testData := []struct {
+		in       []batchClient
+		out      []batchClient
+		nHealthy int
+	}{
+		{nil, nil, 0},
+		{
+			[]batchClient{
+				{remoteAddr: "1", healthy: false},
+				{remoteAddr: "2", healthy: false},
+				{remoteAddr: "3", healthy: true},
+			},
+			[]batchClient{
+				{remoteAddr: "3", healthy: true},
+				{remoteAddr: "1", healthy: false},
+				{remoteAddr: "2", healthy: false},
+			},
+			1,
+		},
+		{
+			[]batchClient{
+				{remoteAddr: "1", healthy: true},
+				{remoteAddr: "2", healthy: false},
+				{remoteAddr: "3", healthy: true},
+			},
+			[]batchClient{
+				{remoteAddr: "1", healthy: true},
+				{remoteAddr: "3", healthy: true},
+				{remoteAddr: "2", healthy: false},
+			},
+			2,
+		},
+		{
+			[]batchClient{
+				{remoteAddr: "1", healthy: true},
+				{remoteAddr: "2", healthy: true},
+				{remoteAddr: "3", healthy: true},
+			},
+			[]batchClient{
+				{remoteAddr: "1", healthy: true},
+				{remoteAddr: "2", healthy: true},
+				{remoteAddr: "3", healthy: true},
+			},
+			3,
+		},
+	}
+
+	for i, td := range testData {
+		nHealthy := splitHealthy(td.in)
+		if nHealthy != td.nHealthy {
+			t.Errorf("%d. splitHealthy(%+v) = %d; not %d", i, td.in, nHealthy, td.nHealthy)
+		}
+		if !reflect.DeepEqual(td.in, td.out) {
+			t.Errorf("%d. splitHealthy(...)\n  = %+v;\nnot %+v", i, td.in, td.out)
 		}
 	}
 }

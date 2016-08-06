@@ -29,7 +29,9 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/util/encoding"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/randutil"
 	"github.com/cockroachdb/cockroach/util/stop"
@@ -86,7 +88,7 @@ func setupMVCCData(emk engineMaker, numVersions, numKeys, valueBytes int, b *tes
 		return eng, loc, stopper
 	}
 
-	log.Infof("creating mvcc data: %s", loc)
+	log.Infof(context.Background(), "creating mvcc data: %s", loc)
 
 	// Generate the same data every time.
 	rng := rand.New(rand.NewSource(1449168817))
@@ -117,7 +119,7 @@ func setupMVCCData(emk engineMaker, numVersions, numKeys, valueBytes int, b *tes
 		// optimizations which change the data size result in the same number of
 		// sstables.
 		if scaled := len(order) / 20; i > 0 && (i%scaled) == 0 {
-			log.Infof("committing (%d/~%d)", i/scaled, 20)
+			log.Infof(context.Background(), "committing (%d/~%d)", i/scaled, 20)
 			if err := batch.Commit(); err != nil {
 				b.Fatal(err)
 			}
@@ -371,11 +373,11 @@ func runMVCCMerge(emk engineMaker, value *roachpb.Value, numKeys int, b *testing
 
 	b.ResetTimer()
 
-	ts := roachpb.Timestamp{}
+	ts := hlc.Timestamp{}
 	// Use parallelism if specified when test is run.
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			ms := MVCCStats{}
+			ms := enginepb.MVCCStats{}
 			ts.Logical++
 			err := MVCCMerge(context.Background(), eng, &ms, keys[rand.Intn(numKeys)], ts, *value)
 			if err != nil {
@@ -386,7 +388,7 @@ func runMVCCMerge(emk engineMaker, value *roachpb.Value, numKeys int, b *testing
 
 	// Read values out to force merge.
 	for _, key := range keys {
-		val, _, err := MVCCGet(context.Background(), eng, key, roachpb.ZeroTimestamp, true, nil)
+		val, _, err := MVCCGet(context.Background(), eng, key, hlc.ZeroTimestamp, true, nil)
 		if err != nil {
 			b.Fatal(err)
 		} else if val == nil {
@@ -437,7 +439,7 @@ func runMVCCDeleteRange(emk engineMaker, valueBytes int, b *testing.B) {
 		dupEng, stopper := emk(b, locDirty)
 
 		b.StartTimer()
-		_, err := MVCCDeleteRange(context.Background(), dupEng, &MVCCStats{}, roachpb.KeyMin, roachpb.KeyMax, 0, roachpb.MaxTimestamp, nil, false)
+		_, err := MVCCDeleteRange(context.Background(), dupEng, &enginepb.MVCCStats{}, roachpb.KeyMin, roachpb.KeyMax, 0, hlc.MaxTimestamp, nil, false)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -458,7 +460,7 @@ func runMVCCComputeStats(emk engineMaker, valueBytes int, b *testing.B) {
 	b.SetBytes(rangeBytes)
 	b.ResetTimer()
 
-	var stats MVCCStats
+	var stats enginepb.MVCCStats
 	var err error
 	for i := 0; i < b.N; i++ {
 		iter := eng.NewIterator(false)
@@ -470,7 +472,7 @@ func runMVCCComputeStats(emk engineMaker, valueBytes int, b *testing.B) {
 	}
 
 	b.StopTimer()
-	log.Infof("live_bytes: %d", stats.LiveBytes)
+	log.Infof(context.Background(), "live_bytes: %d", stats.LiveBytes)
 }
 
 func BenchmarkMVCCPutDelete_RocksDB(b *testing.B) {
@@ -479,7 +481,7 @@ func BenchmarkMVCCPutDelete_RocksDB(b *testing.B) {
 
 	r := rand.New(rand.NewSource(int64(timeutil.Now().UnixNano())))
 	value := roachpb.MakeValueFromBytes(randutil.RandBytes(r, 10))
-	zeroTS := roachpb.ZeroTimestamp
+	zeroTS := hlc.ZeroTimestamp
 	var blockNum int64
 
 	for i := 0; i < b.N; i++ {

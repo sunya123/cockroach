@@ -21,17 +21,22 @@ package sql_test
 import (
 	"testing"
 
-	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
+	"github.com/pkg/errors"
 )
 
-func checkCounterEQ(t *testing.T, s *testServer, key string, e int64) {
+func checkCounterEQ(
+	t *testing.T, s serverutils.TestServerInterface, key string, e int64,
+) {
 	if a := s.MustGetSQLCounter(key); a != e {
-		t.Error(util.ErrorfSkipFrames(1, "stat %s: actual %d != expected %d", key, a, e))
+		t.Error(errors.Errorf("stat %s: actual %d != expected %d", key, a, e))
 	}
 }
 
-func checkCounterGE(t *testing.T, s *testServer, key string, e int64) {
+func checkCounterGE(
+	t *testing.T, s serverutils.TestServerInterface, key string, e int64,
+) {
 	if a := s.MustGetSQLCounter(key); a < e {
-		t.Error(util.ErrorfSkipFrames(1, "stat %s: expected: actual %d >= %d", key, a, e))
+		t.Error(errors.Errorf("stat %s: expected: actual %d >= %d", key, a, e))
 	}
 }

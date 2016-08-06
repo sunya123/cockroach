@@ -21,9 +21,12 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/context"
+
+	"github.com/pkg/errors"
+
 	"github.com/cockroachdb/cockroach/acceptance/cluster"
-	"github.com/cockroachdb/cockroach/client"
-	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/timeutil"
 )
@@ -79,7 +82,7 @@ func testSingleKeyInner(t *testing.T, c cluster.Cluster, cfg cluster.TestConfig)
 					// exp or larger (since concurrent writers might have
 					// committed but not yet performed their atomic update).
 					if err == nil && v < minExp {
-						return util.Errorf("unexpected read: %d, expected >= %d", v, minExp)
+						return errors.Errorf("unexpected read: %d, expected >= %d", v, minExp)
 					}
 					return err
 				})
@@ -111,7 +114,7 @@ func testSingleKeyInner(t *testing.T, c cluster.Cluster, cfg cluster.TestConfig)
 		case <-time.After(1 * time.Second):
 			// Periodically print out progress so that we know the test is still
 			// running.
-			log.Infof("%d", atomic.LoadInt64(&expected))
+			log.Infof(context.Background(), "%d", atomic.LoadInt64(&expected))
 		}
 	}
 
@@ -128,5 +131,5 @@ func testSingleKeyInner(t *testing.T, c cluster.Cluster, cfg cluster.TestConfig)
 	for _, r := range results {
 		maxLatency = append(maxLatency, r.maxLatency)
 	}
-	log.Infof("%d increments: %s", v, maxLatency)
+	log.Infof(context.Background(), "%d increments: %s", v, maxLatency)
 }

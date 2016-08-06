@@ -22,9 +22,12 @@ import (
 	"fmt"
 	"sort"
 
+	"golang.org/x/net/context"
+
+	"github.com/pkg/errors"
+
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/encoding"
 	"github.com/cockroachdb/cockroach/util/log"
 )
@@ -34,6 +37,8 @@ const (
 	// TODO(marc): should we revise this lower?
 	minRangeMaxBytes = 1 << 20
 )
+
+type zoneConfigHook func(SystemConfig, uint32) (ZoneConfig, bool, error)
 
 var (
 	// defaultZoneConfig is the default zone configuration used when no custom
@@ -54,41 +59,12 @@ var (
 	// ZoneConfigHook is a function used to lookup a zone config given a table
 	// or database ID.
 	// This is also used by testing to simplify fake configs.
-	ZoneConfigHook func(SystemConfig, uint32) (*ZoneConfig, error)
+	ZoneConfigHook zoneConfigHook
 
 	// testingLargestIDHook is a function used to bypass GetLargestObjectID
 	// in tests.
 	testingLargestIDHook func(uint32) uint32
-
-	// testingDisableTableSplits is a testing-only variable that disables
-	// splits of tables into separate ranges.
-	testingDisableTableSplits bool
 )
-
-// TestingDisableTableSplits is a testing-only function that disables
-// splits of tables into separate ranges. It returns a function
-// that re-enables this splitting.
-func TestingDisableTableSplits() func() {
-	testingLock.Lock()
-	if testingDisableTableSplits {
-		log.Fatal("TestingDisableTableSplits called twice without cleaning up")
-	}
-	testingDisableTableSplits = true
-	testingLock.Unlock()
-	return func() {
-		testingLock.Lock()
-		testingDisableTableSplits = false
-		testingLock.Unlock()
-	}
-}
-
-// TestingTableSplitsDisabled is a testing-only function that returns true if table
-// splits are currently disabled.
-func TestingTableSplitsDisabled() bool {
-	testingLock.Lock()
-	defer testingLock.Unlock()
-	return testingDisableTableSplits
-}
 
 // DefaultZoneConfig is the default zone configuration used when no custom
 // config has been specified.
@@ -201,7 +177,7 @@ func decodeDescMetadataID(key roachpb.Key) (uint64, error) {
 		return 0, err
 	}
 	if tableID != keys.DescriptorTableID {
-		return 0, util.Errorf("key is not a descriptor table entry: %v", key)
+		return 0, errors.Errorf("key is not a descriptor table entry: %v", key)
 	}
 	// DescriptorTable.PrimaryIndex.ID
 	remaining, _, err = encoding.DecodeUvarintAscending(remaining)
@@ -294,7 +270,7 @@ func (s SystemConfig) GetLargestObjectID(maxID uint32) (uint32, error) {
 
 // GetZoneConfigForKey looks up the zone config for the range containing 'key'.
 // It is the caller's responsibility to ensure that the range does not need to be split.
-func (s SystemConfig) GetZoneConfigForKey(key roachpb.RKey) (*ZoneConfig, error) {
+func (s SystemConfig) GetZoneConfigForKey(key roachpb.RKey) (ZoneConfig, error) {
 	objectID, ok := ObjectIDForKey(key)
 	if !ok {
 		// Not in the structured data namespace.
@@ -308,27 +284,20 @@ func (s SystemConfig) GetZoneConfigForKey(key roachpb.RKey) (*ZoneConfig, error)
 
 // getZoneConfigForID looks up the zone config for the object (table or database)
 // with 'id'.
-func (s SystemConfig) getZoneConfigForID(id uint32) (*ZoneConfig, error) {
+func (s SystemConfig) getZoneConfigForID(id uint32) (ZoneConfig, error) {
 	testingLock.Lock()
 	hook := ZoneConfigHook
 	testingLock.Unlock()
-	if hook == nil {
-		return nil, util.Errorf("ZoneConfigHook not set, unable to lookup zone config")
-	}
-	if cfg, err := hook(s, id); cfg != nil || err != nil {
+	if cfg, found, err := hook(s, id); err != nil || found {
 		return cfg, err
 	}
-	return &defaultZoneConfig, nil
+	return DefaultZoneConfig(), nil
 }
 
 // ComputeSplitKeys takes a start and end key and returns an array of keys
 // at which to split the span [start, end).
 // The only required splits are at each user table prefix.
 func (s SystemConfig) ComputeSplitKeys(startKey, endKey roachpb.RKey) []roachpb.RKey {
-	if TestingTableSplitsDisabled() {
-		return nil
-	}
-
 	tableStart := roachpb.RKey(keys.SystemConfigTableDataMax)
 	if !tableStart.Less(endKey) {
 		// This range is before the user tables span: no required splits.
@@ -361,7 +330,7 @@ func (s SystemConfig) ComputeSplitKeys(startKey, endKey roachpb.RKey) []roachpb.
 	appendSplitKeys := func(startID, endID uint32) {
 		// endID could be smaller than startID if we don't have user tables.
 		for id := startID; id <= endID; id++ {
-			key = keys.MakeNonColumnKey(keys.MakeTablePrefix(id))
+			key = keys.MakeRowSentinelKey(keys.MakeTablePrefix(id))
 			// Skip if this ID matches the startKey passed to ComputeSplitKeys.
 			if !startKey.Less(key) {
 				continue
@@ -379,7 +348,7 @@ func (s SystemConfig) ComputeSplitKeys(startKey, endKey roachpb.RKey) []roachpb.
 	if startID <= keys.MaxReservedDescID {
 		endID, err := s.GetLargestObjectID(keys.MaxReservedDescID)
 		if err != nil {
-			log.Errorf("unable to determine largest reserved object ID from system config: %s", err)
+			log.Errorf(context.TODO(), "unable to determine largest reserved object ID from system config: %s", err)
 			return nil
 		}
 		appendSplitKeys(startID, endID)
@@ -389,7 +358,7 @@ func (s SystemConfig) ComputeSplitKeys(startKey, endKey roachpb.RKey) []roachpb.
 	// Append keys in the user space.
 	endID, err := s.GetLargestObjectID(0)
 	if err != nil {
-		log.Errorf("unable to determine largest object ID from system config: %s", err)
+		log.Errorf(context.TODO(), "unable to determine largest object ID from system config: %s", err)
 		return nil
 	}
 	appendSplitKeys(startID, endID)

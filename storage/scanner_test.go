@@ -18,32 +18,35 @@ package storage
 
 import (
 	"fmt"
-	"sync"
 	"testing"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/google/btree"
+	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/cockroachdb/cockroach/storage/engine"
+	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/syncutil"
 	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 // Test implementation of a range set backed by btree.BTree.
 type testRangeSet struct {
-	sync.Mutex
-	rangesByKey *btree.BTree
-	visited     int
+	syncutil.Mutex
+	replicasByKey *btree.BTree
+	visited       int
 }
 
 // newTestRangeSet creates a new range set that has the count number of ranges.
 func newTestRangeSet(count int, t *testing.T) *testRangeSet {
-	rs := &testRangeSet{rangesByKey: btree.New(64 /* degree */)}
+	rs := &testRangeSet{replicasByKey: btree.New(64 /* degree */)}
 	for i := 0; i < count; i++ {
 		desc := &roachpb.RangeDescriptor{
 			RangeID:  roachpb.RangeID(i),
@@ -53,20 +56,18 @@ func newTestRangeSet(count int, t *testing.T) *testRangeSet {
 		// Initialize the range stat so the scanner can use it.
 		rng := &Replica{
 			RangeID: desc.RangeID,
-			stats: &rangeStats{
-				rangeID: desc.RangeID,
-				mvccStats: engine.MVCCStats{
-					KeyBytes:  1,
-					ValBytes:  2,
-					KeyCount:  1,
-					LiveCount: 1,
-				},
-			},
 		}
+		rng.mu.state.Stats = enginepb.MVCCStats{
+			KeyBytes:  1,
+			ValBytes:  2,
+			KeyCount:  1,
+			LiveCount: 1,
+		}
+
 		if err := rng.setDesc(desc); err != nil {
 			t.Fatal(err)
 		}
-		if exRngItem := rs.rangesByKey.ReplaceOrInsert(rng); exRngItem != nil {
+		if exRngItem := rs.replicasByKey.ReplaceOrInsert(rng); exRngItem != nil {
 			t.Fatalf("failed to insert range %s", rng)
 		}
 	}
@@ -77,7 +78,7 @@ func (rs *testRangeSet) Visit(visitor func(*Replica) bool) {
 	rs.Lock()
 	defer rs.Unlock()
 	rs.visited = 0
-	rs.rangesByKey.Ascend(func(i btree.Item) bool {
+	rs.replicasByKey.Ascend(func(i btree.Item) bool {
 		rs.visited++
 		rs.Unlock()
 		defer rs.Lock()
@@ -88,7 +89,7 @@ func (rs *testRangeSet) Visit(visitor func(*Replica) bool) {
 func (rs *testRangeSet) EstimatedCount() int {
 	rs.Lock()
 	defer rs.Unlock()
-	count := rs.rangesByKey.Len() - rs.visited
+	count := rs.replicasByKey.Len() - rs.visited
 	if count < 1 {
 		count = 1
 	}
@@ -100,7 +101,7 @@ func (rs *testRangeSet) remove(index int, t *testing.T) *Replica {
 	endKey := roachpb.Key(fmt.Sprintf("%03d", index+1))
 	rs.Lock()
 	defer rs.Unlock()
-	rng := rs.rangesByKey.Delete((rangeBTreeKey)(endKey))
+	rng := rs.replicasByKey.Delete((rangeBTreeKey)(endKey))
 	if rng == nil {
 		t.Fatalf("failed to delete range of end key %s", endKey)
 	}
@@ -110,11 +111,11 @@ func (rs *testRangeSet) remove(index int, t *testing.T) *Replica {
 // Test implementation of a range queue which adds range to an
 // internal slice.
 type testQueue struct {
-	sync.Mutex // Protects ranges, done & processed count
-	ranges     []*Replica
-	done       bool
-	processed  int
-	disabled   bool
+	syncutil.Mutex // Protects ranges, done & processed count
+	ranges         []*Replica
+	done           bool
+	processed      int
+	disabled       bool
 }
 
 // setDisabled suspends processing of items from the queue.
@@ -145,7 +146,7 @@ func (tq *testQueue) Start(clock *hlc.Clock, stopper *stop.Stopper) {
 	})
 }
 
-func (tq *testQueue) MaybeAdd(rng *Replica, now roachpb.Timestamp) {
+func (tq *testQueue) MaybeAdd(rng *Replica, now hlc.Timestamp) {
 	tq.Lock()
 	defer tq.Unlock()
 	if index := tq.indexOf(rng); index == -1 {
@@ -202,7 +203,7 @@ func TestScannerAddToQueues(t *testing.T) {
 	s.Start(clock, stopper)
 	util.SucceedsSoon(t, func() error {
 		if q1.count() != count || q2.count() != count {
-			return util.Errorf("q1 or q2 count != %d; got %d, %d", count, q1.count(), q2.count())
+			return errors.Errorf("q1 or q2 count != %d; got %d, %d", count, q1.count(), q2.count())
 		}
 		return nil
 	})
@@ -217,7 +218,7 @@ func TestScannerAddToQueues(t *testing.T) {
 		c1 := q1.count()
 		c2 := q2.count()
 		if c1 != count-1 || c2 != count-1 {
-			return util.Errorf("q1 or q2 count != %d; got %d, %d", count-1, c1, c2)
+			return errors.Errorf("q1 or q2 count != %d; got %d, %d", count-1, c1, c2)
 		}
 		return nil
 	})
@@ -254,10 +255,10 @@ func TestScannerTiming(t *testing.T) {
 			stopper.Stop()
 
 			avg := s.avgScan()
-			log.Infof("%d: average scan: %s", i, avg)
+			log.Infof(context.Background(), "%d: average scan: %s", i, avg)
 			if avg.Nanoseconds()-duration.Nanoseconds() > maxError.Nanoseconds() ||
 				duration.Nanoseconds()-avg.Nanoseconds() > maxError.Nanoseconds() {
-				return util.Errorf("expected %s, got %s: exceeds max error of %s", duration, avg, maxError)
+				return errors.Errorf("expected %s, got %s: exceeds max error of %s", duration, avg, maxError)
 			}
 			return nil
 		})

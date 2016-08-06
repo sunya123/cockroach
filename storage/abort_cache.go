@@ -17,16 +17,16 @@
 package storage
 
 import (
-	"errors"
-
 	"golang.org/x/net/context"
 
 	"github.com/gogo/protobuf/proto"
+	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage/engine"
-	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/uuid"
 )
 
@@ -46,7 +46,7 @@ type AbortCache struct {
 }
 
 // NewAbortCache returns a new abort cache. Every range replica
-// maintains an abort cache, not just the leader.
+// maintains an abort cache, not just the lease holder.
 func NewAbortCache(rangeID roachpb.RangeID) *AbortCache {
 	return &AbortCache{
 		rangeID: rangeID,
@@ -75,15 +75,20 @@ func (sc *AbortCache) max() roachpb.Key {
 
 // ClearData removes all persisted items stored in the cache.
 func (sc *AbortCache) ClearData(e engine.Engine) error {
-	_, err := engine.ClearRange(e, engine.MakeMVCCMetadataKey(sc.min()), engine.MakeMVCCMetadataKey(sc.max()))
-	return err
+	b := e.NewBatch()
+	defer b.Close()
+	_, err := engine.ClearRange(b, engine.MakeMVCCMetadataKey(sc.min()), engine.MakeMVCCMetadataKey(sc.max()))
+	if err != nil {
+		return err
+	}
+	return b.Commit()
 }
 
 // Get looks up an abort cache entry recorded for this transaction ID.
 // Returns whether an abort record was found and any error.
 func (sc *AbortCache) Get(
 	ctx context.Context,
-	e engine.Engine,
+	e engine.Reader,
 	txnID *uuid.UUID,
 	entry *roachpb.AbortCacheEntry,
 ) (bool, error) {
@@ -93,7 +98,7 @@ func (sc *AbortCache) Get(
 
 	// Pull response from disk and read into reply if available.
 	key := keys.AbortCacheKey(sc.rangeID, txnID)
-	ok, err := engine.MVCCGetProto(ctx, e, key, roachpb.ZeroTimestamp, true /* consistent */, nil /* txn */, entry)
+	ok, err := engine.MVCCGetProto(ctx, e, key, hlc.ZeroTimestamp, true /* consistent */, nil /* txn */, entry)
 	return ok, err
 }
 
@@ -103,10 +108,10 @@ func (sc *AbortCache) Get(
 // TODO(tschottdorf): should not use a pointer to UUID.
 func (sc *AbortCache) Iterate(
 	ctx context.Context,
-	e engine.Engine,
+	e engine.Reader,
 	f func([]byte, *uuid.UUID, roachpb.AbortCacheEntry),
 ) {
-	_, _ = engine.MVCCIterate(ctx, e, sc.min(), sc.max(), roachpb.ZeroTimestamp,
+	_, _ = engine.MVCCIterate(ctx, e, sc.min(), sc.max(), hlc.ZeroTimestamp,
 		true /* consistent */, nil /* txn */, false, /* !reverse */
 		func(kv roachpb.KeyValue) (bool, error) {
 			var entry roachpb.AbortCacheEntry
@@ -123,14 +128,14 @@ func (sc *AbortCache) Iterate(
 }
 
 func copySeqCache(
-	e engine.Engine,
-	ms *engine.MVCCStats,
+	e engine.ReadWriter,
+	ms *enginepb.MVCCStats,
 	srcID, dstID roachpb.RangeID,
 	keyMin, keyMax engine.MVCCKey,
 ) (int, error) {
 	var scratch [64]byte
 	var count int
-	var meta engine.MVCCMetadata
+	var meta enginepb.MVCCMetadata
 	// TODO(spencer): look into making this an MVCCIteration and writing
 	// the values using MVCC so we can avoid the ugliness of updating
 	// the MVCCStats by hand below.
@@ -140,15 +145,15 @@ func copySeqCache(
 			// corresponding key in the new cache.
 			txnID, err := decodeAbortCacheMVCCKey(kv.Key, scratch[:0])
 			if err != nil {
-				return false, util.Errorf("could not decode an abort cache key %s: %s", kv.Key, err)
+				return false, errors.Errorf("could not decode an abort cache key %s: %s", kv.Key, err)
 			}
 			key := keys.AbortCacheKey(dstID, txnID)
 			encKey := engine.MakeMVCCMetadataKey(key)
 			// Decode the MVCCMetadata value.
 			if err := proto.Unmarshal(kv.Value, &meta); err != nil {
-				return false, util.Errorf("could not decode mvcc metadata %s [% x]: %s", kv.Key, kv.Value, err)
+				return false, errors.Errorf("could not decode mvcc metadata %s [% x]: %s", kv.Key, kv.Value, err)
 			}
-			value := meta.Value()
+			value := engine.MakeValue(meta)
 			value.ClearChecksum()
 			value.InitChecksum(key)
 			meta.RawBytes = value.RawBytes
@@ -171,8 +176,8 @@ func copySeqCache(
 // abort cache. Failures decoding individual cache entries return an error.
 // On success, returns the number of entries (key-value pairs) copied.
 func (sc *AbortCache) CopyInto(
-	e engine.Engine,
-	ms *engine.MVCCStats,
+	e engine.ReadWriter,
+	ms *enginepb.MVCCStats,
 	destRangeID roachpb.RangeID,
 ) (int, error) {
 	return copySeqCache(e, ms, sc.rangeID, destRangeID,
@@ -187,8 +192,8 @@ func (sc *AbortCache) CopyInto(
 // On success, returns the number of entries (key-value pairs) copied.
 func (sc *AbortCache) CopyFrom(
 	ctx context.Context,
-	e engine.Engine,
-	ms *engine.MVCCStats,
+	e engine.ReadWriter,
+	ms *enginepb.MVCCStats,
 	originRangeID roachpb.RangeID,
 ) (int, error) {
 	originMin := engine.MakeMVCCMetadataKey(keys.AbortCacheKey(originRangeID, txnIDMin))
@@ -199,19 +204,19 @@ func (sc *AbortCache) CopyFrom(
 // Del removes all abort cache entries for the given transaction.
 func (sc *AbortCache) Del(
 	ctx context.Context,
-	e engine.Engine,
-	ms *engine.MVCCStats,
+	e engine.ReadWriter,
+	ms *enginepb.MVCCStats,
 	txnID *uuid.UUID,
 ) error {
 	key := keys.AbortCacheKey(sc.rangeID, txnID)
-	return engine.MVCCDelete(ctx, e, ms, key, roachpb.ZeroTimestamp, nil /* txn */)
+	return engine.MVCCDelete(ctx, e, ms, key, hlc.ZeroTimestamp, nil /* txn */)
 }
 
 // Put writes an entry for the specified transaction ID.
 func (sc *AbortCache) Put(
 	ctx context.Context,
-	e engine.Engine,
-	ms *engine.MVCCStats,
+	e engine.ReadWriter,
+	ms *enginepb.MVCCStats,
 	txnID *uuid.UUID,
 	entry *roachpb.AbortCacheEntry,
 ) error {
@@ -219,14 +224,14 @@ func (sc *AbortCache) Put(
 		return errEmptyTxnID
 	}
 	key := keys.AbortCacheKey(sc.rangeID, txnID)
-	return engine.MVCCPutProto(ctx, e, ms, key, roachpb.ZeroTimestamp, nil /* txn */, entry)
+	return engine.MVCCPutProto(ctx, e, ms, key, hlc.ZeroTimestamp, nil /* txn */, entry)
 }
 
 func decodeAbortCacheMVCCKey(
 	encKey engine.MVCCKey, dest []byte,
 ) (*uuid.UUID, error) {
 	if encKey.IsValue() {
-		return nil, util.Errorf("key %s is not a raw MVCC value", encKey)
+		return nil, errors.Errorf("key %s is not a raw MVCC value", encKey)
 	}
 	return keys.DecodeAbortCacheKey(encKey.Key, dest)
 }

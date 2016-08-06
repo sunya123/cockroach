@@ -23,9 +23,13 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/context"
+
+	"github.com/pkg/errors"
+
 	"github.com/cockroachdb/cockroach/acceptance/cluster"
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/cockroachdb/cockroach/server"
+	"github.com/cockroachdb/cockroach/server/serverpb"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/retry"
@@ -42,23 +46,23 @@ func get(t *testing.T, base, rel string) []byte {
 	// TODO(bram) #2059: Remove retry logic.
 	url := base + rel
 	for r := retry.Start(retryOptions); r.Next(); {
-		resp, err := cluster.HTTPClient().Get(url)
+		resp, err := cluster.HTTPClient.Get(url)
 		if err != nil {
-			log.Infof("could not GET %s - %s", url, err)
+			log.Infof(context.Background(), "could not GET %s - %s", url, err)
 			continue
 		}
 		defer resp.Body.Close()
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
-			log.Infof("could not read body for %s - %s", url, err)
+			log.Infof(context.Background(), "could not read body for %s - %s", url, err)
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
-			log.Infof("could not GET %s - statuscode: %d - body: %s", url, resp.StatusCode, body)
+			log.Infof(context.Background(), "could not GET %s - statuscode: %d - body: %s", url, resp.StatusCode, body)
 			continue
 		}
 		if log.V(1) {
-			log.Infof("OK response from %s", url)
+			log.Infof(context.Background(), "OK response from %s", url)
 		}
 		return body
 	}
@@ -74,13 +78,13 @@ func checkNode(t *testing.T, c cluster.Cluster, i int, nodeID, otherNodeID, expe
 	if nodeID == otherNodeID {
 		urlIDs = append(urlIDs, "local")
 	}
-	var details server.DetailsResponse
+	var details serverpb.DetailsResponse
 	for _, urlID := range urlIDs {
-		if err := getJSON(c.URL(i), fmt.Sprintf("/_status/details/%s", urlID), &details); err != nil {
-			t.Fatal(util.ErrorfSkipFrames(1, "unable to parse details - %s", err))
+		if err := util.GetJSON(cluster.HTTPClient, c.URL(i)+"/_status/details/"+urlID, &details); err != nil {
+			t.Fatal(errors.Errorf("unable to parse details - %s", err))
 		}
 		if details.NodeID != expectedNodeID {
-			t.Fatal(util.ErrorfSkipFrames(1, "%d calling %s: node ids don't match - expected %d, actual %d", nodeID, urlID, expectedNodeID, details.NodeID))
+			t.Fatal(errors.Errorf("%d calling %s: node ids don't match - expected %d, actual %d", nodeID, urlID, expectedNodeID, details.NodeID))
 		}
 
 		get(t, c.URL(i), fmt.Sprintf("/_status/gossip/%s", urlID))
@@ -101,8 +105,8 @@ func testStatusServerInner(t *testing.T, c cluster.Cluster, cfg cluster.TestConf
 	// Get the ids for each node.
 	idMap := make(map[int]roachpb.NodeID)
 	for i := 0; i < c.NumNodes(); i++ {
-		var details server.DetailsResponse
-		if err := getJSON(c.URL(i), "/_status/details/local", &details); err != nil {
+		var details serverpb.DetailsResponse
+		if err := util.GetJSON(cluster.HTTPClient, c.URL(i)+"/_status/details/local", &details); err != nil {
 			t.Fatal(err)
 		}
 		idMap[i] = details.NodeID

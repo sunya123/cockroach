@@ -58,6 +58,7 @@ func TestScanner(t *testing.T) {
 		{`-`, []int{'-'}},
 		{`*`, []int{'*'}},
 		{`/`, []int{'/'}},
+		{`//`, []int{FLOORDIV}},
 		{`%`, []int{'%'}},
 		{`^`, []int{'^'}},
 		{`$`, []int{'$'}},
@@ -66,7 +67,10 @@ func TestScanner(t *testing.T) {
 		{`||`, []int{CONCAT}},
 		{`#`, []int{'#'}},
 		{`~`, []int{'~'}},
-		{`$1`, []int{PARAM}},
+		{`!~`, []int{NOT_REGMATCH}},
+		{`~*`, []int{REGIMATCH}},
+		{`!~*`, []int{NOT_REGIMATCH}},
+		{`$1`, []int{PLACEHOLDER}},
 		{`$a`, []int{'$', IDENT}},
 		{`a`, []int{IDENT}},
 		{`foo + bar`, []int{IDENT, '+', IDENT}},
@@ -86,13 +90,16 @@ func TestScanner(t *testing.T) {
 		{`WITH TIME`, []int{WITH_LA, TIME}},
 		{`WITH ORDINALITY`, []int{WITH_LA, ORDINALITY}},
 		{`1`, []int{ICONST}},
+		{`0xa`, []int{ICONST}},
+		{`x'ba'`, []int{SCONST}},
+		{`X'ba'`, []int{SCONST}},
 		{`1.0`, []int{FCONST}},
 		{`1.0e1`, []int{FCONST}},
 		{`1e+1`, []int{FCONST}},
 		{`1e-1`, []int{FCONST}},
 	}
 	for i, d := range testData {
-		s := makeScanner(d.sql, Traditional)
+		s := MakeScanner(d.sql, Traditional)
 		var tokens []int
 		for {
 			var lval sqlSymType
@@ -125,10 +132,10 @@ func TestScannerModern(t *testing.T) {
 		{`E'a' E"a"`, []int{SCONST, SCONST}},
 		{`r'a' r"a"`, []int{SCONST, SCONST}},
 		{`R'a' R"a"`, []int{SCONST, SCONST}},
-		{`$1 $foo $select`, []int{PARAM, PARAM, PARAM}},
+		{`$1 $foo $select`, []int{PLACEHOLDER, PLACEHOLDER, PLACEHOLDER}},
 	}
 	for i, d := range testData {
-		s := makeScanner(d.sql, Modern)
+		s := MakeScanner(d.sql, Modern)
 		var tokens []int
 		for {
 			var lval sqlSymType
@@ -165,7 +172,7 @@ foo`, "", "foo"},
 		{`/* /* */`, "unterminated comment", ""},
 	}
 	for i, d := range testData {
-		s := makeScanner(d.sql, Traditional)
+		s := MakeScanner(d.sql, Traditional)
 		var lval sqlSymType
 		present, ok := s.scanComment(&lval)
 		if d.err == "" && (!present || !ok) {
@@ -189,7 +196,7 @@ func TestScanCommentModern(t *testing.T) {
 foo`, "", "foo"},
 	}
 	for i, d := range testData {
-		s := makeScanner(d.sql, Modern)
+		s := MakeScanner(d.sql, Modern)
 		var lval sqlSymType
 		present, ok := s.scanComment(&lval)
 		if d.err == "" && (!present || !ok) {
@@ -205,7 +212,7 @@ foo`, "", "foo"},
 
 func TestScanKeyword(t *testing.T) {
 	for kwName, kwID := range keywords {
-		s := makeScanner(kwName, Traditional)
+		s := MakeScanner(kwName, Traditional)
 		var lval sqlSymType
 		id := s.Lex(&lval)
 		if kwID != id {
@@ -241,7 +248,7 @@ func TestScanNumber(t *testing.T) {
 		{`9223372036854775809`, `9223372036854775809`, ICONST},
 	}
 	for _, d := range testData {
-		s := makeScanner(d.sql, Traditional)
+		s := MakeScanner(d.sql, Traditional)
 		var lval sqlSymType
 		id := s.Lex(&lval)
 		if d.id != id {
@@ -253,7 +260,7 @@ func TestScanNumber(t *testing.T) {
 	}
 }
 
-func TestScanParam(t *testing.T) {
+func TestScanPlaceholder(t *testing.T) {
 	testData := []struct {
 		sql      string
 		expected int64
@@ -263,11 +270,11 @@ func TestScanParam(t *testing.T) {
 		{`$123`, 123},
 	}
 	for _, d := range testData {
-		s := makeScanner(d.sql, Traditional)
+		s := MakeScanner(d.sql, Traditional)
 		var lval sqlSymType
 		id := s.Lex(&lval)
-		if id != PARAM {
-			t.Errorf("%s: expected %d, but found %d", d.sql, PARAM, id)
+		if id != PLACEHOLDER {
+			t.Errorf("%s: expected %d, but found %d", d.sql, PLACEHOLDER, id)
 		}
 		if i, err := lval.union.numVal().asInt64(); err != nil {
 			t.Errorf("%s: expected success, but found %v", d.sql, err)
@@ -334,9 +341,11 @@ func TestScanString(t *testing.T) {
 		{`'hello
 world'`, `hello
 world`},
+		{`x'666f6f'`, `foo`},
+		{`X'626172'`, `bar`},
 	}
 	for _, d := range testData {
-		s := makeScanner(d.sql, Traditional)
+		s := MakeScanner(d.sql, Traditional)
 		var lval sqlSymType
 		_ = s.Lex(&lval)
 		if d.expected != lval.str {
@@ -372,7 +381,7 @@ world`},
 world'`, `invalid syntax: embedded newline`},
 	}
 	for _, d := range testData {
-		s := makeScanner(d.sql, Modern)
+		s := MakeScanner(d.sql, Modern)
 		var lval sqlSymType
 		_ = s.Lex(&lval)
 		if d.expected != lval.str {
@@ -389,16 +398,22 @@ func TestScanError(t *testing.T) {
 		{`1e`, "invalid floating point literal"},
 		{`1e-`, "invalid floating point literal"},
 		{`1e+`, "invalid floating point literal"},
-		{`0x`, "invalid hexadecimal literal"},
-		{`1x`, "invalid hexadecimal literal"},
-		{`1.x`, "invalid hexadecimal literal"},
-		{`1.0x`, "invalid hexadecimal literal"},
-		{`0x0x`, "invalid hexadecimal literal"},
-		{`00x0x`, "invalid hexadecimal literal"},
+		{`0x`, "invalid hexadecimal numeric literal"},
+		{`1x`, "invalid hexadecimal numeric literal"},
+		{`1.x`, "invalid hexadecimal numeric literal"},
+		{`1.0x`, "invalid hexadecimal numeric literal"},
+		{`0x0x`, "invalid hexadecimal numeric literal"},
+		{`00x0x`, "invalid hexadecimal numeric literal"},
+		{`08`, "could not make constant int from literal \"08\""},
+		{`x'zzz'`, "invalid hexadecimal string literal"},
+		{`X'zzz'`, "invalid hexadecimal string literal"},
+		{`x'beef\x41'`, "invalid hexadecimal string literal"},
+		{`X'beef\x41\x41'`, "invalid hexadecimal string literal"},
+		{`x'''1'''`, "invalid hexadecimal string literal"},
 		{`$9223372036854775809`, "integer value out of range"},
 	}
 	for _, d := range testData {
-		s := makeScanner(d.sql, Traditional)
+		s := MakeScanner(d.sql, Traditional)
 		var lval sqlSymType
 		id := s.Lex(&lval)
 		if id != ERROR {

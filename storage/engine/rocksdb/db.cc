@@ -30,16 +30,21 @@
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/table.h"
+#include "rocksdb/utilities/checkpoint.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
 #include "cockroach/roachpb/data.pb.h"
 #include "cockroach/roachpb/internal.pb.h"
-#include "cockroach/storage/engine/mvcc.pb.h"
+#include "cockroach/storage/engine/enginepb/mvcc.pb.h"
 #include "db.h"
 #include "encoding.h"
 #include "eventlistener.h"
 
 extern "C" {
 #include "_cgo_export.h"
+
+struct DBCache {
+  std::shared_ptr<rocksdb::Cache> rep;
+};
 
 struct DBEngine {
   rocksdb::DB* const rep;
@@ -58,6 +63,8 @@ struct DBEngine {
   virtual DBStatus Get(DBKey key, DBString* value) = 0;
   virtual DBIterator* NewIter(bool prefix) = 0;
   virtual DBStatus GetStats(DBStatsResult* stats) = 0;
+
+  DBSSTable* GetSSTables(int* n);
 };
 
 struct DBImpl : public DBEngine {
@@ -291,6 +298,16 @@ DBString ToDBString(const rocksdb::Slice& s) {
   return result;
 }
 
+DBKey ToDBKey(const rocksdb::Slice& s) {
+  DBKey key;
+  memset(&key, 0, sizeof(key));
+  rocksdb::Slice tmp;
+  if (DecodeKey(s, &tmp, &key.wall_time, &key.logical)) {
+    key.key = ToDBSlice(tmp);
+  }
+  return key;
+}
+
 DBStatus ToDBStatus(const rocksdb::Status& status) {
   if (status.ok()) {
     return kSuccess;
@@ -351,7 +368,7 @@ void SetTag(std::string *val, cockroach::roachpb::ValueType tag) {
   (*val)[kTagPos] = tag;
 }
 
-bool ParseProtoFromValue(const std::string &val, google::protobuf::Message *msg) {
+bool ParseProtoFromValue(const std::string &val, google::protobuf::MessageLite *msg) {
   if (val.size() < kHeaderSize) {
     return false;
   }
@@ -359,7 +376,7 @@ bool ParseProtoFromValue(const std::string &val, google::protobuf::Message *msg)
   return msg->ParseFromArray(d.data(), d.size());
 }
 
-void SerializeProtoToValue(std::string *val, const google::protobuf::Message &msg) {
+void SerializeProtoToValue(std::string *val, const google::protobuf::MessageLite &msg) {
   val->resize(kHeaderSize);
   std::fill(val->begin(), val->end(), 0);
   SetTag(val, cockroach::roachpb::BYTES);
@@ -440,6 +457,26 @@ class DBPrefixExtractor : public rocksdb::SliceTransform {
   virtual bool InRange(const rocksdb::Slice& dst) const {
     return Transform(dst) == dst;
   }
+};
+
+class DBBatchInserter : public rocksdb::WriteBatch::Handler {
+ public:
+  DBBatchInserter(rocksdb::WriteBatchWithIndex* batch)
+      : batch_(batch) {
+  }
+
+  virtual void Put(const rocksdb::Slice& key, const rocksdb::Slice& value) {
+    batch_->Put(key, value);
+  }
+  virtual void Delete(const rocksdb::Slice& key) {
+    batch_->Delete(key);
+  }
+  virtual void Merge(const rocksdb::Slice& key, const rocksdb::Slice& value) {
+    batch_->Merge(key, value);
+  }
+
+ private:
+  rocksdb::WriteBatchWithIndex* const batch_;
 };
 
 // Method used to sort InternalTimeSeriesSamples.
@@ -596,10 +633,10 @@ bool MergeTimeSeriesValues(
 
 // ConsolidateTimeSeriesValue processes a single value which contains
 // InternalTimeSeriesData messages. This method will sort the sample collection
-// of the value, combining any samples with duplicate offsets. This method is
-// the single-value equivalent of MergeTimeSeriesValues, and is used in the case
-// where the first value is merged into the key. Returns true if the merge is
-// successful.
+// of the value, keeping only the last of samples with duplicate offsets.
+// This method is the single-value equivalent of MergeTimeSeriesValues, and is
+// used in the case where the first value is merged into the key. Returns true
+// if the merge is successful.
 bool ConsolidateTimeSeriesValue(std::string *val, rocksdb::Logger* logger) {
   // Attempt to parse TimeSeriesData from both Values.
   cockroach::roachpb::InternalTimeSeriesData val_ts;
@@ -619,19 +656,18 @@ bool ConsolidateTimeSeriesValue(std::string *val, rocksdb::Logger* logger) {
                    val_ts.mutable_samples()->pointer_end(),
                    TimeSeriesSampleOrdering);
 
-  // Merge sample values of left and right into new_ts.
+  // Consolidate sample values from the ts value with duplicate offsets.
   auto front = val_ts.samples().begin();
   auto end = val_ts.samples().end();
 
   // Loop until samples have been exhausted.
   while (front != end) {
-    // Create an empty sample in the output collection with the selected
-    // offset.  Accumulate data from all samples at the front of the sample
-    // collection which match the selected timestamp. This behavior is
-    // needed because even a single value may have duplicated offsets.
+    // Create an empty sample in the output collection.
     cockroach::roachpb::InternalTimeSeriesSample* ns = new_ts.add_samples();
     ns->set_offset(front->offset());
     while (front != end && front->offset() == ns->offset()) {
+      // Only the last sample in the value's repeated samples field with a given
+      // offset is kept in the case of multiple samples with identical offsets.
       ns->CopyFrom(*front);
       ++front;
     }
@@ -642,8 +678,8 @@ bool ConsolidateTimeSeriesValue(std::string *val, rocksdb::Logger* logger) {
   return true;
 }
 
-bool MergeValues(cockroach::storage::engine::MVCCMetadata *left,
-                 const cockroach::storage::engine::MVCCMetadata &right,
+bool MergeValues(cockroach::storage::engine::enginepb::MVCCMetadata *left,
+                 const cockroach::storage::engine::enginepb::MVCCMetadata &right,
                  bool full_merge, rocksdb::Logger* logger) {
   if (left->has_raw_bytes()) {
     if (!right.has_raw_bytes()) {
@@ -685,7 +721,7 @@ bool MergeValues(cockroach::storage::engine::MVCCMetadata *left,
 
 
 // MergeResult serializes the result MVCCMetadata value into a byte slice.
-DBStatus MergeResult(cockroach::storage::engine::MVCCMetadata* meta, DBString* result) {
+DBStatus MergeResult(cockroach::storage::engine::enginepb::MVCCMetadata* meta, DBString* result) {
   // TODO(pmattis): Should recompute checksum here. Need a crc32
   // implementation and need to verify the checksumming is identical
   // to what is being done in Go. Zlib's crc32 should be sufficient.
@@ -724,7 +760,7 @@ class DBMergeOperator : public rocksdb::MergeOperator {
     // corruption error will be returned, but likely only after the next
     // read of the key). In effect, there is no propagation of error
     // information to the client.
-    cockroach::storage::engine::MVCCMetadata meta;
+    cockroach::storage::engine::enginepb::MVCCMetadata meta;
     if (existing_value != NULL) {
       if (!meta.ParseFromArray(existing_value->data(), existing_value->size())) {
         // Corrupted existing value.
@@ -751,7 +787,7 @@ class DBMergeOperator : public rocksdb::MergeOperator {
       const std::deque<rocksdb::Slice>& operand_list,
       std::string* new_value,
       rocksdb::Logger* logger) const {
-    cockroach::storage::engine::MVCCMetadata meta;
+    cockroach::storage::engine::enginepb::MVCCMetadata meta;
 
     for (int i = 0; i < operand_list.size(); i++) {
       if (!MergeOne(&meta, operand_list[i], false, logger)) {
@@ -767,11 +803,11 @@ class DBMergeOperator : public rocksdb::MergeOperator {
   }
 
  private:
-  bool MergeOne(cockroach::storage::engine::MVCCMetadata* meta,
+  bool MergeOne(cockroach::storage::engine::enginepb::MVCCMetadata* meta,
                 const rocksdb::Slice& operand,
                 bool full_merge,
                 rocksdb::Logger* logger) const {
-    cockroach::storage::engine::MVCCMetadata operand_meta;
+    cockroach::storage::engine::enginepb::MVCCMetadata operand_meta;
     if (!operand_meta.ParseFromArray(operand.data(), operand.size())) {
       rocksdb::Warn(logger, "corrupted operand value");
       return false;
@@ -909,6 +945,10 @@ struct DBGetter : public Getter {
 // <key, seq-num>. Looping over the entries in WBWIIterator will
 // return the keys in sorted order and, for each key, the updates as
 // they were added to the batch.
+//
+// Upon return, the delta iterator will point to the next entry past
+// key. The delta iterator may not be valid if the end of iteration
+// was reached.
 DBStatus ProcessDeltaKey(Getter* base, rocksdb::WBWIIterator* delta,
                          rocksdb::Slice key, DBString* value) {
   if (value->data != NULL) {
@@ -981,7 +1021,9 @@ DBStatus ProcessDeltaKey(Getter* base, rocksdb::WBWIIterator* delta,
 }
 
 // This was cribbed from RocksDB and modified to support merge
-// records.
+// records. A BaseDeltaIterator is an iterator which provides a merged
+// view of a base iterator and a delta where the delta iterator is
+// from a WriteBatchWithIndex.
 class BaseDeltaIterator : public rocksdb::Iterator {
  public:
   BaseDeltaIterator(rocksdb::Iterator* base_iterator,
@@ -989,7 +1031,6 @@ class BaseDeltaIterator : public rocksdb::Iterator {
                     bool prefix)
       : current_at_base_(true),
         equal_keys_(false),
-        done_(false),
         status_(rocksdb::Status::OK()),
         base_iterator_(base_iterator),
         delta_iterator_(delta_iterator),
@@ -1002,11 +1043,10 @@ class BaseDeltaIterator : public rocksdb::Iterator {
   }
 
   bool Valid() const override {
-    return !done_ && (current_at_base_ ? BaseValid() : DeltaValid());
+    return current_at_base_ ? BaseValid() : DeltaValid();
   }
 
   void SeekToFirst() override {
-    done_ = false;
     base_iterator_->SeekToFirst();
     delta_iterator_->SeekToFirst();
     UpdateCurrent(false /* no prefix check */);
@@ -1014,7 +1054,6 @@ class BaseDeltaIterator : public rocksdb::Iterator {
   }
 
   void SeekToLast() override {
-    done_ = false;
     prefix_start_key_.clear();
     base_iterator_->SeekToLast();
     delta_iterator_->SeekToLast();
@@ -1023,7 +1062,6 @@ class BaseDeltaIterator : public rocksdb::Iterator {
   }
 
   void Seek(const rocksdb::Slice& k) override {
-    done_ = false;
     if (prefix_same_as_start_) {
       prefix_start_key_ = KeyPrefix(k);
     }
@@ -1085,32 +1123,8 @@ class BaseDeltaIterator : public rocksdb::Iterator {
                                base_iterator_->key());
   }
 
-  void AssertInvariants() {
-#ifndef NDEBUG
-    if (!Valid()) {
-      return;
-    }
-    if (!BaseValid()) {
-      assert(!current_at_base_ && delta_iterator_->Valid());
-      return;
-    }
-    if (!DeltaValid()) {
-      assert(current_at_base_ && base_iterator_->Valid());
-      return;
-    }
-    // we don't support those yet
-    assert(delta_iterator_->Entry().type != rocksdb::kLogDataRecord);
-    int compare = kComparator.Compare(delta_iterator_->Entry().key,
-                                      base_iterator_->key());
-    // current_at_base -> compare < 0
-    assert(!current_at_base_ || compare < 0);
-    // !current_at_base -> compare <= 0
-    assert(current_at_base_ && compare >= 0);
-    // equal_keys_ <=> compare == 0
-    assert((equal_keys_ || compare != 0) && (!equal_keys_ || compare == 0));
-#endif
-  }
-
+  // Advance the iterator to the next key, advancing either the base
+  // or delta iterators or both.
   void Advance() {
     if (equal_keys_) {
       assert(BaseValid() && DeltaValid());
@@ -1128,11 +1142,18 @@ class BaseDeltaIterator : public rocksdb::Iterator {
     UpdateCurrent(prefix_same_as_start_);
   }
 
+  // Advance the delta iterator, clearing any cached (merged) value
+  // the delta iterator was pointing at.
   void AdvanceDelta() {
     delta_iterator_->Next();
     ClearMerged();
   }
 
+  // Process the current entry the delta iterator is pointing at. This
+  // is needed to handle merge operations. Note that all of the
+  // entries for a particular key are stored consecutively in the
+  // write batch with the "earlier" entries appearing first. Returns
+  // true if the current entry is deleted and false otherwise.
   bool ProcessDelta() {
     IteratorGetter base(equal_keys_ ? base_iterator_.get() : NULL);
     // The contents of WBWIIterator.Entry() are only valid until the
@@ -1159,10 +1180,14 @@ class BaseDeltaIterator : public rocksdb::Iterator {
     return merged_.data == NULL;
   }
 
+  // Advance the base iterator.
   void AdvanceBase() {
     base_iterator_->Next();
   }
 
+  // Save the prefix start key if prefix iteration is enabled. The
+  // prefix start key is the prefix of the key that was seeked to. See
+  // also Seek() where similar code is inlined.
   void MaybeSavePrefixStart() {
     if (prefix_same_as_start_) {
       if (Valid()) {
@@ -1189,6 +1214,14 @@ class BaseDeltaIterator : public rocksdb::Iterator {
     return delta_iterator_->Valid();
   }
 
+  // Update the state for the iterator. The check_prefix parameter
+  // specifies whether iteration should stop if the next non-deleted
+  // key has a prefix that differs from prefix_start_key_.
+  //
+  // UpdateCurrent is the work horse of the BaseDeltaIterator methods
+  // and contains the logic for advancing either the base or delta
+  // iterators or both, as well as overlaying the delta iterator state
+  // on the base iterator.
   void UpdateCurrent(bool check_prefix) {
     ClearMerged();
 
@@ -1201,12 +1234,18 @@ class BaseDeltaIterator : public rocksdb::Iterator {
           return;
         }
         if (check_prefix && CheckPrefix(delta_iterator_->Entry().key)) {
+          // The delta iterator key has a different prefix than the
+          // one we're searching for. We set current_at_base_ to true
+          // which will cause the iterator overall to be considered
+          // not valid (since base currently isn't valid).
+          current_at_base_ = true;
           return;
         }
         if (!ProcessDelta()) {
           current_at_base_ = false;
           return;
         }
+        // Delta is a deletion tombstone.
         AdvanceDelta();
         continue;
       }
@@ -1217,19 +1256,19 @@ class BaseDeltaIterator : public rocksdb::Iterator {
         return;
       }
 
-      int compare = Compare();
+      // Delta and base are both valid. We need to compare keys to see
+      // which to use.
+
+      const int compare = Compare();
       if (compare > 0) {
-        // Delta is greater than base.
-        if (check_prefix && CheckPrefix(base_iterator_->key())) {
-          return;
-        }
+        // Delta is greater than base (use base).
         current_at_base_ = true;
         return;
       }
-      // Delta is less than or equal to base.
-      if (check_prefix && CheckPrefix(delta_iterator_->Entry().key)) {
-        return;
-      }
+      // Delta is less than or equal to base. If check_prefix is true,
+      // for base to be valid it has to contain the prefix we were
+      // searching for. It follows that delta contains the prefix
+      // we're searching for.
       if (compare == 0) {
         // Delta is equal to base.
         equal_keys_ = true;
@@ -1246,10 +1285,9 @@ class BaseDeltaIterator : public rocksdb::Iterator {
         AdvanceBase();
       }
     }
-
-    AssertInvariants();
   }
 
+  // Clear the merged delta iterator value.
   void ClearMerged() const {
     if (merged_.data != NULL) {
       free(merged_.data);
@@ -1258,20 +1296,61 @@ class BaseDeltaIterator : public rocksdb::Iterator {
     }
   }
 
+  // Is the iterator currently pointed at the base or delta iterator?
+  // Also see equal_keys_ which indicates the base and delta iterator
+  // keys are the same and both need to be advanced.
   bool current_at_base_;
   bool equal_keys_;
-  bool done_;
   mutable rocksdb::Status status_;
+  // The merged delta value returned when we're pointed at the delta
+  // iterator.
   mutable DBString merged_;
+  // The base iterator, presumably obtained from a rocksdb::DB.
   std::unique_ptr<rocksdb::Iterator> base_iterator_;
+  // The delta iterator obtained from a rocksdb::WriteBatchWithIndex.
   std::unique_ptr<rocksdb::WBWIIterator> delta_iterator_;
+  // The key the delta iterator is currently pointed at. We can't use
+  // delta_iterator_->Entry().key due to the handling of merge
+  // operations.
   std::string delta_key_;
+  // Is this a prefix iterator?
   const bool prefix_same_as_start_;
+  // The key prefix that we're restricting iteration to. Only used if
+  // prefix_same_as_start_ is true.
   std::string prefix_start_buf_;
   rocksdb::Slice prefix_start_key_;
 };
 
 }  // namespace
+
+DBSSTable* DBEngine::GetSSTables(int* n) {
+  std::vector<rocksdb::LiveFileMetaData> metadata;
+  rep->GetLiveFilesMetaData(&metadata);
+  *n = metadata.size();
+  // We malloc the result so it can be deallocated by the caller using free().
+  const int size = metadata.size() * sizeof(DBSSTable);
+  DBSSTable *tables = reinterpret_cast<DBSSTable*>(malloc(size));
+  memset(tables, 0, size);
+  for (int i = 0; i < metadata.size(); i++) {
+    tables[i].level = metadata[i].level;
+    tables[i].size = metadata[i].size;
+
+    rocksdb::Slice tmp;
+    if (DecodeKey(metadata[i].smallestkey, &tmp,
+                  &tables[i].start_key.wall_time, &tables[i].start_key.logical)) {
+      // This is a bit ugly because we want DBKey.key to be copied and
+      // not refer to the memory in metadata[i].smallestkey.
+      DBString str = ToDBString(tmp);
+      tables[i].start_key.key = *reinterpret_cast<DBSlice*>(&str);
+    }
+    if (DecodeKey(metadata[i].largestkey, &tmp,
+                  &tables[i].end_key.wall_time, &tables[i].end_key.logical)) {
+      DBString str = ToDBString(tmp);
+      tables[i].end_key.key = *reinterpret_cast<DBSlice*>(&str);
+    }
+  }
+  return tables;
+}
 
 DBBatch::DBBatch(DBEngine* db)
     : DBEngine(db->rep),
@@ -1279,18 +1358,27 @@ DBBatch::DBBatch(DBEngine* db)
       updates(0) {
 }
 
-DBStatus DBOpen(DBEngine **db, DBSlice dir, DBOptions db_opts) {
-  // Divide the cache space into two levels: the fast row cache
-  // and the slower but more space-efficient block cache.
-  // TODO(bdarnell): do we need both? how much of each?
-  // TODO(peter): disabled for now until benchmarks show improvement.
-  const auto row_cache_size = 0 * db_opts.cache_size;
-  const auto block_cache_size = db_opts.cache_size - row_cache_size;
+DBCache* DBNewCache(uint64_t size) {
   const int num_cache_shard_bits = 4;
+  DBCache *cache = new DBCache;
+  cache->rep = rocksdb::NewLRUCache(size, num_cache_shard_bits);
+  return cache;
+}
+
+DBCache* DBRefCache(DBCache *cache) {
+  DBCache *res = new DBCache;
+  res->rep = cache->rep;
+  return res;
+}
+
+void DBReleaseCache(DBCache *cache) {
+  delete cache;
+}
+
+DBStatus DBOpen(DBEngine **db, DBSlice dir, DBOptions db_opts) {
   rocksdb::BlockBasedTableOptions table_options;
-  if (block_cache_size > 0) {
-    table_options.block_cache = rocksdb::NewLRUCache(
-        block_cache_size, num_cache_shard_bits);
+  if (db_opts.cache != nullptr) {
+    table_options.block_cache = db_opts.cache->rep;
   }
   // Pass false for use_blocked_base_builder creates a per file
   // (sstable) filter instead of a per-block filter. The per file
@@ -1301,16 +1389,22 @@ DBStatus DBOpen(DBEngine **db, DBSlice dir, DBOptions db_opts) {
       rocksdb::NewBloomFilterPolicy(10, false /* !block_based */));
   table_options.format_version = 2;
 
-  rocksdb::ColumnFamilyOptions cf_options;
-  cf_options.OptimizeLevelStyleCompaction(db_opts.memtable_budget);
-  // OptimizeLevelStyleCompaction sets no-compression for L0 and
-  // L1. Current benchmarks and tests show no benefit to doing this.
-  for (int i = 0; i < cf_options.compression_per_level.size(); i++) {
-    cf_options.compression_per_level[i] = rocksdb::kSnappyCompression;
-  }
+  // Increasing block_size decreases memory usage at the cost of
+  // increased read amplification.
+  table_options.block_size = db_opts.block_size;
 
-  rocksdb::Options options(rocksdb::DBOptions(), cf_options);
+  // Use the rocksdb options builder to configure the base options
+  // using our memtable budget.
+  rocksdb::Options options(rocksdb::GetOptions(db_opts.memtable_budget));
+  // Increase parallelism for compactions based on the number of
+  // cpus. This will use 1 high priority thread for flushes and
+  // num_cpu-1 low priority threads for compactions.
+  options.IncreaseParallelism(db_opts.num_cpu);
+  // Enable subcompactions which will use multiple threads to speed up
+  // a single compaction. The value of num_cpu/2 has not been tuned.
+  options.max_subcompactions = std::max(db_opts.num_cpu / 2, 1);
   options.allow_os_buffer = db_opts.allow_os_buffer;
+  options.WAL_ttl_seconds = db_opts.wal_ttl_seconds;
   options.comparator = &kComparator;
   options.create_if_missing = true;
   options.info_log.reset(new DBLogger(db_opts.logging_enabled));
@@ -1318,18 +1412,39 @@ DBStatus DBOpen(DBEngine **db, DBSlice dir, DBOptions db_opts) {
   options.prefix_extractor.reset(new DBPrefixExtractor);
   options.statistics = rocksdb::CreateDBStatistics();
   options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
+  options.max_open_files = db_opts.max_open_files;
 
-  // File size settings: TODO(marc): investigate and determine better long-term settings:
-  // https://github.com/cockroachdb/cockroach/issues/5852
-  options.target_file_size_base = 64 << 20;
-  options.target_file_size_multiplier = 8;
-  options.max_bytes_for_level_base = 512 << 20;
-  options.max_bytes_for_level_multiplier = 8;
-
-  if (row_cache_size > 0) {
-    options.row_cache = rocksdb::NewLRUCache(
-        row_cache_size, num_cache_shard_bits);
-  }
+  // Merge two memtables when flushing to L0.
+  options.min_write_buffer_number_to_merge = 2;
+  // Enable dynamic level sizing which reduces both size and write
+  // amplification. This causes RocksDB to pick the target size of
+  // each level dynamically.
+  options.level_compaction_dynamic_level_bytes = true;
+  // Follow the RocksDB recommendation to configure the size of L1 to
+  // be the same as the estimated size of L0.
+  options.max_bytes_for_level_base = options.write_buffer_size *
+      options.min_write_buffer_number_to_merge * options.level0_file_num_compaction_trigger;
+  options.max_bytes_for_level_multiplier = 10;
+  // Target the base file size as 1/4 of the base size which will give
+  // us ~4 files in the base level (level 0). Each additional level
+  // grows the file size by 2. If max_bytes_for_level_base is 16 MB,
+  // this translates into the following target level and file sizes
+  // for each level:
+  //
+  //       level-size  file-size  max-files
+  //   L1:      16 MB       4 MB          4
+  //   L2:     160 MB       8 MB         20
+  //   L3:     1.6 GB      16 MB        100
+  //   L4:      16 GB      32 MB        500
+  //   L5:     156 GB      64 MB       2500
+  //   L6:     1.6 TB     128 MB      12500
+  //
+  // We don't want the target file size to be too large, otherwise
+  // individual compactions become more expensive. We don't want the
+  // target file size to be too small or else we get an overabundance
+  // of sstables.
+  options.target_file_size_base = options.max_bytes_for_level_base / 4;
+  options.target_file_size_multiplier = 2;
 
   // Register listener for tracking RocksDB stats.
   std::shared_ptr<DBEventListener> event_listener(new DBEventListener);
@@ -1367,6 +1482,16 @@ DBStatus DBFlush(DBEngine* db) {
 
 DBStatus DBCompact(DBEngine* db) {
   return ToDBStatus(db->rep->CompactRange(rocksdb::CompactRangeOptions(), NULL, NULL));
+}
+
+DBStatus DBCheckpoint(DBEngine* db, DBSlice dir) {
+  rocksdb::Checkpoint* cp = nullptr;
+  rocksdb::Status status = rocksdb::Checkpoint::Create(db->rep, &cp);
+  if (!status.ok()) {
+    return ToDBStatus(status);
+  }
+  std::unique_ptr<rocksdb::Checkpoint> cp_deleter(cp);
+  return ToDBStatus(cp->CreateCheckpoint(ToString(dir)));
 }
 
 DBStatus DBImpl::Put(DBKey key, DBSlice value) {
@@ -1477,10 +1602,13 @@ DBStatus DBImpl::ApplyBatchRepr(DBSlice repr) {
 }
 
 DBStatus DBBatch::ApplyBatchRepr(DBSlice repr) {
-  // TODO(peter): If needed, we could support applying a batch to
-  // another batch. We would have to iterate over the batch contents
-  // and perform the associated Put/Delete/Merge operations.
-  return FmtStatus("unsupported");
+  // TODO(peter): It would be slightly more efficient to iterate over
+  // repr directly instead of first converting it to a string.
+  DBBatchInserter inserter(&batch);
+  rocksdb::WriteBatch batch(ToString(repr));
+  batch.Iterate(&inserter);
+  updates += batch.Count();
+  return kSuccess;
 }
 
 DBStatus DBSnapshot::ApplyBatchRepr(DBSlice repr) {
@@ -1692,12 +1820,12 @@ DBStatus DBIterError(DBIterator* iter) {
 DBStatus DBMergeOne(DBSlice existing, DBSlice update, DBString* new_value) {
   new_value->len = 0;
 
-  cockroach::storage::engine::MVCCMetadata meta;
+  cockroach::storage::engine::enginepb::MVCCMetadata meta;
   if (!meta.ParseFromArray(existing.data, existing.len)) {
     return ToDBString("corrupted existing value");
   }
 
-  cockroach::storage::engine::MVCCMetadata update_meta;
+  cockroach::storage::engine::enginepb::MVCCMetadata update_meta;
   if (!update_meta.ParseFromArray(update.data, update.len)) {
     return ToDBString("corrupted update value");
   }
@@ -1730,7 +1858,7 @@ MVCCStatsResult MVCCComputeStats(
   iter_rep->Seek(EncodeKey(start));
   const std::string end_key = EncodeKey(end);
 
-  cockroach::storage::engine::MVCCMetadata meta;
+  cockroach::storage::engine::enginepb::MVCCMetadata meta;
   std::string prev_key;
   bool first = false;
 
@@ -1837,4 +1965,8 @@ MVCCStatsResult MVCCComputeStats(
 // write them to the provided DBStatsResult instance.
 DBStatus DBGetStats(DBEngine* db, DBStatsResult* stats) {
   return db->GetStats(stats);
+}
+
+DBSSTable* DBGetSSTables(DBEngine* db, int* n) {
+  return db->GetSSTables(n);
 }

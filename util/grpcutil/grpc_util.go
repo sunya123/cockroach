@@ -25,7 +25,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/transport"
 
-	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/netutil"
 )
 
 // IsClosedConnection returns true if err is an error produced by gRPC on closed connections.
@@ -39,5 +39,13 @@ func IsClosedConnection(err error) bool {
 	if streamErr, ok := err.(transport.StreamError); ok && streamErr.Code == codes.Canceled {
 		return true
 	}
-	return util.IsClosedConnection(err)
+	return netutil.IsClosedConnection(err)
+}
+
+// ErrorEqual checks two grpc errors for equality. We check structural
+// equality, not pointer equality as you would get by comparing the error
+// interface.
+func ErrorEqual(err1, err2 error) bool {
+	return grpc.Code(err1) == grpc.Code(err2) &&
+		grpc.ErrorDesc(err1) == grpc.ErrorDesc(err2)
 }

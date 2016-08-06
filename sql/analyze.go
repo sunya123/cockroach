@@ -134,6 +134,9 @@ func joinExprs(exprs parser.TypedExprs, joinExprsFn func(left, right parser.Type
 // to the original. This occurs for expressions which are currently not handled
 // by simplification.
 func simplifyExpr(e parser.TypedExpr) (simplified parser.TypedExpr, equivalent bool) {
+	if e == parser.DNull {
+		return e, true
+	}
 	switch t := e.(type) {
 	case *parser.NotExpr:
 		return simplifyNotExpr(t)
@@ -152,6 +155,9 @@ func simplifyExpr(e parser.TypedExpr) (simplified parser.TypedExpr, equivalent b
 }
 
 func simplifyNotExpr(n *parser.NotExpr) (parser.TypedExpr, bool) {
+	if n.Expr == parser.DNull {
+		return parser.DNull, true
+	}
 	switch t := n.Expr.(type) {
 	case *parser.ComparisonExpr:
 		op := t.Operator
@@ -176,10 +182,18 @@ func simplifyNotExpr(n *parser.NotExpr) (parser.TypedExpr, bool) {
 			op = parser.NotLike
 		case parser.NotLike:
 			op = parser.Like
+		case parser.ILike:
+			op = parser.NotILike
+		case parser.NotILike:
+			op = parser.ILike
 		case parser.SimilarTo:
 			op = parser.NotSimilarTo
 		case parser.NotSimilarTo:
 			op = parser.SimilarTo
+		case parser.RegMatch:
+			op = parser.NotRegMatch
+		case parser.RegIMatch:
+			op = parser.NotRegIMatch
 		default:
 			return parser.MakeDBool(true), false
 		}
@@ -206,6 +220,26 @@ func simplifyNotExpr(n *parser.NotExpr) (parser.TypedExpr, bool) {
 	return parser.MakeDBool(true), false
 }
 
+func isKnownTrue(e parser.TypedExpr) bool {
+	if e == parser.DNull {
+		return false
+	}
+	if b, ok := e.(*parser.DBool); ok {
+		return bool(*b)
+	}
+	return false
+}
+
+func isKnownFalseOrNull(e parser.TypedExpr) bool {
+	if e == parser.DNull {
+		return true
+	}
+	if b, ok := e.(*parser.DBool); ok {
+		return !bool(*b)
+	}
+	return false
+}
+
 func simplifyAndExpr(n *parser.AndExpr) (parser.TypedExpr, bool) {
 	// a AND b AND c AND d -> [a, b, c, d]
 	equivalent := true
@@ -216,8 +250,8 @@ func simplifyAndExpr(n *parser.AndExpr) (parser.TypedExpr, bool) {
 		if !equiv {
 			equivalent = false
 		}
-		if d, ok := exprs[i].(*parser.DBool); ok && !bool(*d) {
-			return d, equivalent
+		if isKnownFalseOrNull(exprs[i]) {
+			return parser.MakeDBool(false), equivalent
 		}
 	}
 	// Simplifying exprs might have transformed one of the elements into an AND
@@ -239,10 +273,10 @@ outer:
 			if !equiv {
 				equivalent = false
 			}
-			if d, ok := exprs[j].(*parser.DBool); ok && !bool(*d) {
-				return d, equivalent
+			if isKnownFalseOrNull(exprs[j]) {
+				return exprs[j], equivalent
 			}
-			if d, ok := exprs[i].(*parser.DBool); ok && bool(*d) {
+			if isKnownTrue(exprs[i]) {
 				exprs[i] = nil
 			}
 			if exprs[i] == nil {
@@ -767,8 +801,8 @@ func simplifyOrExpr(n *parser.OrExpr) (parser.TypedExpr, bool) {
 		if !equiv {
 			equivalent = false
 		}
-		if d, ok := exprs[i].(*parser.DBool); ok && bool(*d) {
-			return d, equivalent
+		if isKnownTrue(exprs[i]) {
+			return exprs[i], equivalent
 		}
 	}
 	// Simplifying exprs might have transformed one of the elements into an OR
@@ -790,10 +824,10 @@ outer:
 			if !equiv {
 				equivalent = false
 			}
-			if d, ok := exprs[j].(*parser.DBool); ok && bool(*d) {
-				return d, equivalent
+			if isKnownTrue(exprs[j]) {
+				return exprs[j], equivalent
 			}
-			if d, ok := exprs[i].(*parser.DBool); ok && !bool(*d) {
+			if isKnownFalseOrNull(exprs[i]) {
 				exprs[i] = nil
 			}
 			if exprs[i] == nil {
@@ -1561,4 +1595,59 @@ func makeIsNotNull(left parser.TypedExpr) parser.TypedExpr {
 		left,
 		parser.DNull,
 	)
+}
+
+// analyzeExpr performs semantic analysis of an axpression, including:
+// - replacing sub-queries by a sql.subquery node;
+// - resolving qnames (optional);
+// - type checking (with optional type enforcement);
+// - normalization.
+// The parameters sources and qvals, if both are non-nil, indicate
+// qname resolution should be performed. The qvals map will be filled
+// as a result.
+func (p *planner) analyzeExpr(
+	raw parser.Expr,
+	/* arguments for qname resolution */
+	sources multiSourceInfo,
+	qvals qvalMap,
+	/* arguments for type checking */
+	expectedType parser.Datum,
+	requireType bool,
+	typingContext string,
+) (parser.TypedExpr, error) {
+	// Replace the sub-queries.
+	// In all contexts that analyze a single expression, a single value
+	// is expected. Tell this to replaceSubqueries.  (See UPDATE for a
+	// counter-example; cases where a subquery is an operand of a
+	// comparison are handled specially in the subqueryVisitor already.)
+	replaced, err := p.replaceSubqueries(raw, 1 /* one value expected */)
+	if err != nil {
+		return nil, err
+	}
+
+	// Perform optional qname resolution.
+	var resolved parser.Expr
+	if sources == nil || qvals == nil {
+		resolved = replaced
+	} else {
+		resolved, err = resolveQNames(replaced, sources, qvals, &p.qnameVisitor)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Type check.
+	var typedExpr parser.TypedExpr
+	if requireType {
+		typedExpr, err = parser.TypeCheckAndRequire(resolved, &p.semaCtx,
+			expectedType, typingContext)
+	} else {
+		typedExpr, err = parser.TypeCheck(resolved, &p.semaCtx, expectedType)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Normalize.
+	return p.parser.NormalizeExpr(&p.evalCtx, typedExpr)
 }

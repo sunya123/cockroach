@@ -17,19 +17,21 @@
 package acceptance
 
 import (
-	"bytes"
 	gosql "database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"testing"
 	"time"
+
+	"golang.org/x/net/context"
 
 	"github.com/docker/engine-api/types"
 	"github.com/docker/engine-api/types/container"
@@ -37,11 +39,38 @@ import (
 	"github.com/cockroachdb/cockroach/acceptance/cluster"
 	"github.com/cockroachdb/cockroach/acceptance/terrafarm"
 	"github.com/cockroachdb/cockroach/base"
-	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/caller"
 	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/randutil"
 	_ "github.com/cockroachdb/pq"
 )
+
+type keepClusterVar string
+
+func (kcv *keepClusterVar) String() string {
+	return string(*kcv)
+}
+
+func (kcv *keepClusterVar) Set(val string) error {
+	if val != terrafarm.KeepClusterAlways &&
+		val != terrafarm.KeepClusterFailed &&
+		val != terrafarm.KeepClusterNever {
+		return errors.New("invalid value")
+	}
+	*kcv = keepClusterVar(val)
+	return nil
+}
+
+func init() {
+	flag.Var(&flagTFKeepCluster, "tf.keep-cluster",
+		"keep the cluster after the test, either 'always', 'never', or 'failed'")
+
+	flag.Parse()
+
+	if *flagCLTWriters == -1 {
+		*flagCLTWriters = *flagNodes
+	}
+}
 
 var flagDuration = flag.Duration("d", cluster.DefaultDuration, "duration to run the test")
 var flagNodes = flag.Int("nodes", 3, "number of nodes")
@@ -58,17 +87,84 @@ var flagConfig = flag.String("config", "", "a json TestConfig proto, see testcon
 var flagPrivileged = flag.Bool("privileged", os.Getenv("CIRCLECI") != "true",
 	"run containers in privileged mode (required for nemesis tests")
 
+// Terrafarm flags.
+var flagTFReuseCluster = flag.String("reuse", "",
+	`attempt to use the cluster with the given name.
+	  Tests which don't support this may behave unexpectedly.
+	  This flag can also be set to have a test create a cluster
+	  with predetermined name.`,
+)
+
+var flagTFKeepCluster = keepClusterVar(terrafarm.KeepClusterNever) // see init()
+
+// Allocator test flags.
+//
+// TODO(cuongdo): These should be refactored so that they're not allocator
+// test-specific when we have more than one kind of system test that uses these
+// flags.
+var flagATCockroachBinary = flag.String("at.cockroach-binary", "",
+	"path to custom CockroachDB binary to use for allocator tests")
+var flagATCockroachFlags = flag.String("at.cockroach-flags", "",
+	"command-line flags to pass to cockroach for allocator tests")
+var flagATCockroachEnv = flag.String("at.cockroach-env", "",
+	"supervisor-style environment variables to pass to cockroach")
+var flagATDiskType = flag.String("at.disk-type", "pd-standard",
+	"type of disk (either 'pd-standard' for spinny disk, or 'pd-ssd' for SSD)")
+var flagATMaxStdDev = flag.Float64("at.std-dev", 10,
+	"maximum standard deviation of replica counts")
+
+// continuousLoadTest (CLT) flags.
+var flagCLTWriters = flag.Int("clt.writers", -1,
+	"# of load generators to spawn (defaults to # of nodes)")
+var flagCLTMinQPS = flag.Float64("clt.min-qps", 5.0,
+	"fail load tests when queries per second drops below this during a health check interval")
+
 var testFuncRE = regexp.MustCompile("^(Test|Benchmark)")
 
 var stopper = make(chan struct{})
 
-func farmer(t *testing.T) *terrafarm.Farmer {
-	if !*flagRemote {
-		t.Skip("running in docker mode")
-	}
+func runTests(m *testing.M) {
+	randutil.SeedForTests()
+	go func() {
+		// Shut down tests when interrupted (for example CTRL+C).
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt)
+		<-sig
+		select {
+		case <-stopper:
+		default:
+			// There is a very tiny race here: the cluster might be closing
+			// the stopper simultaneously.
+			close(stopper)
+		}
+	}()
+	os.Exit(m.Run())
+}
+
+// prefixRE is based on a Terraform error message regarding invalid resource
+// names. We perform this check to make sure that when we prepend the name
+// to the Terraform-generated resource name, we have a name that meets
+// Terraform's naming rules.
+//
+// Here's an example of the error message:
+//
+// * google_compute_instance.cockroach: Error creating instance: googleapi:
+//   Error 400: Invalid value for field 'resource.name':
+//   'Uprep-1to3-small-cockroach-1'. Must be a match of regex
+//   '(?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)', invalid
+var prefixRE = regexp.MustCompile("^(?:[a-z](?:[-a-z0-9]{0,45}[a-z0-9])?)$")
+
+func farmer(t *testing.T, prefix string) *terrafarm.Farmer {
+	SkipUnlessRemote(t)
+
 	if *flagKeyName == "" {
 		t.Fatal("-key-name is required") // saves a lot of trouble
 	}
+
+	if e := "GOOGLE_PROJECT"; os.Getenv(e) == "" {
+		t.Fatalf("%s environment variable must be set for Terraform", e)
+	}
+
 	logDir := *flagLogDir
 	if logDir == "" {
 		var err error
@@ -80,18 +176,56 @@ func farmer(t *testing.T) *terrafarm.Farmer {
 	if !filepath.IsAbs(logDir) {
 		logDir = filepath.Join(filepath.Clean(os.ExpandEnv("${PWD}")), logDir)
 	}
-	stores := "ssd=data0"
+	stores := "--store=/mnt/data0"
 	for j := 1; j < *flagStores; j++ {
-		stores += ",ssd=data" + strconv.Itoa(j)
+		stores += " --store=/mnt/data" + strconv.Itoa(j)
+	}
+
+	var name string
+	if *flagTFReuseCluster == "" {
+		// We concatenate a random name to the prefix (for Terraform resource
+		// names) to allow multiple instances of the same test to run
+		// concurrently. The prefix is also used as the name of the Terraform
+		// state file.
+
+		name = prefix
+		if name != "" {
+			name += "-"
+		}
+
+		name += getRandomName()
+
+		// Rudimentary collision control.
+		for i := 0; ; i++ {
+			newName := name
+			if i > 0 {
+				newName += strconv.Itoa(i)
+			}
+			_, err := os.Stat(filepath.Join(*flagCwd, newName+".tfstate"))
+			if os.IsNotExist(err) {
+				name = newName
+				break
+			}
+		}
+	} else {
+		name = *flagTFReuseCluster
+	}
+
+	if !prefixRE.MatchString(name) {
+		t.Fatalf("generated cluster name '%s' must match regex %s", name, prefixRE)
 	}
 	f := &terrafarm.Farmer{
-		Output:  os.Stderr,
-		Cwd:     *flagCwd,
-		LogDir:  logDir,
-		KeyName: *flagKeyName,
-		Stores:  stores,
+		Output:      os.Stderr,
+		Cwd:         *flagCwd,
+		LogDir:      logDir,
+		KeyName:     *flagKeyName,
+		Stores:      stores,
+		Prefix:      name,
+		StateFile:   name + ".tfstate",
+		AddVars:     make(map[string]string),
+		KeepCluster: flagTFKeepCluster.String(),
 	}
-	log.Infof("logging to %s", logDir)
+	log.Infof(context.Background(), "logging to %s", logDir)
 	return f
 }
 
@@ -177,11 +311,15 @@ func StartCluster(t *testing.T, cfg cluster.TestConfig) (c cluster.Cluster) {
 	if !*flagRemote {
 		logDir := *flagLogDir
 		if logDir != "" {
-			_, _, fun := caller.Lookup(3)
-			if !testFuncRE.MatchString(fun) {
-				t.Fatalf("invalid caller %s; want TestX -> runTestOnConfigs -> func()", fun)
-			}
-			logDir = filepath.Join(logDir, fun)
+			logDir = func(d string) string {
+				for i := 1; i < 100; i++ {
+					_, _, fun := caller.Lookup(i)
+					if testFuncRE.MatchString(fun) {
+						return filepath.Join(d, fun)
+					}
+				}
+				panic("no caller matching Test(.*) in stack trace")
+			}(logDir)
 		}
 		l := cluster.CreateLocal(cfg, logDir, *flagPrivileged, stopper)
 		l.Start()
@@ -190,13 +328,15 @@ func StartCluster(t *testing.T, cfg cluster.TestConfig) (c cluster.Cluster) {
 		completed = true
 		return l
 	}
-	f := farmer(t)
+	f := farmer(t, "")
 	c = f
-	if err := f.Resize(*flagNodes, 0); err != nil {
+	if err := f.Resize(*flagNodes); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.WaitReady(5 * time.Minute); err != nil {
-		_ = f.Destroy()
+		if destroyErr := f.Destroy(t); destroyErr != nil {
+			t.Fatalf("could not destroy cluster after error %v: %v", err, destroyErr)
+		}
 		t.Fatalf("cluster not ready in time: %v", err)
 	}
 	checkRangeReplication(t, f, 20*time.Second)
@@ -208,6 +348,13 @@ func StartCluster(t *testing.T, cfg cluster.TestConfig) (c cluster.Cluster) {
 func SkipUnlessLocal(t *testing.T) {
 	if *flagRemote {
 		t.Skip("skipping since not run against local cluster")
+	}
+}
+
+// SkipUnlessRemote calls t.Skip if not running against a remote cluster.
+func SkipUnlessRemote(t *testing.T) {
+	if !*flagRemote {
+		t.Skip("skipping since not run against remote cluster")
 	}
 }
 
@@ -226,55 +373,6 @@ func makePGClient(t *testing.T, dest string) *gosql.DB {
 	return db
 }
 
-// getJSON retrieves the URL specified by the parameters and
-// and unmarshals the result into the supplied interface.
-func getJSON(base, rel string, v interface{}) error {
-	url := base + rel
-	resp, err := cluster.HTTPClient().Get(url)
-	if err != nil {
-		if log.V(1) {
-			log.Info(err)
-		}
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	b, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		if log.V(1) {
-			log.Info(err)
-		}
-		return err
-	}
-	return json.Unmarshal(b, v)
-}
-
-// postJSON POSTs to the URL specified by the parameters and unmarshals the
-// result into the supplied interface.
-func postJSON(c *http.Client, url, rel string, reqBody interface{}, v interface{}) error {
-	reqBodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return err
-	}
-
-	resp, err := c.Post(url+rel, util.JSONContentType, bytes.NewReader(reqBodyBytes))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	b, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return util.Errorf("%d: %s", resp.StatusCode, b)
-	}
-	if err := new(util.JSONPb).Unmarshal(b, v); err != nil {
-		return fmt.Errorf("cannot unmarshal %s: %s", b, err)
-	}
-
-	return nil
-}
-
 // testDockerFail ensures the specified docker cmd fails.
 func testDockerFail(t *testing.T, name string, cmd []string) {
 	if err := testDockerSingleNode(t, name, cmd); err == nil {
@@ -285,27 +383,30 @@ func testDockerFail(t *testing.T, name string, cmd []string) {
 // testDockerSuccess ensures the specified docker cmd succeeds.
 func testDockerSuccess(t *testing.T, name string, cmd []string) {
 	if err := testDockerSingleNode(t, name, cmd); err != nil {
-		t.Errorf("expected success: %s", err)
+		t.Error(err)
 	}
 }
 
 const (
-	postgresTestImage = "cockroachdb/postgres-test"
-	postgresTestTag   = "20160512-1936"
+	// NB: postgresTestTag is grepped for in circle-deps.sh, so don't rename it.
+	postgresTestTag = "20160705-1326"
+	// Iterating against a locally built version of the docker image can be done
+	// by changing postgresTestImage to the hash of the container.
+	postgresTestImage = "cockroachdb/postgres-test:" + postgresTestTag
 )
 
-func testDockerSingleNode(t *testing.T, name string, cmd []string) error {
+func testDocker(t *testing.T, num int32, name string, cmd []string) error {
 	SkipUnlessLocal(t)
 	cfg := cluster.TestConfig{
 		Name:     name,
 		Duration: *flagDuration,
-		Nodes:    []cluster.NodeConfig{{Count: 1, Stores: []cluster.StoreConfig{{Count: 1}}}},
+		Nodes:    []cluster.NodeConfig{{Count: num, Stores: []cluster.StoreConfig{{Count: 1}}}},
 	}
 	l := StartCluster(t, cfg).(*cluster.LocalCluster)
 	defer l.AssertAndStop(t)
 
 	containerConfig := container.Config{
-		Image: fmt.Sprintf(postgresTestImage + ":" + postgresTestTag),
+		Image: postgresTestImage,
 		Env: []string{
 			"PGHOST=roach0",
 			fmt.Sprintf("PGPORT=%s", base.DefaultPort),
@@ -315,5 +416,36 @@ func testDockerSingleNode(t *testing.T, name string, cmd []string) error {
 		Cmd: cmd,
 	}
 	hostConfig := container.HostConfig{NetworkMode: "host"}
-	return l.OneShot(postgresTestImage+":"+postgresTestTag, types.ImagePullOptions{}, containerConfig, hostConfig, "docker-"+name)
+	return l.OneShot(postgresTestImage, types.ImagePullOptions{}, containerConfig, hostConfig, "docker-"+name)
+}
+
+func testDockerSingleNode(t *testing.T, name string, cmd []string) error {
+	return testDocker(t, 1, name, cmd)
+}
+
+func testDockerOneShot(t *testing.T, name string, cmd []string) error {
+	return testDocker(t, 0, name, cmd)
+}
+
+// WithClusterTimeout returns a copy of the given parent Context with a timeout
+// that's less than the `test.timeout` flag, allowing time for test cluster
+// creation and destruction to occur.
+func WithClusterTimeout(parent context.Context) (context.Context, error) {
+	// createDestroyInterval is set based on occasional observed teardown times of 6-7
+	// minutes.
+	const createDestroyInterval = 10 * time.Minute
+	fl := flag.Lookup("test.timeout")
+	if fl == nil {
+		return parent, nil
+	}
+	testTimeout, err := time.ParseDuration(fl.Value.String())
+	if err != nil {
+		return nil, err
+	}
+	if createDestroyInterval >= testTimeout {
+		return nil, fmt.Errorf("test.timeout must be greater than create/destroy interval %s",
+			createDestroyInterval)
+	}
+	ctx, _ := context.WithTimeout(parent, testTimeout-createDestroyInterval)
+	return ctx, nil
 }

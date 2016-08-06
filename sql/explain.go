@@ -19,10 +19,10 @@ package sql
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/sql/parser"
-	"github.com/cockroachdb/cockroach/util/encoding"
 	"github.com/cockroachdb/cockroach/util/tracing"
 	basictracer "github.com/opentracing/basictracer-go"
 	opentracing "github.com/opentracing/opentracing-go"
@@ -38,13 +38,17 @@ const (
 	explainTypes
 )
 
+var explainStrings = []string{"", "debug", "plan", "trace", "types"}
+
 // Explain executes the explain statement, providing debugging and analysis
-// info about a DELETE, INSERT, SELECT or UPDATE statement.
+// info about the wrapped statement.
 //
 // Privileges: the same privileges as the statement being explained.
 func (p *planner) Explain(n *parser.Explain, autoCommit bool) (planNode, error) {
 	mode := explainNone
 	verbose := false
+	expanded := true
+	normalizedExplainTypes := false
 	for _, opt := range n.Options {
 		newMode := explainNone
 		if strings.EqualFold(opt, "DEBUG") {
@@ -57,6 +61,10 @@ func (p *planner) Explain(n *parser.Explain, autoCommit bool) (planNode, error) 
 			newMode = explainTypes
 		} else if strings.EqualFold(opt, "VERBOSE") {
 			verbose = true
+		} else if strings.EqualFold(opt, "NOEXPAND") {
+			expanded = false
+		} else if strings.EqualFold(opt, "NORMALIZE") {
+			normalizedExplainTypes = true
 		} else {
 			return nil, fmt.Errorf("unsupported EXPLAIN option: %s", opt)
 		}
@@ -81,6 +89,10 @@ func (p *planner) Explain(n *parser.Explain, autoCommit bool) (planNode, error) 
 		p.txn.Context = opentracing.ContextWithSpan(p.txn.Context, sp)
 	}
 
+	if mode == explainTypes {
+		p.evalCtx.SkipNormalize = !normalizedExplainTypes
+	}
+
 	plan, err := p.newPlan(n.Statement, nil, autoCommit)
 	if err != nil {
 		return nil, err
@@ -91,7 +103,8 @@ func (p *planner) Explain(n *parser.Explain, autoCommit bool) (planNode, error) 
 
 	case explainTypes:
 		node := &explainTypesNode{
-			plan: plan,
+			plan:     plan,
+			expanded: expanded,
 			results: &valuesNode{
 				columns: []ResultColumn{
 					{Name: "Level", Typ: parser.TypeInt},
@@ -107,21 +120,11 @@ func (p *planner) Explain(n *parser.Explain, autoCommit bool) (planNode, error) 
 		node := &explainPlanNode{
 			verbose: verbose,
 			plan:    plan,
-			results: &valuesNode{
-				columns: []ResultColumn{
-					{Name: "Level", Typ: parser.TypeInt},
-					{Name: "Type", Typ: parser.TypeString},
-					{Name: "Description", Typ: parser.TypeString},
-				},
-			},
 		}
 		return node, nil
 
 	case explainTrace:
-		return (&sortNode{
-			ordering: []columnOrderInfo{{len(traceColumns), encoding.Ascending}, {2, encoding.Ascending}},
-			columns:  traceColumns,
-		}).wrap(&explainTraceNode{plan: plan, txn: p.txn}), nil
+		return makeTraceNode(plan, p.txn), nil
 
 	default:
 		return nil, fmt.Errorf("unsupported EXPLAIN mode: %d", mode)
@@ -129,27 +132,35 @@ func (p *planner) Explain(n *parser.Explain, autoCommit bool) (planNode, error) 
 }
 
 type explainTypesNode struct {
-	plan    planNode
-	results *valuesNode
+	plan     planNode
+	expanded bool
+	results  *valuesNode
 }
 
 func (e *explainTypesNode) ExplainTypes(fn func(string, string)) {}
-func (e *explainTypesNode) Next() bool                           { return e.results.Next() }
+func (e *explainTypesNode) Next() (bool, error)                  { return e.results.Next() }
 func (e *explainTypesNode) Columns() []ResultColumn              { return e.results.Columns() }
 func (e *explainTypesNode) Ordering() orderingInfo               { return e.results.Ordering() }
 func (e *explainTypesNode) Values() parser.DTuple                { return e.results.Values() }
 func (e *explainTypesNode) DebugValues() debugValues             { return e.results.DebugValues() }
-func (e *explainTypesNode) Err() error                           { return e.results.Err() }
 func (e *explainTypesNode) SetLimitHint(n int64, s bool)         { e.results.SetLimitHint(n, s) }
-func (e *explainTypesNode) MarkDebug(mode explainMode)           { e.results.MarkDebug(mode) }
+func (e *explainTypesNode) MarkDebug(mode explainMode)           {}
 func (e *explainTypesNode) ExplainPlan(v bool) (string, string, []planNode) {
-	return e.plan.ExplainPlan(v)
+	return "explain", "types", []planNode{e.plan}
 }
 
 func (e *explainTypesNode) expandPlan() error {
-	// TODO(knz) This will not need to call expandPlan() any more once all
-	// the type checking occurs earlier.
-	return e.plan.expandPlan()
+	if e.expanded {
+		if err := e.plan.expandPlan(); err != nil {
+			return err
+		}
+		// Trigger limit hint propagation, which would otherwise only
+		// occur during the plan's Start() phase. This may trigger
+		// additional optimizations (eg. in sortNode) which the user of
+		// EXPLAIN will be interested in.
+		e.plan.SetLimitHint(math.MaxInt64, true)
+	}
+	return nil
 }
 
 func (e *explainTypesNode) Start() error {
@@ -157,26 +168,35 @@ func (e *explainTypesNode) Start() error {
 	return nil
 }
 
+func formatColumns(cols []ResultColumn, printTypes bool) string {
+	var buf bytes.Buffer
+	buf.WriteByte('(')
+	for i, rCol := range cols {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		parser.Name(rCol.Name).Format(&buf, parser.FmtSimple)
+		if rCol.hidden {
+			buf.WriteString("[hidden]")
+		}
+		if printTypes {
+			buf.WriteByte(' ')
+			buf.WriteString(rCol.Typ.Type())
+		}
+	}
+	buf.WriteByte(')')
+	return buf.String()
+}
+
 func populateTypes(v *valuesNode, plan planNode, level int) {
 	name, _, children := plan.ExplainPlan(true)
 
 	// Format the result column types.
-	var colDesc bytes.Buffer
-	colDesc.WriteByte('(')
-	for i, rCol := range plan.Columns() {
-		if i > 0 {
-			colDesc.WriteString(", ")
-		}
-		colDesc.WriteString(parser.Name(rCol.Name).String())
-		colDesc.WriteByte(' ')
-		colDesc.WriteString(rCol.Typ.Type())
-	}
-	colDesc.WriteByte(')')
 	row := parser.DTuple{
 		parser.NewDInt(parser.DInt(level)),
 		parser.NewDString(name),
 		parser.NewDString("result"),
-		parser.NewDString(colDesc.String()),
+		parser.NewDString(formatColumns(plan.Columns(), true)),
 	}
 	v.rows = append(v.rows, row)
 
@@ -205,17 +225,37 @@ type explainPlanNode struct {
 }
 
 func (e *explainPlanNode) ExplainTypes(fn func(string, string)) {}
-func (e *explainPlanNode) Next() bool                           { return e.results.Next() }
+func (e *explainPlanNode) Next() (bool, error)                  { return e.results.Next() }
 func (e *explainPlanNode) Columns() []ResultColumn              { return e.results.Columns() }
 func (e *explainPlanNode) Ordering() orderingInfo               { return e.results.Ordering() }
 func (e *explainPlanNode) Values() parser.DTuple                { return e.results.Values() }
-func (e *explainPlanNode) DebugValues() debugValues             { return e.results.DebugValues() }
-func (e *explainPlanNode) Err() error                           { return e.results.Err() }
+func (e *explainPlanNode) DebugValues() debugValues             { return debugValues{} }
 func (e *explainPlanNode) SetLimitHint(n int64, s bool)         { e.results.SetLimitHint(n, s) }
-func (e *explainPlanNode) MarkDebug(mode explainMode)           { e.results.MarkDebug(mode) }
-func (e *explainPlanNode) expandPlan() error                    { return e.plan.expandPlan() }
+func (e *explainPlanNode) MarkDebug(mode explainMode)           {}
+func (e *explainPlanNode) expandPlan() error {
+	columns := []ResultColumn{
+		{Name: "Level", Typ: parser.TypeInt},
+		{Name: "Type", Typ: parser.TypeString},
+		{Name: "Description", Typ: parser.TypeString},
+	}
+	if e.verbose {
+		columns = append(columns, ResultColumn{Name: "Columns", Typ: parser.TypeString})
+		columns = append(columns, ResultColumn{Name: "Ordering", Typ: parser.TypeString})
+	}
+	e.results = &valuesNode{columns: columns}
+
+	if err := e.plan.expandPlan(); err != nil {
+		return err
+	}
+	// Trigger limit hint propagation, which would otherwise only occur
+	// during the plan's Start() phase. This may trigger additional
+	// optimizations (eg. in sortNode) which the user of EXPLAIN will be
+	// interested in.
+	e.plan.SetLimitHint(math.MaxInt64, true)
+	return nil
+}
 func (e *explainPlanNode) ExplainPlan(v bool) (string, string, []planNode) {
-	return e.plan.ExplainPlan(v)
+	return "explain", "plan", []planNode{e.plan}
 }
 
 func (e *explainPlanNode) Start() error {
@@ -230,6 +270,10 @@ func populateExplain(verbose bool, v *valuesNode, plan planNode, level int) {
 		parser.NewDInt(parser.DInt(level)),
 		parser.NewDString(name),
 		parser.NewDString(description),
+	}
+	if verbose {
+		row = append(row, parser.NewDString(formatColumns(plan.Columns(), false)))
+		row = append(row, parser.NewDString(plan.Ordering().AsString(plan.Columns())))
 	}
 	v.rows = append(v.rows, row)
 
@@ -325,7 +369,6 @@ var debugColumns = []ResultColumn{
 func (*explainDebugNode) Columns() []ResultColumn { return debugColumns }
 func (*explainDebugNode) Ordering() orderingInfo  { return orderingInfo{} }
 
-func (n *explainDebugNode) Err() error { return n.plan.Err() }
 func (n *explainDebugNode) expandPlan() error {
 	if err := n.plan.expandPlan(); err != nil {
 		return err
@@ -334,17 +377,14 @@ func (n *explainDebugNode) expandPlan() error {
 	return nil
 }
 
-func (n *explainDebugNode) Start() error { return n.plan.Start() }
-
-func (n *explainDebugNode) Next() bool { return n.plan.Next() }
+func (n *explainDebugNode) Start() error        { return n.plan.Start() }
+func (n *explainDebugNode) Next() (bool, error) { return n.plan.Next() }
 
 func (n *explainDebugNode) ExplainPlan(v bool) (name, description string, children []planNode) {
 	return n.plan.ExplainPlan(v)
 }
 
-func (n *explainDebugNode) ExplainTypes(fn func(string, string)) {
-	n.plan.ExplainTypes(fn)
-}
+func (n *explainDebugNode) ExplainTypes(fn func(string, string)) {}
 
 func (n *explainDebugNode) Values() parser.DTuple {
 	vals := n.plan.DebugValues()
@@ -362,12 +402,6 @@ func (n *explainDebugNode) Values() parser.DTuple {
 	}
 }
 
-func (*explainDebugNode) MarkDebug(_ explainMode) {
-	panic("debug mode not implemented in explainDebugNode")
-}
-
-func (*explainDebugNode) DebugValues() debugValues {
-	panic("debug mode not implemented in explainDebugNode")
-}
-
+func (*explainDebugNode) MarkDebug(_ explainMode)      {}
+func (*explainDebugNode) DebugValues() debugValues     { return debugValues{} }
 func (*explainDebugNode) SetLimitHint(_ int64, _ bool) {}

@@ -19,9 +19,12 @@ package storage
 import (
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/config"
 	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 )
 
@@ -34,31 +37,32 @@ type replicaConsistencyQueue struct {
 }
 
 // newReplicaConsistencyQueue returns a new instance of replicaConsistencyQueue.
-func newReplicaConsistencyQueue(gossip *gossip.Gossip) *replicaConsistencyQueue {
+func newReplicaConsistencyQueue(store *Store, gossip *gossip.Gossip) *replicaConsistencyQueue {
 	rcq := &replicaConsistencyQueue{}
-	rcq.baseQueue = makeBaseQueue("replica consistency checker", rcq, gossip, replicaConsistencyQueueSize)
+	rcq.baseQueue = makeBaseQueue("replica consistency checker", rcq, store, gossip, queueConfig{
+		maxSize:              replicaConsistencyQueueSize,
+		needsLease:           true,
+		acceptsUnsplitRanges: true,
+	})
 	return rcq
 }
 
-func (*replicaConsistencyQueue) needsLeaderLease() bool {
-	return true
-}
-
-func (*replicaConsistencyQueue) acceptsUnsplitRanges() bool {
-	return true
-}
-
-func (*replicaConsistencyQueue) shouldQueue(now roachpb.Timestamp, rng *Replica,
+func (*replicaConsistencyQueue) shouldQueue(now hlc.Timestamp, rng *Replica,
 	_ config.SystemConfig) (bool, float64) {
 	return true, 1.0
 }
 
-// process() is called on every range for which this node is a leader.
-func (q *replicaConsistencyQueue) process(_ roachpb.Timestamp, rng *Replica, _ config.SystemConfig) error {
+// process() is called on every range for which this node is a lease holder.
+func (q *replicaConsistencyQueue) process(
+	ctx context.Context,
+	_ hlc.Timestamp,
+	rng *Replica,
+	_ config.SystemConfig,
+) error {
 	req := roachpb.CheckConsistencyRequest{}
 	_, pErr := rng.CheckConsistency(req, rng.Desc())
 	if pErr != nil {
-		log.Error(pErr.GoError())
+		log.Error(ctx, pErr.GoError())
 	}
 	return nil
 }

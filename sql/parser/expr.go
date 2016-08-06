@@ -35,10 +35,10 @@ type Expr interface {
 	// sub-expressions will be guaranteed to be well-typed, meaning that the method effectively
 	// maps the Expr tree into a TypedExpr tree.
 	//
-	// The args parameter maps ValArg names to types inferred while type-checking.
+	// The ctx parameter defines the context in which to perform type checking.
 	// The desired parameter hints the desired type that the method's caller wants from
 	// the resulting TypedExpr.
-	TypeCheck(args MapArgs, desired Datum) (TypedExpr, error)
+	TypeCheck(ctx *SemaContext, desired Datum) (TypedExpr, error)
 }
 
 // TypedExpr represents a well-typed expression.
@@ -48,11 +48,11 @@ type TypedExpr interface {
 	// straightforward walk over the parse tree. The only significant complexity is
 	// the handling of types and implicit conversions. See binOps and cmpOps for
 	// more details. Note that expression evaluation returns an error if certain
-	// node types are encountered: ValArg, QualifiedName or Subquery. These nodes
+	// node types are encountered: Placeholder, QualifiedName or Subquery. These nodes
 	// should be replaced prior to expression evaluation by an appropriate
-	// WalkExpr. For example, ValArg should be replace by the argument passed from
+	// WalkExpr. For example, Placeholder should be replace by the argument passed from
 	// the client.
-	Eval(EvalContext) (Datum, error)
+	Eval(*EvalContext) (Datum, error)
 	// ReturnType provides the type of the TypedExpr, which is the type of Datum that
 	// the TypedExpr will return when evaluated.
 	ReturnType() Datum
@@ -230,6 +230,18 @@ func (node *ParenExpr) TypedInnerExpr() TypedExpr {
 	return node.Expr.(TypedExpr)
 }
 
+// StripParens strips any parentheses surrounding an expression and
+// returns the inner expression. For instance:
+//   1   -> 1
+//  (1)  -> 1
+// ((1)) -> 1
+func StripParens(expr Expr) Expr {
+	if p, ok := expr.(*ParenExpr); ok {
+		return StripParens(p.Expr)
+	}
+	return expr
+}
+
 // ComparisonOperator represents a binary operator.
 type ComparisonOperator int
 
@@ -245,8 +257,14 @@ const (
 	NotIn
 	Like
 	NotLike
+	ILike
+	NotILike
 	SimilarTo
 	NotSimilarTo
+	RegMatch
+	NotRegMatch
+	RegIMatch
+	NotRegIMatch
 	IsDistinctFrom
 	IsNotDistinctFrom
 	Is
@@ -264,8 +282,14 @@ var comparisonOpName = [...]string{
 	NotIn:             "NOT IN",
 	Like:              "LIKE",
 	NotLike:           "NOT LIKE",
+	ILike:             "ILIKE",
+	NotILike:          "NOT ILIKE",
 	SimilarTo:         "SIMILAR TO",
 	NotSimilarTo:      "NOT SIMILAR TO",
+	RegMatch:          "~",
+	NotRegMatch:       "!~",
+	RegIMatch:         "~*",
+	NotRegIMatch:      "!~*",
 	IsDistinctFrom:    "IS DISTINCT FROM",
 	IsNotDistinctFrom: "IS NOT DISTINCT FROM",
 	Is:                "IS",
@@ -444,6 +468,21 @@ type IfExpr struct {
 	typeAnnotation
 }
 
+// TypedTrueExpr returns the IfExpr's True expression as a TypedExpr.
+func (node *IfExpr) TypedTrueExpr() TypedExpr {
+	return node.True.(TypedExpr)
+}
+
+// TypedCondExpr returns the IfExpr's Cond expression as a TypedExpr.
+func (node *IfExpr) TypedCondExpr() TypedExpr {
+	return node.Cond.(TypedExpr)
+}
+
+// TypedElseExpr returns the IfExpr's Else expression as a TypedExpr.
+func (node *IfExpr) TypedElseExpr() TypedExpr {
+	return node.Else.(TypedExpr)
+}
+
 // Format implements the NodeFormatter interface.
 func (node *IfExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("IF(")
@@ -480,6 +519,11 @@ type CoalesceExpr struct {
 	typeAnnotation
 }
 
+// TypedExprAt returns the expression at the specified index as a TypedExpr.
+func (node *CoalesceExpr) TypedExprAt(idx int) TypedExpr {
+	return node.Exprs[idx].(TypedExpr)
+}
+
 // Format implements the NodeFormatter interface.
 func (node *CoalesceExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString(node.Name)
@@ -499,18 +543,18 @@ func (node DefaultVal) Format(buf *bytes.Buffer, f FmtFlags) {
 // ReturnType implements the TypedExpr interface.
 func (DefaultVal) ReturnType() Datum { return nil }
 
-var _ VariableExpr = ValArg{}
+var _ VariableExpr = Placeholder{}
 
-// ValArg represents a named bind var argument.
-type ValArg struct {
+// Placeholder represents a named placeholder.
+type Placeholder struct {
 	Name string
 }
 
 // Variable implements the VariableExpr interface.
-func (ValArg) Variable() {}
+func (Placeholder) Variable() {}
 
 // Format implements the NodeFormatter interface.
-func (node ValArg) Format(buf *bytes.Buffer, f FmtFlags) {
+func (node Placeholder) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteByte('$')
 	buf.WriteString(node.Name)
 }
@@ -533,6 +577,19 @@ type QualifiedName struct {
 
 	// We preserve the "original" string representation (before normalization).
 	origString string
+}
+
+// NewQualifiedNameFromDBAndTable creates a new QualifiedName object from the
+// provided database and table name.
+func NewQualifiedNameFromDBAndTable(db, table string) (*QualifiedName, error) {
+	qname := &QualifiedName{
+		Base:     Name(db),
+		Indirect: Indirection{NameIndirection(table)},
+	}
+	if err := qname.NormalizeTableName(""); err != nil {
+		return nil, err
+	}
+	return qname, nil
 }
 
 // ReturnType implements the TypedExpr interface.
@@ -576,6 +633,12 @@ func (node *QualifiedName) NormalizeTableName(database string) error {
 	}
 
 	if len(node.Indirect) > 1 {
+		return fmt.Errorf("invalid table name: %s", node)
+	}
+	switch node.Indirect[0].(type) {
+	case NameIndirection:
+		// Nothing to do.
+	default:
 		return fmt.Errorf("invalid table name: %s", node)
 	}
 	node.normalized = tableName
@@ -870,6 +933,9 @@ type Subquery struct {
 	Select SelectStatement
 }
 
+// Variable implements the VariableExpr interface.
+func (*Subquery) Variable() {}
+
 // Format implements the NodeFormatter interface.
 func (node *Subquery) Format(buf *bytes.Buffer, f FmtFlags) {
 	FormatNode(buf, f, node.Select)
@@ -892,6 +958,7 @@ const (
 	Minus
 	Mult
 	Div
+	FloorDiv
 	Mod
 	Concat
 	LShift
@@ -899,17 +966,18 @@ const (
 )
 
 var binaryOpName = [...]string{
-	Bitand: "&",
-	Bitor:  "|",
-	Bitxor: "^",
-	Plus:   "+",
-	Minus:  "-",
-	Mult:   "*",
-	Div:    "/",
-	Mod:    "%",
-	Concat: "||",
-	LShift: "<<",
-	RShift: ">>",
+	Bitand:   "&",
+	Bitor:    "|",
+	Bitxor:   "^",
+	Plus:     "+",
+	Minus:    "-",
+	Mult:     "*",
+	Div:      "/",
+	FloorDiv: "//",
+	Mod:      "%",
+	Concat:   "||",
+	LShift:   "<<",
+	RShift:   ">>",
 }
 
 func (i BinaryOperator) String() string {
@@ -928,6 +996,16 @@ type BinaryExpr struct {
 	fn BinOp
 }
 
+// TypedLeft returns the BinaryExpr's left expression as a TypedExpr.
+func (node *BinaryExpr) TypedLeft() TypedExpr {
+	return node.Left.(TypedExpr)
+}
+
+// TypedRight returns the BinaryExpr's right expression as a TypedExpr.
+func (node *BinaryExpr) TypedRight() TypedExpr {
+	return node.Right.(TypedExpr)
+}
+
 func (*BinaryExpr) operatorExpr() {}
 
 func (node *BinaryExpr) memoizeFn() {
@@ -938,6 +1016,25 @@ func (node *BinaryExpr) memoizeFn() {
 			AsStringWithFlags(node, FmtShowTypes)))
 	}
 	node.fn = fn
+}
+
+// newBinExprIfValidOverload constructs a new BinaryExpr if and only
+// if the pair of arguments have a valid implementation for the given
+// BinaryOperator.
+func newBinExprIfValidOverload(op BinaryOperator, left TypedExpr, right TypedExpr) *BinaryExpr {
+	leftRet, rightRet := left.ReturnType(), right.ReturnType()
+	fn, ok := BinOps[op].lookupImpl(leftRet, rightRet)
+	if ok {
+		expr := &BinaryExpr{
+			Operator: op,
+			Left:     left,
+			Right:    right,
+			fn:       fn,
+		}
+		expr.typ = fn.returnType()
+		return expr
+	}
+	return nil
 }
 
 // Format implements the NodeFormatter interface.
@@ -984,6 +1081,11 @@ func (node *UnaryExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString(node.Operator.String())
 	buf.WriteByte(' ')
 	exprFmtWithParen(buf, f, node.Expr)
+}
+
+// TypedInnerExpr returns the UnaryExpr's inner expression as a TypedExpr.
+func (node *UnaryExpr) TypedInnerExpr() TypedExpr {
+	return node.Expr.(TypedExpr)
 }
 
 // FuncExpr represents a function call.
@@ -1120,8 +1222,8 @@ var (
 	intervalCastTypes  = []Datum{DNull, TypeString, TypeInt, TypeInterval}
 )
 
-func (node *CastExpr) castTypeAndValidArgTypes() (Datum, []Datum) {
-	switch node.Type.(type) {
+func colTypeToTypeAndValidArgTypes(t ColumnType) (Datum, []Datum) {
+	switch t.(type) {
 	case *BoolColType:
 		return TypeBool, boolCastTypes
 	case *IntColType:
@@ -1146,6 +1248,37 @@ func (node *CastExpr) castTypeAndValidArgTypes() (Datum, []Datum) {
 	return nil, nil
 }
 
+func (node *CastExpr) castTypeAndValidArgTypes() (Datum, []Datum) {
+	return colTypeToTypeAndValidArgTypes(node.Type)
+}
+
+// AnnotateTypeExpr represents a ANNOTATE_TYPE(expr, type) expression.
+type AnnotateTypeExpr struct {
+	Expr Expr
+	Type ColumnType
+
+	typeAnnotation
+}
+
+// Format implements the NodeFormatter interface.
+func (node *AnnotateTypeExpr) Format(buf *bytes.Buffer, f FmtFlags) {
+	buf.WriteString("ANNOTATE_TYPE(")
+	FormatNode(buf, f, node.Expr)
+	buf.WriteString(", ")
+	FormatNode(buf, f, node.Type)
+	buf.WriteByte(')')
+}
+
+// TypedInnerExpr returns the AnnotateTypeExpr's inner expression as a TypedExpr.
+func (node *AnnotateTypeExpr) TypedInnerExpr() TypedExpr {
+	return node.Expr.(TypedExpr)
+}
+
+func (node *AnnotateTypeExpr) annotationType() Datum {
+	typ, _ := colTypeToTypeAndValidArgTypes(node.Type)
+	return typ
+}
+
 func (node *AliasedTableExpr) String() string { return AsString(node) }
 func (node *ParenTableExpr) String() string   { return AsString(node) }
 func (node *JoinTableExpr) String() string    { return AsString(node) }
@@ -1167,7 +1300,7 @@ func (node *DString) String() string          { return AsString(node) }
 func (node *DTimestamp) String() string       { return AsString(node) }
 func (node *DTimestampTZ) String() string     { return AsString(node) }
 func (node *DTuple) String() string           { return AsString(node) }
-func (node *DValArg) String() string          { return AsString(node) }
+func (node *DPlaceholder) String() string     { return AsString(node) }
 func (node *ExistsExpr) String() string       { return AsString(node) }
 func (node Exprs) String() string             { return AsString(node) }
 func (node *FuncExpr) String() string         { return AsString(node) }
@@ -1186,8 +1319,9 @@ func (node *RangeCond) String() string        { return AsString(node) }
 func (node *StrVal) String() string           { return AsString(node) }
 func (node *Subquery) String() string         { return AsString(node) }
 func (node *Tuple) String() string            { return AsString(node) }
+func (node *AnnotateTypeExpr) String() string { return AsString(node) }
 func (node *UnaryExpr) String() string        { return AsString(node) }
 func (node DefaultVal) String() string        { return AsString(node) }
-func (node ValArg) String() string            { return AsString(node) }
+func (node Placeholder) String() string       { return AsString(node) }
 func (node dNull) String() string             { return AsString(node) }
 func (list NameList) String() string          { return AsString(list) }

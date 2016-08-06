@@ -20,11 +20,14 @@ import (
 	"math"
 	"testing"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/config"
 	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/cockroachdb/cockroach/storage/engine"
+	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
@@ -37,8 +40,8 @@ func TestSplitQueueShouldQueue(t *testing.T) {
 	defer tc.Stop()
 
 	// Set zone configs.
-	config.TestingSetZoneConfig(2000, &config.ZoneConfig{RangeMaxBytes: 32 << 20})
-	config.TestingSetZoneConfig(2002, &config.ZoneConfig{RangeMaxBytes: 32 << 20})
+	config.TestingSetZoneConfig(2000, config.ZoneConfig{RangeMaxBytes: 32 << 20})
+	config.TestingSetZoneConfig(2002, config.ZoneConfig{RangeMaxBytes: 32 << 20})
 
 	// Despite faking the zone configs, we still need to have a gossip entry.
 	if err := tc.gossip.AddInfoProto(gossip.KeySystemConfig, &config.SystemConfig{}, 0); err != nil {
@@ -71,7 +74,7 @@ func TestSplitQueueShouldQueue(t *testing.T) {
 		{keys.MakeTablePrefix(2001), roachpb.RKeyMax, 32<<20 + 1, true, 1},
 	}
 
-	splitQ := newSplitQueue(nil, tc.gossip)
+	splitQ := newSplitQueue(tc.store, nil, tc.gossip)
 
 	cfg, ok := tc.gossip.GetSystemConfig()
 	if !ok {
@@ -79,16 +82,25 @@ func TestSplitQueueShouldQueue(t *testing.T) {
 	}
 
 	for i, test := range testCases {
-		if err := tc.rng.stats.SetMVCCStats(tc.rng.store.Engine(), engine.MVCCStats{KeyBytes: test.bytes}); err != nil {
-			t.Fatal(err)
-		}
+		func() {
+			// Hold lock throughout to reduce chance of random commands leading
+			// to inconsistent state.
+			tc.rng.mu.Lock()
+			defer tc.rng.mu.Unlock()
+			ms := enginepb.MVCCStats{KeyBytes: test.bytes}
+			if err := setMVCCStats(context.Background(), tc.rng.store.Engine(), tc.rng.RangeID, ms); err != nil {
+				t.Fatal(err)
+			}
+			tc.rng.mu.state.Stats = ms
+		}()
+
 		copy := *tc.rng.Desc()
 		copy.StartKey = test.start
 		copy.EndKey = test.end
 		if err := tc.rng.setDesc(&copy); err != nil {
 			t.Fatal(err)
 		}
-		shouldQ, priority := splitQ.shouldQueue(roachpb.ZeroTimestamp, tc.rng, cfg)
+		shouldQ, priority := splitQ.shouldQueue(hlc.ZeroTimestamp, tc.rng, cfg)
 		if shouldQ != test.shouldQ {
 			t.Errorf("%d: should queue expected %t; got %t", i, test.shouldQ, shouldQ)
 		}

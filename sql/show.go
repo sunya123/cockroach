@@ -24,8 +24,8 @@ import (
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/encoding"
+	"github.com/pkg/errors"
 )
 
 // Show a session-local variable name.
@@ -56,17 +56,18 @@ func (p *planner) Show(n *parser.Show) (planNode, error) {
 }
 
 // ShowColumns of a table.
-// Privileges: None.
+// Privileges: Any privilege on table.
 //   Notes: postgres does not have a SHOW COLUMNS statement.
 //          mysql only returns columns you have privileges on.
 func (p *planner) ShowColumns(n *parser.ShowColumns) (planNode, error) {
-	desc, err := p.getTableDesc(n.Table)
+	desc, err := p.mustGetTableDesc(n.Table)
 	if err != nil {
 		return nil, err
 	}
-	if desc == nil {
-		return nil, newUndefinedTableError(n.Table.String())
+	if err := p.anyPrivilege(desc); err != nil {
+		return nil, err
 	}
+
 	v := &valuesNode{
 		columns: []ResultColumn{
 			{Name: "Field", Typ: parser.TypeString},
@@ -75,8 +76,9 @@ func (p *planner) ShowColumns(n *parser.ShowColumns) (planNode, error) {
 			{Name: "Default", Typ: parser.TypeString},
 		},
 	}
+
 	for i, col := range desc.Columns {
-		defaultExpr := parser.Datum(parser.DNull)
+		defaultExpr := parser.DNull
 		if e := desc.Columns[i].DefaultExpr; e != nil {
 			defaultExpr = parser.NewDString(*e)
 		}
@@ -90,17 +92,38 @@ func (p *planner) ShowColumns(n *parser.ShowColumns) (planNode, error) {
 	return v, nil
 }
 
+// showCreateInterleave returns an INTERLEAVE IN PARENT clause for the specified
+// index, if applicable.
+func (p *planner) showCreateInterleave(idx *sqlbase.IndexDescriptor) (string, error) {
+	if len(idx.Interleave.Ancestors) == 0 {
+		return "", nil
+	}
+	intl := idx.Interleave
+	parentTable, err := sqlbase.GetTableDescFromID(p.txn, intl.Ancestors[len(intl.Ancestors)-1].TableID)
+	if err != nil {
+		return "", err
+	}
+	var sharedPrefixLen int
+	for _, ancestor := range intl.Ancestors {
+		sharedPrefixLen += int(ancestor.SharedPrefixLen)
+	}
+	interleavedColumnNames := quoteNames(idx.ColumnNames[:sharedPrefixLen]...)
+	s := fmt.Sprintf(" INTERLEAVE IN PARENT %s (%s)", parentTable.Name, interleavedColumnNames)
+	return s, nil
+}
+
 // ShowCreateTable returns a CREATE TABLE statement for the specified table in
 // Traditional syntax.
-// Privileges: None.
+// Privileges: Any privilege on table.
 func (p *planner) ShowCreateTable(n *parser.ShowCreateTable) (planNode, error) {
-	desc, err := p.getTableDesc(n.Table)
+	desc, err := p.mustGetTableDesc(n.Table)
 	if err != nil {
 		return nil, err
 	}
-	if desc == nil {
-		return nil, newUndefinedTableError(n.Table.String())
+	if err := p.anyPrivilege(desc); err != nil {
+		return nil, err
 	}
+
 	v := &valuesNode{
 		columns: []ResultColumn{
 			{Name: "Table", Typ: parser.TypeString},
@@ -117,15 +140,21 @@ func (p *planner) ShowCreateTable(n *parser.ShowCreateTable) (planNode, error) {
 		}
 		buf.WriteString("\n\t")
 		fmt.Fprintf(&buf, "%s %s", quoteNames(col.Name), col.Type.SQLString())
+		if col.NullableConstraintName != "" {
+			fmt.Fprintf(&buf, " CONSTRAINT %s", col.NullableConstraintName)
+		}
 		if col.Nullable {
 			buf.WriteString(" NULL")
 		} else {
 			buf.WriteString(" NOT NULL")
 		}
 		if col.DefaultExpr != nil {
+			if col.DefaultExprConstraintName != "" {
+				fmt.Fprintf(&buf, " CONSTRAINT %s", col.DefaultExprConstraintName)
+			}
 			fmt.Fprintf(&buf, " DEFAULT %s", *col.DefaultExpr)
 		}
-		if desc.PrimaryIndex.ColumnIDs[0] == col.ID {
+		if len(desc.PrimaryIndex.ColumnIDs) > 0 && desc.PrimaryIndex.ColumnIDs[0] == col.ID {
 			// Only set primary if the primary key is on a visible column (not rowid).
 			primary = fmt.Sprintf(",\n\tCONSTRAINT %s PRIMARY KEY (%s)",
 				quoteNames(desc.PrimaryIndex.Name),
@@ -139,11 +168,28 @@ func (p *planner) ShowCreateTable(n *parser.ShowCreateTable) (planNode, error) {
 		if len(idx.StoreColumnNames) > 0 {
 			storing = fmt.Sprintf(" STORING (%s)", quoteNames(idx.StoreColumnNames...))
 		}
-		fmt.Fprintf(&buf, ",\n\t%sINDEX %s (%s)%s",
+		interleave, err := p.showCreateInterleave(&idx)
+		if err != nil {
+			return nil, err
+		}
+		fmt.Fprintf(&buf, ",\n\t%sINDEX %s (%s)%s%s",
 			isUnique[idx.Unique],
 			quoteNames(idx.Name),
 			quoteNames(idx.ColumnNames...),
 			storing,
+			interleave,
+		)
+	}
+	for _, fam := range desc.Families {
+		activeColumnNames := make([]string, 0, len(fam.ColumnNames))
+		for i, colID := range fam.ColumnIDs {
+			if _, err := desc.FindActiveColumnByID(colID); err == nil {
+				activeColumnNames = append(activeColumnNames, fam.ColumnNames[i])
+			}
+		}
+		fmt.Fprintf(&buf, ",\n\tFAMILY %s (%s)",
+			quoteNames(fam.Name),
+			quoteNames(activeColumnNames...),
 		)
 	}
 
@@ -156,6 +202,12 @@ func (p *planner) ShowCreateTable(n *parser.ShowCreateTable) (planNode, error) {
 	}
 
 	buf.WriteString("\n)")
+	interleave, err := p.showCreateInterleave(&desc.PrimaryIndex)
+	if err != nil {
+		return nil, err
+	}
+	buf.WriteString(interleave)
+
 	v.rows = append(v.rows, []parser.Datum{
 		parser.NewDString(n.Table.String()),
 		parser.NewDString(buf.String()),
@@ -185,6 +237,9 @@ func (p *planner) ShowDatabases(n *parser.ShowDatabases) (planNode, error) {
 		return nil, err
 	}
 	v := &valuesNode{columns: []ResultColumn{{Name: "Database", Typ: parser.TypeString}}}
+	for db := range virtualSchemaMap {
+		v.rows = append(v.rows, []parser.Datum{parser.NewDString(db)})
+	}
 	for _, row := range sr {
 		_, name, err := encoding.DecodeUnsafeStringAscending(
 			bytes.TrimPrefix(row.Key, prefix), nil)
@@ -203,7 +258,7 @@ func (p *planner) ShowDatabases(n *parser.ShowDatabases) (planNode, error) {
 //          mysql only returns the user's privileges.
 func (p *planner) ShowGrants(n *parser.ShowGrants) (planNode, error) {
 	if n.Targets == nil {
-		return nil, util.Errorf("TODO(marc): implement SHOW GRANT with no targets")
+		return nil, errors.Errorf("TODO(marc): implement SHOW GRANT with no targets")
 	}
 	descriptors, err := p.getDescriptorsFromTargetList(*n.Targets)
 	if err != nil {
@@ -249,16 +304,16 @@ func (p *planner) ShowGrants(n *parser.ShowGrants) (planNode, error) {
 }
 
 // ShowIndex returns all the indexes for a table.
-// Privileges: None.
+// Privileges: Any privilege on table.
 //   Notes: postgres does not have a SHOW INDEXES statement.
 //          mysql requires some privilege for any column.
 func (p *planner) ShowIndex(n *parser.ShowIndex) (planNode, error) {
-	desc, err := p.getTableDesc(n.Table)
+	desc, err := p.mustGetTableDesc(n.Table)
 	if err != nil {
 		return nil, err
 	}
-	if desc == nil {
-		return nil, newUndefinedTableError(n.Table.String())
+	if err := p.anyPrivilege(desc); err != nil {
+		return nil, err
 	}
 
 	v := &valuesNode{
@@ -285,6 +340,7 @@ func (p *planner) ShowIndex(n *parser.ShowIndex) (planNode, error) {
 			parser.MakeDBool(parser.DBool(isStored)),
 		})
 	}
+
 	for _, index := range append([]sqlbase.IndexDescriptor{desc.PrimaryIndex}, desc.Indexes...) {
 		sequence := 1
 		for i, col := range index.ColumnNames {
@@ -297,6 +353,94 @@ func (p *planner) ShowIndex(n *parser.ShowIndex) (planNode, error) {
 		}
 	}
 	return v, nil
+}
+
+// ShowConstraints returns all the constraints for a table.
+// Privileges: None.
+//   Notes: postgres does not have a SHOW CONSTRAINTS statement.
+//          mysql requires some privilege for any column.
+func (p *planner) ShowConstraints(n *parser.ShowConstraints) (planNode, error) {
+	desc, err := p.mustGetTableDesc(n.Table)
+	if err != nil {
+		return nil, err
+	}
+
+	v := &valuesNode{
+		columns: []ResultColumn{
+			{Name: "Table", Typ: parser.TypeString},
+			{Name: "Name", Typ: parser.TypeString},
+			{Name: "Type", Typ: parser.TypeString},
+			{Name: "Column(s)", Typ: parser.TypeString},
+			{Name: "Details", Typ: parser.TypeString},
+		},
+	}
+
+	appendRow := func(name, typ, columns, details string) {
+		detailsDatum := parser.DNull
+		if details != "" {
+			detailsDatum = parser.NewDString(details)
+		}
+		columnsDatum := parser.DNull
+		if columns != "" {
+			columnsDatum = parser.NewDString(columns)
+		}
+		v.rows = append(v.rows, []parser.Datum{
+			parser.NewDString(n.Table.Table()),
+			parser.NewDString(name),
+			parser.NewDString(typ),
+			columnsDatum,
+			detailsDatum,
+		})
+	}
+
+	for _, index := range append([]sqlbase.IndexDescriptor{desc.PrimaryIndex}, desc.Indexes...) {
+		if index.ID == desc.PrimaryIndex.ID {
+			appendRow(index.Name, "PRIMARY KEY", fmt.Sprintf("%+v", index.ColumnNames), "")
+		} else if index.Unique {
+			appendRow(index.Name, "UNIQUE", fmt.Sprintf("%+v", index.ColumnNames), "")
+		}
+		if index.ForeignKey.IsSet() {
+			other, err := p.getTableLeaseByID(index.ForeignKey.Table)
+			if err != nil {
+				return nil, errors.Errorf("error resolving table %d referenced in foreign key",
+					index.ForeignKey.Table)
+			}
+			otherIdx, err := other.FindIndexByID(index.ForeignKey.Index)
+			if err != nil {
+				return nil, errors.Errorf("error resolving index %d in table %s referenced in foreign key",
+					index.ForeignKey.Index, other.Name)
+			}
+			appendRow(index.ForeignKey.Name, "FOREIGN KEY", fmt.Sprintf("%v", index.ColumnNames),
+				fmt.Sprintf("%s.%v", other.Name, otherIdx.ColumnNames))
+		}
+	}
+	for _, c := range desc.Checks {
+		appendRow(c.Name, "CHECK", "", c.Expr)
+	}
+
+	for _, c := range desc.Columns {
+		if c.DefaultExprConstraintName != "" {
+			appendRow(c.DefaultExprConstraintName, "DEFAULT", c.Name, *c.DefaultExpr)
+		}
+		if c.NullableConstraintName != "" {
+			if c.Nullable {
+				appendRow(c.NullableConstraintName, "NULL", c.Name, "")
+			} else {
+				appendRow(c.NullableConstraintName, "NOT NULL", c.Name, "")
+			}
+		}
+	}
+
+	// Sort the results by constraint name.
+	sort := &sortNode{
+		ctx: p.ctx(),
+		ordering: sqlbase.ColumnOrdering{
+			{ColIdx: 0, Direction: encoding.Ascending},
+			{ColIdx: 1, Direction: encoding.Ascending},
+		},
+		columns: v.columns,
+	}
+	return &selectTopNode{source: v, sort: sort}, nil
 }
 
 // ShowTables returns all the tables.
@@ -317,12 +461,9 @@ func (p *planner) ShowTables(n *parser.ShowTables) (planNode, error) {
 		}
 		name = &parser.QualifiedName{Base: parser.Name(p.session.Database)}
 	}
-	dbDesc, err := p.getDatabaseDesc(string(name.Base))
+	dbDesc, err := p.mustGetDatabaseDesc(string(name.Base))
 	if err != nil {
 		return nil, err
-	}
-	if dbDesc == nil {
-		return nil, newUndefinedDatabaseError(string(name.Base))
 	}
 
 	tableNames, err := p.getTableNames(dbDesc)

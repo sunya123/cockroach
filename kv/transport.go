@@ -18,17 +18,19 @@
 package kv
 
 import (
-	"fmt"
+	"sort"
 	"time"
 
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/util/envutil"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/opentracing/opentracing-go"
+	"github.com/pkg/errors"
+	"github.com/rubyist/circuitbreaker"
 	"google.golang.org/grpc"
 )
 
@@ -63,6 +65,7 @@ type batchClient struct {
 	conn       *grpc.ClientConn
 	client     roachpb.InternalClient
 	args       roachpb.BatchRequest
+	healthy    bool
 }
 
 // BatchCall contains a response and an RPC error (note that the
@@ -117,23 +120,25 @@ func grpcTransportFactory(
 	for _, replica := range replicas {
 		conn, err := rpcContext.GRPCDial(replica.NodeDesc.Address.String())
 		if err != nil {
+			if errors.Cause(err) == circuit.ErrBreakerOpen {
+				continue
+			}
 			return nil, err
 		}
 		argsCopy := args
 		argsCopy.Replica = replica.ReplicaDescriptor
+		remoteAddr := replica.NodeDesc.Address.String()
 		clients = append(clients, batchClient{
-			remoteAddr: replica.NodeDesc.Address.String(),
+			remoteAddr: remoteAddr,
 			conn:       conn,
 			client:     roachpb.NewInternalClient(conn),
 			args:       argsCopy,
+			healthy:    rpcContext.IsConnHealthy(remoteAddr),
 		})
 	}
 
 	// Put known-unhealthy clients last.
-	_, err := splitHealthy(clients)
-	if err != nil {
-		return nil, err
-	}
+	splitHealthy(clients)
 
 	return &grpcTransport{
 		opts:           opts,
@@ -161,7 +166,7 @@ func (gt *grpcTransport) SendNext(done chan BatchCall) {
 
 	addr := client.remoteAddr
 	if log.V(2) {
-		log.Infof("sending request to %s: %+v", addr, client.args)
+		log.Infof(gt.opts.Context, "sending request to %s: %+v", addr, client.args)
 	}
 
 	if localServer := gt.rpcContext.GetLocalInternalServerForAddr(addr); enableLocalCalls && localServer != nil {
@@ -177,19 +182,14 @@ func (gt *grpcTransport) SendNext(done chan BatchCall) {
 		ctx, cancel := gt.opts.contextWithTimeout()
 		defer cancel()
 
-		c := client.conn
-		for state, err := c.State(); state != grpc.Ready; state, err = c.WaitForStateChange(ctx, state) {
-			if err != nil {
-				done <- BatchCall{Err: err}
-				return
-			}
-			if state == grpc.Shutdown {
-				done <- BatchCall{Err: fmt.Errorf("rpc to %s failed as client connection was closed", addr)}
-				return
+		reply, err := client.client.Batch(ctx, &client.args)
+		if reply != nil {
+			for i := range reply.Responses {
+				if err := reply.Responses[i].GetInner().Verify(client.args.Requests[i].GetInner()); err != nil {
+					log.Error(ctx, err)
+				}
 			}
 		}
-
-		reply, err := client.client.Batch(ctx, &client.args)
 		done <- BatchCall{Reply: reply, Err: err}
 	}()
 }
@@ -205,21 +205,23 @@ func (*grpcTransport) Close() {
 // be rearranged first in the slice, and unhealthy clients will be rearranged
 // last. Within these two groups, the rearrangement will be stable. The function
 // will then return the number of healthy clients.
-func splitHealthy(clients []batchClient) (int, error) {
+func splitHealthy(clients []batchClient) int {
 	var nHealthy int
-	for i, client := range clients {
-		clientState, err := client.conn.State()
-		if err != nil {
-			// This should not currently happen with the default grpc.Picker.
-			return 0, err
-		}
-		if clientState == grpc.Ready {
-			clients[i], clients[nHealthy] = clients[nHealthy], clients[i]
+	sort.Stable(byHealth(clients))
+	for _, client := range clients {
+		if client.healthy {
 			nHealthy++
 		}
 	}
-	return nHealthy, nil
+	return nHealthy
 }
+
+// byHealth sorts a slice of batchClients by their health with healthy first.
+type byHealth []batchClient
+
+func (h byHealth) Len() int           { return len(h) }
+func (h byHealth) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h byHealth) Less(i, j int) bool { return h[i].healthy && !h[j].healthy }
 
 // SenderTransportFactory wraps a client.Sender for use as a KV
 // Transport. This is useful for tests that want to use DistSender

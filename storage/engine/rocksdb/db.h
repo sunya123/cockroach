@@ -54,16 +54,33 @@ typedef struct {
 // operation. If DBStatus.data == NULL the operation succeeded.
 typedef DBString DBStatus;
 
+typedef struct DBCache DBCache;
 typedef struct DBEngine DBEngine;
 typedef struct DBIterator DBIterator;
 
 // DBOptions contains local database options.
 typedef struct {
-  uint64_t cache_size;
+  DBCache *cache;
   uint64_t memtable_budget;
+  uint64_t block_size;
+  uint64_t wal_ttl_seconds;
   bool allow_os_buffer;
   bool logging_enabled;
+  int num_cpu;
+  int max_open_files;
 } DBOptions;
+
+// Create a new cache with the specified size.
+DBCache* DBNewCache(uint64_t size);
+
+// Add a reference to an existing cache. Note that the underlying
+// RocksDB cache is shared between the original and new reference.
+DBCache* DBRefCache(DBCache *cache);
+
+// Release a cache, decrementing the reference count on the underlying
+// RocksDB cache. Note that the RocksDB cache will not be freed until
+// all of the references have been released.
+void DBReleaseCache(DBCache *cache);
 
 // Opens the database located in "dir", creating it if it doesn't
 // exist.
@@ -82,6 +99,11 @@ DBStatus DBFlush(DBEngine* db);
 
 // Forces an immediate compaction over all keys.
 DBStatus DBCompact(DBEngine* db);
+
+// Checkpoint creates a point-in-time snapshot of the database,
+// hard-linking sstable files and copying the manifest and other
+// files.
+DBStatus DBCheckpoint(DBEngine* db, DBSlice dir);
 
 // Sets the database entry for "key" to "value".
 DBStatus DBPut(DBEngine* db, DBKey key, DBSlice value);
@@ -102,8 +124,8 @@ DBStatus DBCommitBatch(DBEngine* db);
 
 // ApplyBatchRepr applies a batch of mutations encoded using that
 // batch representation returned by DBBatchRepr(). It is only valid to
-// call this function on an engine created by DBOpen() (i.e. not a
-// batch or snapshot).
+// call this function on an engine created by DBOpen() or DBNewBatch()
+// (i.e. not a snapshot).
 DBStatus DBApplyBatchRepr(DBEngine* db, DBSlice repr);
 
 // Returns the internal batch representation. The returned value is
@@ -198,6 +220,18 @@ typedef struct {
 } DBStatsResult;
 
 DBStatus DBGetStats(DBEngine* db, DBStatsResult* stats);
+
+typedef struct {
+  int level;
+  uint64_t size;
+  DBKey start_key;
+  DBKey end_key;
+} DBSSTable;
+
+// Retrieve stats about all of the live sstables. Note that the tables
+// array must be freed along with the start_key and end_key of each
+// table.
+DBSSTable* DBGetSSTables(DBEngine* db, int* n);
 
 #ifdef __cplusplus
 }  // extern "C"

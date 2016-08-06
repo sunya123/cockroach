@@ -16,10 +16,7 @@
 
 package parser
 
-import (
-	"fmt"
-	"reflect"
-)
+import "reflect"
 
 // Visitor defines methods that are called for nodes during an expression or statement walk.
 type Visitor interface {
@@ -127,6 +124,17 @@ func (expr *CaseExpr) Walk(v Visitor) Expr {
 
 // Walk implements the Expr interface.
 func (expr *CastExpr) Walk(v Visitor) Expr {
+	e, changed := WalkExpr(v, expr.Expr)
+	if changed {
+		exprCopy := *expr
+		exprCopy.Expr = e
+		return &exprCopy
+	}
+	return expr
+}
+
+// Walk implements the Expr interface.
+func (expr *AnnotateTypeExpr) Walk(v Visitor) Expr {
 	e, changed := WalkExpr(v, expr.Expr)
 	if changed {
 		exprCopy := *expr
@@ -361,7 +369,7 @@ func (expr *NumVal) Walk(_ Visitor) Expr { return expr }
 func (expr *StrVal) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
-func (expr ValArg) Walk(_ Visitor) Expr { return expr }
+func (expr Placeholder) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
 func (expr *DBool) Walk(_ Visitor) Expr { return expr }
@@ -400,7 +408,7 @@ func (expr *DTimestampTZ) Walk(_ Visitor) Expr { return expr }
 func (expr *DTuple) Walk(_ Visitor) Expr { return expr }
 
 // Walk implements the Expr interface.
-func (expr *DValArg) Walk(_ Visitor) Expr { return expr }
+func (expr *DPlaceholder) Walk(_ Visitor) Expr { return expr }
 
 // WalkExpr traverses the nodes in an expression.
 func WalkExpr(v Visitor, expr Expr) (newExpr Expr, changed bool) {
@@ -581,7 +589,10 @@ func (stmt *Select) WalkStmt(v Visitor) Statement {
 func (stmt *SelectClause) CopyNode() *SelectClause {
 	stmtCopy := *stmt
 	stmtCopy.Exprs = SelectExprs(append([]SelectExpr(nil), stmt.Exprs...))
-	stmtCopy.From = TableExprs(append([]TableExpr(nil), stmt.From...))
+	stmtCopy.From = &From{
+		Tables: TableExprs(append([]TableExpr(nil), stmt.From.Tables...)),
+		AsOf:   stmt.From.AsOf,
+	}
 	if stmt.Where != nil {
 		wCopy := *stmt.Where
 		stmtCopy.Where = &wCopy
@@ -605,6 +616,16 @@ func (stmt *SelectClause) WalkStmt(v Visitor) Statement {
 				ret = stmt.CopyNode()
 			}
 			ret.Exprs[i].Expr = e
+		}
+	}
+
+	if stmt.From != nil && stmt.From.AsOf.Expr != nil {
+		e, changed := WalkExpr(v, stmt.From.AsOf.Expr)
+		if changed {
+			if ret == stmt {
+				ret = stmt.CopyNode()
+			}
+			ret.From.AsOf.Expr = e
 		}
 	}
 
@@ -749,118 +770,6 @@ func WalkStmt(v Visitor, stmt Statement) (newStmt Statement, changed bool) {
 	}
 	newStmt = walkable.WalkStmt(v)
 	return newStmt, (stmt != newStmt)
-}
-
-// Args defines the interface for retrieving arguments. Return false for the
-// second return value if the argument cannot be found.
-type Args interface {
-	Arg(name string) (Datum, bool)
-}
-
-var _ Args = MapArgs{}
-
-// MapArgs is an Args implementation which is used for the type
-// inference necessary to support the postgres wire protocol.
-// See various TypeCheck() implementations for details.
-type MapArgs map[string]Datum
-
-// Arg implements the Args interface.
-func (m MapArgs) Arg(name string) (Datum, bool) {
-	d, ok := m[name]
-	return d, ok
-}
-
-// SetInferredType sets the bind var argument d to the type typ in m. If m is
-// nil or d is not a DValArg, nil is returned. If the bind var argument is set,
-// typ is returned. An error is returned if typ cannot be set because a
-// different type is already present.
-func (m MapArgs) SetInferredType(d, typ Datum) (set Datum, err error) {
-	if m == nil {
-		return nil, nil
-	}
-	v, ok := d.(*DValArg)
-	if !ok {
-		return nil, nil
-	}
-	if t, ok := m[v.name]; ok && !typ.TypeEqual(t) {
-		return nil, fmt.Errorf("parameter %s has multiple types: %s, %s", v, typ.Type(), t.Type())
-	}
-	m[v.name] = typ
-	return typ, nil
-}
-
-// IsUnresolvedArgument returns whether expr is an unresolved var argument. In
-// other words, it returns whether the provided expression is an argument, and
-// if so, whether the variable's type remains unset or not.
-func (m MapArgs) IsUnresolvedArgument(expr Expr) bool {
-	if t, ok := expr.(ValArg); ok {
-		if _, ok := m[t.Name]; !ok {
-			return true
-		}
-	}
-	return false
-}
-
-type argVisitor struct {
-	args Args
-	err  error
-}
-
-var _ Visitor = &argVisitor{}
-
-func (v *argVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
-	if v.err != nil {
-		return false, expr
-	}
-	placeholder, ok := expr.(ValArg)
-	if !ok {
-		return true, expr
-	}
-	d, found := v.args.Arg(placeholder.Name)
-	if !found {
-		v.err = fmt.Errorf("arg %s not found", placeholder)
-		return false, expr
-	}
-	if d == nil {
-		d = DNull
-	}
-	return true, d
-}
-
-func (v *argVisitor) VisitPost(expr Expr) Expr { return expr }
-
-// FillArgs replaces any placeholder nodes in the expression with arguments
-// supplied with the query.
-func FillArgs(stmt Statement, args Args) (Statement, error) {
-	v := argVisitor{args: args}
-	stmt, _ = WalkStmt(&v, stmt)
-	return stmt, v.err
-}
-
-type containsSubqueryVisitor struct {
-	containsSubquery bool
-}
-
-var _ Visitor = &containsSubqueryVisitor{}
-
-func (v *containsSubqueryVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
-	if !v.containsSubquery {
-		switch expr.(type) {
-		case *Subquery:
-			v.containsSubquery = true
-			return false, expr
-		}
-	}
-	return true, expr
-}
-
-func (*containsSubqueryVisitor) VisitPost(expr Expr) Expr { return expr }
-
-// containsSubquery returns true if the expression contains a subquery.
-func containsSubquery(expr Expr) bool {
-	v := containsSubqueryVisitor{containsSubquery: false}
-	WalkExprConst(&v, expr)
-	return v.containsSubquery
 }
 
 type simpleVisitor struct {

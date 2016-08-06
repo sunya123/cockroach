@@ -23,6 +23,7 @@ import (
 	"strconv"
 
 	"github.com/cockroachdb/cockroach/sql/parser"
+	"github.com/cockroachdb/cockroach/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/encoding"
 )
@@ -31,7 +32,8 @@ type valuesNode struct {
 	n        *parser.ValuesClause
 	p        *planner
 	columns  []ResultColumn
-	ordering columnOrdering
+	ordering sqlbase.ColumnOrdering
+	tuples   [][]parser.TypedExpr
 	rows     []parser.DTuple
 
 	desiredTypes []parser.Datum // This can be removed when we only type check once.
@@ -52,6 +54,10 @@ func (p *planner) ValuesClause(n *parser.ValuesClause, desiredTypes []parser.Dat
 	}
 
 	numCols := len(n.Tuples[0].Exprs)
+
+	v.tuples = make([][]parser.TypedExpr, 0, len(n.Tuples))
+	tupleBuf := make([]parser.TypedExpr, len(n.Tuples)*numCols)
+
 	v.columns = make([]ResultColumn, 0, numCols)
 
 	for num, tuple := range n.Tuples {
@@ -59,25 +65,20 @@ func (p *planner) ValuesClause(n *parser.ValuesClause, desiredTypes []parser.Dat
 			return nil, fmt.Errorf("VALUES lists must all be the same length, %d for %d", a, e)
 		}
 
+		// Chop off prefix of tupleBuf and limit its capacity.
+		tupleRow := tupleBuf[:numCols:numCols]
+		tupleBuf = tupleBuf[numCols:]
+
 		for i, expr := range tuple.Exprs {
-			// TODO(knz): We need to expand subqueries two times, once here
-			// and once in Start() below, until the logic for select is split
-			// between makePlan and Start(). This is because a first call is
-			// needed for typechecking, and a separate call is needed to
-			// select indexes.
-			expr, err := p.expandSubqueries(expr, 1)
-			if err != nil {
-				return nil, err
+			if p.parser.AggregateInExpr(expr) {
+				return nil, fmt.Errorf("aggregate functions are not allowed in VALUES")
 			}
+
 			desired := parser.NoTypePreference
 			if len(desiredTypes) > i {
 				desired = desiredTypes[i]
 			}
-			typedExpr, err := parser.TypeCheck(expr, p.evalCtx.Args, desired)
-			if err != nil {
-				return nil, err
-			}
-			typedExpr, err = p.parser.NormalizeExpr(p.evalCtx, typedExpr)
+			typedExpr, err := p.analyzeExpr(expr, nil, nil, desired, false, "")
 			if err != nil {
 				return nil, err
 			}
@@ -90,7 +91,10 @@ func (p *planner) ValuesClause(n *parser.ValuesClause, desiredTypes []parser.Dat
 			} else if typ != parser.DNull && !typ.TypeEqual(v.columns[i].Typ) {
 				return nil, fmt.Errorf("VALUES list type mismatch, %s for %s", typ.Type(), v.columns[i].Typ.Type())
 			}
+
+			tupleRow[i] = typedExpr
 		}
+		v.tuples = append(v.tuples, tupleRow)
 	}
 
 	return v, nil
@@ -101,50 +105,51 @@ func (n *valuesNode) expandPlan() error {
 		return nil
 	}
 
-	n.rows = make([]parser.DTuple, 0, len(n.n.Tuples))
+	// This node is coming from a SQL query (as opposed to sortNode and
+	// others that create a valuesNode internally for storing results
+	// from other planNodes), so it may contain subqueries.
+	for _, tupleRow := range n.tuples {
+		for _, typedExpr := range tupleRow {
+			if err := n.p.expandSubqueryPlans(typedExpr); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (n *valuesNode) Start() error {
+	if n.n == nil {
+		return nil
+	}
 
 	// This node is coming from a SQL query (as opposed to sortNode and
 	// others that create a valuesNode internally for storing results
-	// from other planNodes), so it needs to evaluate expressions.
-
+	// from other planNodes), so its expressions need evaluting.
+	// This may run subqueries.
 	numCols := len(n.columns)
-	rowBuf := make(parser.DTuple, len(n.n.Tuples)*numCols)
-
-	for _, tuple := range n.n.Tuples {
+	n.rows = make([]parser.DTuple, 0, len(n.n.Tuples))
+	rowBuf := make([]parser.Datum, len(n.n.Tuples)*numCols)
+	for _, tupleRow := range n.tuples {
 		// Chop off prefix of rowBuf and limit its capacity.
 		row := rowBuf[:numCols:numCols]
 		rowBuf = rowBuf[numCols:]
 
-		for i, expr := range tuple.Exprs {
-			// TODO(knz): see comment above about expandSubqueries in ValuesClause().
-			expr, err := n.p.expandSubqueries(expr, 1)
-			if err != nil {
-				return err
-			}
-			desired := parser.NoTypePreference
-			if len(n.desiredTypes) > i {
-				desired = n.desiredTypes[i]
-			}
-			typedExpr, err := parser.TypeCheck(expr, n.p.evalCtx.Args, desired)
-			if err != nil {
-				return err
-			}
-			typedExpr, err = n.p.parser.NormalizeExpr(n.p.evalCtx, typedExpr)
-			if err != nil {
+		for i, typedExpr := range tupleRow {
+			if err := n.p.startSubqueryPlans(typedExpr); err != nil {
 				return err
 			}
 
-			row[i], err = typedExpr.Eval(n.p.evalCtx)
+			var err error
+			row[i], err = typedExpr.Eval(&n.p.evalCtx)
 			if err != nil {
 				return err
 			}
 		}
 		n.rows = append(n.rows, row)
 	}
-	return nil
-}
 
-func (n *valuesNode) Start() error {
 	return nil
 }
 
@@ -171,16 +176,12 @@ func (n *valuesNode) DebugValues() debugValues {
 	}
 }
 
-func (n *valuesNode) Next() bool {
+func (n *valuesNode) Next() (bool, error) {
 	if n.nextRow >= len(n.rows) {
-		return false
+		return false, nil
 	}
 	n.nextRow++
-	return true
-}
-
-func (*valuesNode) Err() error {
-	return nil
+	return true, nil
 }
 
 func (n *valuesNode) Len() int {
@@ -200,12 +201,12 @@ func (n *valuesNode) Less(i, j int) bool {
 func (n *valuesNode) ValuesLess(ra, rb parser.DTuple) bool {
 	for _, c := range n.ordering {
 		var da, db parser.Datum
-		if c.direction == encoding.Ascending {
-			da = ra[c.colIdx]
-			db = rb[c.colIdx]
+		if c.Direction == encoding.Ascending {
+			da = ra[c.ColIdx]
+			db = rb[c.ColIdx]
 		} else {
-			da = rb[c.colIdx]
-			db = ra[c.colIdx]
+			da = rb[c.ColIdx]
+			db = ra[c.ColIdx]
 		}
 		// TODO(pmattis): This is assuming that the datum types are compatible. I'm
 		// not sure this always holds as `CASE` expressions can return different
@@ -282,8 +283,10 @@ func (n *valuesNode) ExplainPlan(_ bool) (name, description string, children []p
 
 func (n *valuesNode) ExplainTypes(regTypes func(string, string)) {
 	if n.n != nil {
-		for i, tuple := range n.rows {
-			regTypes(fmt.Sprintf("tuple %d", i), parser.AsStringWithFlags(&tuple, parser.FmtShowTypes))
+		for i, tuple := range n.tuples {
+			for j, expr := range tuple {
+				regTypes(fmt.Sprintf("row %d, expr %d", i, j), parser.AsStringWithFlags(expr, parser.FmtShowTypes))
+			}
 		}
 	}
 }

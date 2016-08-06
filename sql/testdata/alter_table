@@ -10,6 +10,12 @@ EXPLAIN (DEBUG) SELECT * FROM t
 RowIdx Key          Value Disposition
 0      /t/primary/1 NULL  ROW
 
+statement error invalid table name
+ALTER TABLE t RENAME TO t.*
+
+statement error invalid table name
+ALTER TABLE t RENAME TO t[TRUE]
+
 statement ok
 ALTER TABLE t ADD b INT
 
@@ -94,13 +100,9 @@ query ITTT colnames
 EXPLAIN (DEBUG) SELECT * FROM t
 ----
 RowIdx  Key             Value  Disposition
-0       /t/primary/1    NULL   ROW
-1       /t/primary/2    NULL   PARTIAL
-1       /t/primary/2/b  1      PARTIAL
-1       /t/primary/2/c  1      ROW
-2       /t/primary/3    NULL   PARTIAL
-2       /t/primary/3/b  2      PARTIAL
-2       /t/primary/3/c  1      ROW
+0       /t/primary/1      NULL   ROW
+1       /t/primary/2/b/c  /1/1   ROW
+2       /t/primary/3/b/c  /2/1   ROW
 
 statement ok
 ALTER TABLE t DROP b, DROP c
@@ -180,6 +182,27 @@ ALTER TABLE t DROP CONSTRAINT t_d_key
 statement ok
 ALTER TABLE t DROP COLUMN d
 
+# Test that more than one column with constraints can be added in the same
+# statement. The constraints added here are on columns that are new and both
+# columns and constraints run through the schema change process together.
+statement ok
+ALTER TABLE t ADD d INT UNIQUE, ADD e INT UNIQUE, ADD f INT
+
+query ITTTIII colnames
+SELECT * FROM t
+----
+a   x     y     z     d     e     f
+1   NULL  1.3   1.4   NULL  NULL  NULL
+2   NULL  1.3   1.4   NULL  NULL  NULL
+3   NULL  1.3   1.4   NULL  NULL  NULL
+4   NULL  1.3   1.4   NULL  NULL  NULL
+11  1     1.3   1.4   NULL  NULL  NULL
+13  NULL  1.3   1.4   NULL  NULL  NULL
+21  NULL  1     1.4   NULL  NULL  NULL
+23  NULL  1.3   1.4   NULL  NULL  NULL
+31  NULL  1.3   1.4   NULL  NULL  NULL
+33  2     2.1   2.2   NULL  NULL  NULL
+
 # Subsequent operations succeed because the table is empty
 statement ok
 CREATE TABLE tt (a INT PRIMARY KEY)
@@ -190,6 +213,14 @@ ALTER TABLE tt ADD COLUMN q DECIMAL NOT NULL
 statement ok
 ALTER table tt ADD COLUMN r DECIMAL
 
+# Ensure that a UNIQUE NOT NULL COLUMN can be added when there is no data in
+# the table.
+statement ok
+ALTER TABLE tt ADD COLUMN s DECIMAL UNIQUE NOT NULL
+
+statement ok
+ALTER TABLE tt ADD t DECIMAL UNIQUE DEFAULT 4.0
+
 query TTBT colnames
 SHOW COLUMNS FROM tt
 ----
@@ -197,6 +228,8 @@ Field  Type     Null   Default
 a      INT      false  NULL
 q      DECIMAL  false  NULL
 r      DECIMAL  true   NULL
+s      DECIMAL  false  NULL
+t      DECIMAL  true   4.0
 
 # Default values can be added and changed after table creation.
 statement ok
@@ -217,16 +250,16 @@ ALTER TABLE add_default ALTER COLUMN b SET DEFAULT 10
 statement ok
 INSERT INTO add_default (a) VALUES (3)
 
-statement error incompatible column type
+statement error incompatible type for DEFAULT expression
 ALTER TABLE add_default ALTER COLUMN b SET DEFAULT 'foo'
 
-statement error default expression .* may not contain placeholders
+statement error DEFAULT expression .* may not contain variable sub-expressions
 ALTER TABLE add_default ALTER COLUMN b SET DEFAULT $1
 
-statement error qualified name "c" not found
+statement error DEFAULT expression .* may not contain variable sub-expressions
 ALTER TABLE add_default ALTER COLUMN b SET DEFAULT c
 
-statement error default expression contains a subquery
+statement error DEFAULT expression .* may not contain variable sub-expressions
 ALTER TABLE add_default ALTER COLUMN b SET DEFAULT (SELECT 1)
 
 statement ok
@@ -285,6 +318,31 @@ SELECT a,b FROM add_default WHERE e > d AND e - d < interval '10s'
 2 42
 3 10
 5 NULL
+
+# Adding a unique column to an existing table with data with a default value
+# is illegal
+statement error duplicate key value .* violates unique constraint \"add_default_f_key\"
+ALTER TABLE add_default ADD f TIMESTAMP UNIQUE DEFAULT current_timestamp()
+
+# Multiple columns can be added at once with heterogeneous DEFAULT usage
+statement ok
+CREATE TABLE d (a INT PRIMARY KEY)
+
+statement ok
+INSERT INTO d VALUES (1), (2)
+
+statement ok
+ALTER TABLE d ADD COLUMN c INT, ADD COLUMN b INT DEFAULT 7
+
+statement ok
+INSERT INTO d (a, c) VALUES (3, 4)
+
+query III
+SELECT * FROM d
+----
+1 NULL 7
+2 NULL 7
+3 4    7
 
 # Test privileges.
 

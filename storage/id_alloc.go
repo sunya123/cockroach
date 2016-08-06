@@ -21,13 +21,15 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/base"
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/retry"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/pkg/errors"
 )
 
 // An idAllocator is used to increment a key in allocation blocks
@@ -52,10 +54,10 @@ func newIDAllocator(
 	// minID can't be the zero value because reads from closed channels return
 	// the zero value.
 	if minID == 0 {
-		return nil, util.Errorf("minID must be a positive integer: %d", minID)
+		return nil, errors.Errorf("minID must be a positive integer: %d", minID)
 	}
 	if blockSize == 0 {
-		return nil, util.Errorf("blockSize must be a positive integer: %d", blockSize)
+		return nil, errors.Errorf("blockSize must be a positive integer: %d", blockSize)
 	}
 	ia := &idAllocator{
 		db:        db,
@@ -76,7 +78,7 @@ func (ia *idAllocator) Allocate() (uint32, error) {
 	id := <-ia.ids
 	// when the channel is closed, the zero value is returned.
 	if id == 0 {
-		return id, util.Errorf("could not allocate ID; system is draining")
+		return id, errors.Errorf("could not allocate ID; system is draining")
 	}
 	return id, nil
 }
@@ -88,15 +90,14 @@ func (ia *idAllocator) start() {
 		for {
 			var newValue int64
 			for newValue <= int64(ia.minID) {
-				var (
-					err error
-					res client.KeyValue
-				)
+				var err error
+				var res client.KeyValue
 				for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
 					idKey := ia.idKey.Load().(roachpb.Key)
-					if !ia.stopper.RunTask(func() {
+					if err := ia.stopper.RunTask(func() {
 						res, err = ia.db.Inc(idKey, int64(ia.blockSize))
-					}) {
+					}); err != nil {
+						log.Warning(context.TODO(), err)
 						return
 					}
 					if err == nil {
@@ -104,7 +105,7 @@ func (ia *idAllocator) start() {
 						break
 					}
 
-					log.Warningf("unable to allocate %d ids from %s: %s", ia.blockSize, idKey, err)
+					log.Warningf(context.TODO(), "unable to allocate %d ids from %s: %s", ia.blockSize, idKey, err)
 				}
 				if err != nil {
 					panic(fmt.Sprintf("unexpectedly exited id allocation retry loop: %s", err))

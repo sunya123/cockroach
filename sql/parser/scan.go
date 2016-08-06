@@ -18,6 +18,7 @@ package parser
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"go/constant"
 	"go/token"
@@ -28,9 +29,11 @@ import (
 
 const eof = -1
 const errUnterminated = "unterminated string"
+const errInvalidHexNumeric = "invalid hexadecimal numeric literal"
 const singleQuote = '\''
 
-type scanner struct {
+// Scanner lexes SQL statements.
+type Scanner struct {
 	in          string
 	pos         int
 	tokBuf      sqlSymType
@@ -45,13 +48,14 @@ type scanner struct {
 	initialized bool
 }
 
-func makeScanner(str string, syntax Syntax) scanner {
-	var s scanner
+// MakeScanner makes a Scanner from str.
+func MakeScanner(str string, syntax Syntax) Scanner {
+	var s Scanner
 	s.init(str, syntax)
 	return s
 }
 
-func (s *scanner) init(str string, syntax Syntax) {
+func (s *Scanner) init(str string, syntax Syntax) {
 	if s.initialized {
 		panic("scanner already initialized; a scanner cannot be reused.")
 	}
@@ -67,7 +71,19 @@ func (s *scanner) init(str string, syntax Syntax) {
 	}
 }
 
-func (s *scanner) Lex(lval *sqlSymType) int {
+// Tokens calls f on all tokens of the input until an EOF is encountered.
+func (s *Scanner) Tokens(f func(token int)) {
+	for {
+		t := s.Lex(&s.tokBuf)
+		if t == 0 {
+			return
+		}
+		f(t)
+	}
+}
+
+// Lex lexes a token from input.
+func (s *Scanner) Lex(lval *sqlSymType) int {
 	// The core lexing takes place in scan(). Here we do a small bit of post
 	// processing of the lexical tokens so that the grammar only requires
 	// one-token lookahead despite SQL requiring multi-token lookahead in some
@@ -82,7 +98,7 @@ func (s *scanner) Lex(lval *sqlSymType) int {
 	}
 
 	switch lval.id {
-	case NOT, NULLS, WITH:
+	case NOT, NULLS, WITH, AS:
 	default:
 		s.lastTok = *lval
 		return lval.id
@@ -92,9 +108,14 @@ func (s *scanner) Lex(lval *sqlSymType) int {
 	s.scan(s.nextTok)
 
 	switch lval.id {
+	case AS:
+		switch s.nextTok.id {
+		case OF:
+			lval.id = AS_LA
+		}
 	case NOT:
 		switch s.nextTok.id {
-		case BETWEEN, IN, LIKE, SIMILAR:
+		case BETWEEN, IN, LIKE, ILIKE, SIMILAR:
 			lval.id = NOT_LA
 		}
 
@@ -109,7 +130,7 @@ func (s *scanner) Lex(lval *sqlSymType) int {
 	return lval.id
 }
 
-func (s *scanner) Error(e string) {
+func (s *Scanner) Error(e string) {
 	var buf bytes.Buffer
 	if s.lastTok.id == ERROR {
 		fmt.Fprintf(&buf, "%s", s.lastTok.str)
@@ -135,7 +156,7 @@ func (s *scanner) Error(e string) {
 	s.lastError = buf.String()
 }
 
-func (s *scanner) scan(lval *sqlSymType) {
+func (s *Scanner) scan(lval *sqlSymType) {
 	lval.id = 0
 	lval.pos = s.pos
 	lval.str = "EOF"
@@ -150,25 +171,25 @@ func (s *scanner) scan(lval *sqlSymType) {
 		return
 	}
 
-	lval.id = int(ch)
+	lval.id = ch
 	lval.pos = s.pos - 1
 	lval.str = s.in[lval.pos:s.pos]
 
 	switch ch {
 	case '$':
-		// param? $[0-9]+
+		// placeholder? $[0-9]+
 		if isDigit(s.peek()) {
-			s.scanParam(lval)
+			s.scanPlaceholder(lval)
 			return
 		} else if s.syntax == Modern {
 			// TODO(pmattis): This should really be prefixed with '@', but that
 			// conflicts with using '@' for index indirection in qualified names.
 			//
-			// param? $<ident>
+			// placeholder? $<ident>
 			if t := s.peek(); isIdentStart(t) {
 				s.pos++
 				s.scanIdent(lval, t)
-				lval.id = PARAM
+				lval.id = PLACEHOLDER
 				return
 			}
 		}
@@ -256,6 +277,28 @@ func (s *scanner) scan(lval *sqlSymType) {
 		s.scanIdent(lval, ch)
 		return
 
+	case 'x', 'X':
+		// Hex literal?
+		if t := s.peek(); t == singleQuote || t == s.stringQuote {
+			// [xX]'[a-f0-9]'
+			s.pos++
+			if s.scanString(lval, t, false) {
+				stringBytes, err := hex.DecodeString(lval.str)
+				if err != nil {
+					// Either the string has an odd number of characters or contains one or
+					// more invalid bytes.
+					lval.id = ERROR
+					lval.str = "invalid hexadecimal string literal"
+					return
+				}
+				lval.id = SCONST
+				lval.str = string(stringBytes)
+			}
+			return
+		}
+		s.scanIdent(lval, ch)
+		return
+
 	case '.':
 		switch t := s.peek(); {
 		case t == '.': // ..
@@ -273,6 +316,16 @@ func (s *scanner) scan(lval *sqlSymType) {
 		case '=': // !=
 			s.pos++
 			lval.id = NOT_EQUALS
+			return
+		case '~': // !~
+			s.pos++
+			switch s.peek() {
+			case '*': // !~*
+				s.pos++
+				lval.id = NOT_REGIMATCH
+				return
+			}
+			lval.id = NOT_REGMATCH
 			return
 		}
 		return
@@ -325,6 +378,24 @@ func (s *scanner) scan(lval *sqlSymType) {
 		}
 		return
 
+	case '/':
+		switch s.peek() {
+		case '/': // //
+			s.pos++
+			lval.id = FLOORDIV
+			return
+		}
+		return
+
+	case '~':
+		switch s.peek() {
+		case '*': // ~*
+			s.pos++
+			lval.id = REGIMATCH
+			return
+		}
+		return
+
 	default:
 		if isDigit(ch) {
 			s.scanNumber(lval, ch)
@@ -340,14 +411,14 @@ func (s *scanner) scan(lval *sqlSymType) {
 	// lval for above.
 }
 
-func (s *scanner) peek() int {
+func (s *Scanner) peek() int {
 	if s.pos >= len(s.in) {
 		return eof
 	}
 	return int(s.in[s.pos])
 }
 
-func (s *scanner) peekN(n int) int {
+func (s *Scanner) peekN(n int) int {
 	pos := s.pos + n
 	if pos >= len(s.in) {
 		return eof
@@ -355,7 +426,7 @@ func (s *scanner) peekN(n int) int {
 	return int(s.in[pos])
 }
 
-func (s *scanner) next() int {
+func (s *Scanner) next() int {
 	ch := s.peek()
 	if ch != eof {
 		s.pos++
@@ -363,7 +434,7 @@ func (s *scanner) next() int {
 	return ch
 }
 
-func (s *scanner) skipWhitespace(lval *sqlSymType, allowComments bool) (newline, ok bool) {
+func (s *Scanner) skipWhitespace(lval *sqlSymType, allowComments bool) (newline, ok bool) {
 	newline = false
 	for {
 		ch := s.peek()
@@ -388,7 +459,7 @@ func (s *scanner) skipWhitespace(lval *sqlSymType, allowComments bool) (newline,
 	return newline, true
 }
 
-func (s *scanner) scanComment(lval *sqlSymType) (present, ok bool) {
+func (s *Scanner) scanComment(lval *sqlSymType) (present, ok bool) {
 	start := s.pos
 	ch := s.peek()
 
@@ -455,7 +526,7 @@ func (s *scanner) scanComment(lval *sqlSymType) (present, ok bool) {
 	return false, true
 }
 
-func (s *scanner) scanIdent(lval *sqlSymType, ch int) {
+func (s *Scanner) scanIdent(lval *sqlSymType, ch int) {
 	start := s.pos - 1
 	for {
 		ch := s.peek()
@@ -474,7 +545,7 @@ func (s *scanner) scanIdent(lval *sqlSymType, ch int) {
 	lval.id = IDENT
 }
 
-func (s *scanner) scanNumber(lval *sqlSymType, ch int) {
+func (s *Scanner) scanNumber(lval *sqlSymType, ch int) {
 	start := s.pos - 1
 	isHex := false
 	hasDecimal := ch == '.'
@@ -489,7 +560,7 @@ func (s *scanner) scanNumber(lval *sqlSymType, ch int) {
 		if ch == 'x' || ch == 'X' {
 			if isHex || s.in[start] != '0' || s.pos != start+1 {
 				lval.id = ERROR
-				lval.str = "invalid hexadecimal literal"
+				lval.str = errInvalidHexNumeric
 				return
 			}
 			s.pos++
@@ -539,26 +610,30 @@ func (s *scanner) scanNumber(lval *sqlSymType, ch int) {
 		lval.id = FCONST
 		floatConst := constant.MakeFromLiteral(lval.str, token.FLOAT, 0)
 		if floatConst.Kind() == constant.Unknown {
-			panic(fmt.Sprintf("could not make constant float from literal %q", lval.str))
+			lval.id = ERROR
+			lval.str = fmt.Sprintf("could not make constant float from literal %q", lval.str)
+			return
 		}
 		lval.union.val = &NumVal{Value: floatConst, OrigString: lval.str}
 	} else {
 		if isHex && s.pos == start+2 {
 			lval.id = ERROR
-			lval.str = "invalid hexadecimal literal"
+			lval.str = errInvalidHexNumeric
 			return
 		}
 
 		lval.id = ICONST
 		intConst := constant.MakeFromLiteral(lval.str, token.INT, 0)
 		if intConst.Kind() == constant.Unknown {
-			panic(fmt.Sprintf("could not make constant int from literal %q", lval.str))
+			lval.id = ERROR
+			lval.str = fmt.Sprintf("could not make constant int from literal %q", lval.str)
+			return
 		}
 		lval.union.val = &NumVal{Value: intConst, OrigString: lval.str}
 	}
 }
 
-func (s *scanner) scanParam(lval *sqlSymType) {
+func (s *Scanner) scanPlaceholder(lval *sqlSymType) {
 	start := s.pos
 	for isDigit(s.peek()) {
 		s.pos++
@@ -578,10 +653,10 @@ func (s *scanner) scanParam(lval *sqlSymType) {
 	// uval is now in the range [0, 1<<63]. Casting to an int64 leaves the range
 	// [0, 1<<63 - 1] intact and moves 1<<63 to -1<<63 (a.k.a. math.MinInt64).
 	lval.union.val = &NumVal{Value: constant.MakeUint64(uval)}
-	lval.id = PARAM
+	lval.id = PLACEHOLDER
 }
 
-func (s *scanner) scanString(lval *sqlSymType, ch int, allowEscapes bool) bool {
+func (s *Scanner) scanString(lval *sqlSymType, ch int, allowEscapes bool) bool {
 	var buf []byte
 	var runeTmp [utf8.UTFMax]byte
 	start := s.pos

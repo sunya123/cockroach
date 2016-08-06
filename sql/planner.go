@@ -20,13 +20,13 @@ import (
 	"fmt"
 	"time"
 
-	"gopkg.in/inf.v0"
+	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/config"
-	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/sql/parser"
-	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/hlc"
+	"github.com/pkg/errors"
 )
 
 // planner is the centerpiece of SQL statement execution combining session
@@ -39,6 +39,7 @@ type planner struct {
 	// TODO(andrei): see if the circular dependency between planner and Session
 	// can be broken if we move the User and Database here from the Session.
 	session  *Session
+	semaCtx  parser.SemaContext
 	evalCtx  parser.EvalContext
 	leases   []*LeaseState
 	leaseMgr *LeaseManager
@@ -52,12 +53,17 @@ type planner struct {
 	verifyFnCheckedOnce     bool
 
 	parser parser.Parser
-	params parameters
+
+	// If set, this is an AS OF SYSTEM TIME query. This flag is used in layers
+	// below the executor to modify the behavior of the SELECT. For example the
+	// table descriptor is not leased, only fetched at the correct time.
+	asOf bool
 
 	// Avoid allocations by embedding commonly used visitors.
-	isAggregateVisitor isAggregateVisitor
-	subqueryVisitor    subqueryVisitor
-	qnameVisitor       qnameVisitor
+	subqueryVisitor             subqueryVisitor
+	subqueryPlanVisitor         subqueryPlanVisitor
+	collectSubqueryPlansVisitor collectSubqueryPlansVisitor
+	qnameVisitor                qnameVisitor
 
 	execCtx *ExecutorContext
 }
@@ -67,7 +73,7 @@ type planner struct {
 func makePlanner() *planner {
 	// init with an empty session. We can't leave this nil because too much code
 	// looks in the session for the current database.
-	return &planner{session: &Session{Location: time.UTC}}
+	return &planner{session: &Session{Location: time.UTC, context: context.Background()}}
 }
 
 // queryRunner abstracts the services provided by a planner object
@@ -139,6 +145,11 @@ type queryRunner interface {
 
 var _ queryRunner = &planner{}
 
+// ctx returns the current session context (suitable for logging/tracing).
+func (p *planner) ctx() context.Context {
+	return p.session.Ctx()
+}
+
 // setTxn implements the queryRunner interface.
 func (p *planner) setTxn(txn *client.Txn) {
 	p.txn = txn
@@ -147,13 +158,36 @@ func (p *planner) setTxn(txn *client.Txn) {
 	} else {
 		p.evalCtx.SetTxnTimestamp(time.Time{})
 		p.evalCtx.SetStmtTimestamp(time.Time{})
-		p.evalCtx.SetClusterTimestamp(roachpb.ZeroTimestamp)
+		p.evalCtx.SetClusterTimestamp(hlc.ZeroTimestamp)
 	}
 }
 
 // resetTxn implements the queryRunner interface.
 func (p *planner) resetTxn() {
 	p.setTxn(nil)
+}
+
+// resetContexts (re-)initializes the structures
+// needed for expression handling.
+func (p *planner) resetContexts() {
+	// Need to reset the parser because it cannot be reused between
+	// batches.
+	p.parser = parser.Parser{}
+
+	p.semaCtx = parser.MakeSemaContext()
+	p.semaCtx.Location = &p.session.Location
+
+	p.evalCtx = parser.EvalContext{
+		Location: &p.session.Location,
+	}
+}
+
+func makeInternalPlanner(txn *client.Txn, user string) *planner {
+	p := makePlanner()
+	p.setTxn(txn)
+	p.resetContexts()
+	p.session.User = user
+	return p
 }
 
 // resetForBatch implements the queryRunner interface.
@@ -163,19 +197,10 @@ func (p *planner) resetForBatch(e *Executor) {
 	cfg, cache := e.getSystemConfig()
 	p.systemConfig = cfg
 	p.databaseCache = cache
-
-	p.params = parameters{}
-
-	// The parser cannot be reused between batches.
-	p.parser = parser.Parser{}
-
-	p.evalCtx = parser.EvalContext{
-		NodeID:   e.nodeID,
-		ReCache:  e.reCache,
-		TmpDec:   new(inf.Dec),
-		Location: p.session.Location,
-	}
 	p.session.TxnState.schemaChangers.curGroupNum++
+	p.resetContexts()
+	p.evalCtx.NodeID = e.nodeID
+	p.evalCtx.ReCache = e.reCache
 }
 
 // query initializes a planNode from a SQL statement string.  This
@@ -186,10 +211,7 @@ func (p *planner) query(sql string, args ...interface{}) (planNode, error) {
 	if err != nil {
 		return nil, err
 	}
-	stmt, err = parser.FillArgs(stmt, golangParameters(args))
-	if err != nil {
-		return nil, err
-	}
+	golangFillQueryArguments(p.semaCtx.Placeholders, args)
 	return p.makePlan(stmt, false)
 }
 
@@ -202,18 +224,16 @@ func (p *planner) queryRow(sql string, args ...interface{}) (parser.DTuple, erro
 	if err := plan.Start(); err != nil {
 		return nil, err
 	}
-	if !plan.Next() {
-		if err := plan.Err(); err != nil {
-			return nil, err
-		}
-		return nil, nil
+	if next, err := plan.Next(); !next {
+		return nil, err
 	}
 	values := plan.Values()
-	if plan.Next() {
-		return nil, util.Errorf("%s: unexpected multiple results", sql)
-	}
-	if err := plan.Err(); err != nil {
+	next, err := plan.Next()
+	if err != nil {
 		return nil, err
+	}
+	if next {
+		return nil, errors.Errorf("%s: unexpected multiple results", sql)
 	}
 	return values, nil
 }
@@ -227,7 +247,7 @@ func (p *planner) exec(sql string, args ...interface{}) (int, error) {
 	if err := plan.Start(); err != nil {
 		return 0, err
 	}
-	return countRowsAffected(plan), plan.Err()
+	return countRowsAffected(plan)
 }
 
 // setTestingVerifyMetadata implements the queryRunner interface.
@@ -271,11 +291,21 @@ func (p *planner) checkTestingVerifyMetadataOrDie(
 		return
 	}
 	if !p.verifyFnCheckedOnce {
-		panic("intial state of the condition to verify was not checked")
+		panic("initial state of the condition to verify was not checked")
 	}
 
 	for p.testingVerifyMetadataFn(e.systemConfig) != nil {
 		e.waitForConfigUpdate()
 	}
 	p.testingVerifyMetadataFn = nil
+}
+
+func (p *planner) fillFKTableMap(m TablesByID) error {
+	var err error
+	for tableID := range m {
+		if m[tableID], err = p.getTableLeaseByID(tableID); err != nil {
+			return err
+		}
+	}
+	return nil
 }

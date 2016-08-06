@@ -17,126 +17,116 @@
 package distsql
 
 import (
-	"fmt"
 	"testing"
 
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/base"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/util/encoding"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
-// testingReceiver is an implementation of rowReceiver that accumulates
-// results which we can later verify.
-type testingReceiver struct {
-	rows       [][]parser.Datum
-	datumAlloc sqlbase.DatumAlloc
-	closed     bool
-	err        error
-}
-
-var _ rowReceiver = &testingReceiver{}
-
-func (tr *testingReceiver) PushRow(row row) bool {
-	if tr.err != nil {
-		return false
-	}
-	decodedRow := make([]parser.Datum, len(row))
-	for i := range row {
-		tr.err = row[i].Decode(&tr.datumAlloc)
-		if tr.err != nil {
-			return false
-		}
-		decodedRow[i] = row[i].Datum
-	}
-	tr.rows = append(tr.rows, decodedRow)
-	return true
-}
-
-func (tr *testingReceiver) Close(err error) {
-	if tr.err != nil {
-		tr.err = err
-	}
-	tr.closed = true
-}
-
 func TestTableReader(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	_, sqlDB, kvDB, cleanup := sqlutils.SetupServer(t)
-	defer cleanup()
+	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
-	if _, err := sqlDB.Exec(`
-		CREATE DATABASE test;
-		CREATE TABLE test.t (a INT PRIMARY KEY, b INT, c INT, d INT, INDEX bc (b, c));
-		INSERT INTO test.t VALUES (1, 10, 11, 12), (2, 20, 21, 22), (3, 30, 31, 32);
-		INSERT INTO test.t VALUES (4, 60, 61, 62), (5, 50, 51, 52), (6, 40, 41, 42);
-	`); err != nil {
-		t.Fatal(err)
+	// Create a table where each row is:
+	//
+	//  |     a    |     b    |         sum         |         s           |
+	//  |-----------------------------------------------------------------|
+	//  | rowId/10 | rowId%10 | rowId/10 + rowId%10 | IntToEnglish(rowId) |
+
+	aFn := func(row int) parser.Datum {
+		return parser.NewDInt(parser.DInt(row / 10))
 	}
+	bFn := func(row int) parser.Datum {
+		return parser.NewDInt(parser.DInt(row % 10))
+	}
+	sumFn := func(row int) parser.Datum {
+		return parser.NewDInt(parser.DInt(row/10 + row%10))
+	}
+
+	sqlutils.CreateTable(t, sqlDB, "t",
+		"a INT, b INT, sum INT, s STRING, PRIMARY KEY (a,b), INDEX bs (b,s)",
+		99,
+		sqlutils.ToRowFn(aFn, bFn, sumFn, sqlutils.RowEnglishFn))
 
 	td := sqlbase.GetTableDescriptor(kvDB, "test", "t")
 
-	ts := TableReaderSpec{
-		Table:         *td,
-		IndexIdx:      0,
-		Reverse:       false,
-		Spans:         nil,
-		Filter:        Expression{Expr: "$2 != 21"}, // c != 21
-		OutputColumns: []uint32{0, 3},               // a, d
+	makeIndexSpan := func(start, end int) TableReaderSpan {
+		var span roachpb.Span
+		prefix := roachpb.Key(sqlbase.MakeIndexKeyPrefix(td, td.Indexes[0].ID))
+		span.Key = append(prefix, encoding.EncodeVarintAscending(nil, int64(start))...)
+		span.EndKey = append(span.EndKey, prefix...)
+		span.EndKey = append(span.EndKey, encoding.EncodeVarintAscending(nil, int64(end))...)
+		return TableReaderSpan{Span: span}
 	}
 
-	txn := client.NewTxn(context.Background(), *kvDB)
+	testCases := []struct {
+		spec     TableReaderSpec
+		expected string
+	}{
+		{
+			spec: TableReaderSpec{
+				Filter:        Expression{Expr: "$2 < 5 AND $1 != 3"}, // sum < 5 && b != 3
+				OutputColumns: []uint32{0, 1},
+			},
+			expected: "[[0 1] [0 2] [0 4] [1 0] [1 1] [1 2] [2 0] [2 1] [2 2] [3 0] [3 1] [4 0]]",
+		},
+		{
+			spec: TableReaderSpec{
+				Filter:        Expression{Expr: "$2 < 5 AND $1 != 3"},
+				OutputColumns: []uint32{3}, // s
+				HardLimit:     4,
+			},
+			expected: "[['one'] ['two'] ['four'] ['one-zero']]",
+		},
+		{
+			spec: TableReaderSpec{
+				IndexIdx:      1,
+				Reverse:       true,
+				Spans:         []TableReaderSpan{makeIndexSpan(4, 6)},
+				Filter:        Expression{Expr: "$0 < 3"}, // sum < 8
+				OutputColumns: []uint32{0, 1},
+				SoftLimit:     1,
+			},
+			expected: "[[2 5] [1 5] [0 5] [2 4] [1 4] [0 4]]",
+		},
+	}
 
-	out := &testingReceiver{}
-	tr, err := newTableReader(&ts, txn, out, parser.EvalContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tr.run()
-	if out.err != nil {
-		t.Fatal(out.err)
-	}
-	if !out.closed {
-		t.Fatalf("output rowReceiver not closed")
-	}
-	expected := "[[1 12] [3 32] [4 62] [5 52] [6 42]]"
-	if fmt.Sprintf("%s", out.rows) != expected {
-		t.Errorf("invalid results: %s, expected %s'", out.rows, expected)
-	}
+	for _, c := range testCases {
+		ts := c.spec
+		ts.Table = *td
 
-	// Read using the bc index
-	var span roachpb.Span
-	span.Key = roachpb.Key(sqlbase.MakeIndexKeyPrefix(td.ID, td.Indexes[0].ID))
-	span.EndKey = append(span.Key, encoding.EncodeVarintAscending(nil, 50)...)
+		txn := client.NewTxn(context.Background(), *kvDB)
+		flowCtx := FlowCtx{
+			Context: context.Background(),
+			evalCtx: &parser.EvalContext{},
+			txn:     txn,
+		}
 
-	ts = TableReaderSpec{
-		Table:         *td,
-		IndexIdx:      1,
-		Reverse:       true,
-		Spans:         []TableReaderSpan{{Span: span}},
-		Filter:        Expression{Expr: "$1 != 30"}, // b != 30
-		OutputColumns: []uint32{0, 2},               // a, c
-	}
-	out = &testingReceiver{}
-	tr, err = newTableReader(&ts, txn, out, parser.EvalContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tr.run()
-	if out.err != nil {
-		t.Fatal(out.err)
-	}
-	if !out.closed {
-		t.Fatalf("output rowReceiver not closed")
-	}
-	expected = "[[6 41] [2 21] [1 11]]"
-	if fmt.Sprintf("%s", out.rows) != expected {
-		t.Errorf("invalid results: %s, expected %s'", out.rows, expected)
+		out := &RowBuffer{}
+		tr, err := newTableReader(&flowCtx, &ts, out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr.Run(nil)
+		if out.err != nil {
+			t.Fatal(out.err)
+		}
+		if !out.closed {
+			t.Fatalf("output RowReceiver not closed")
+		}
+		if result := out.rows.String(); result != c.expected {
+			t.Errorf("invalid results: %s, expected %s'", result, c.expected)
+		}
 	}
 }

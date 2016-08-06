@@ -51,36 +51,7 @@ if [ "${1-}" = "docker" ]; then
   # same build order as the pre-parallel deps script.
 
   if is_shard 2; then
-    # Symlink the cache into the source tree if they don't exist.
-    # In circleci they never do, but this script can also be run
-    # locally where they might.
-    for i in bower_components node_modules typings; do
-      if ! [ -e ui/$i ]; then
-        # Create the cache directory to avoid errors on `ln` below.
-        # `/uicache` is `~/uicache` on the host computer, which is cached
-        # by circle-ci.
-        mkdir -p /uicache/$i
-        ln -s /uicache/$i ui/$i
-      fi
-    done
-
-    for i in npm.installed bower.installed typings.installed; do
-      if [ -f /uicache/$i ]; then
-        cp -a /uicache/$i ui/$i
-      fi
-    done
-
-    time make -C ui npm.installed     || rm -rf ui/node_modules/{*,.bin} && make -C ui npm.installed
-    time make -C ui bower.installed   || rm -rf ui/bower_components/*    && make -C ui bower.installed
-    time make -C ui typings.installed || rm -rf ui/typings/*             && make -C ui typings.installed
-
-    for i in npm.installed bower.installed typings.installed; do
-      cp -a ui/$i /uicache/$i
-    done
-
-    # Fix permissions on the ui/typings directory and subdirectories
-    # (they lack the execute permission for group/other).
-    find /uicache/typings -type d | xargs chmod 0755
+    make -C ui jspm.installed
 
     # TODO(pmattis): This works around the problem seen in
     # https://github.com/cockroachdb/cockroach/issues/4013 where
@@ -169,22 +140,14 @@ if is_shard 2; then
   # We might already be on shard 0 if we're running without
   # parallelism. Avoid deleting our build output in that case.
   if ! is_shard 0; then
-    dir="${HOME}/uicache"
-    # A side-effect of using build/builder.sh is that files created by
-    # the builder are owned by root.root. This isn't normally a
-    # problem, except when trying to rsync onto these directories by a
-    # non-root user which runs into permissions problem. So before
-    # rsyncing, we chown all the files to the current user.
-    time ssh node0 sudo chown -R "${USER}.${USER}" "${dir}"
-    time rsync -a --delete "${dir}/" node0:"${dir}"
+    for dir in "${HOME}/.jspm" "${HOME}/.npm"; do
+      time rsync -a --delete "${dir}/" node0:"${dir}"
+    done
 
     cmds=$(grep '^cmd ' GLOCKFILE | grep -v glock | awk '{print $2}' | awk -F/ '{print $NF}')
-    time ssh node0 mkdir -p "${gopath0}/bin/linux_amd64"
-    time ssh node0 sudo chown "${USER}.${USER}" "${gopath0}/bin/linux_amd64"
-    for cmd in ${cmds}; do
-      path="${gopath0}/bin/linux_amd64/${cmd}"
-      time rsync "${path}" node0:"${path}"
-    done
+    path="${gopath0}/bin/docker_amd64"
+    time ssh node0 mkdir -p "$path"
+    (time cd "$path" && rsync ${cmds} node0:"${path}")
   fi
 fi
 
@@ -192,8 +155,7 @@ if is_shard 1; then
   # We might already be on shard 0 if we're running without
   # parallelism. Avoid deleting our build output in that case.
   if ! is_shard 0; then
-    dir="${gopath0}/pkg/linux_amd64_race"
-    time ssh node0 sudo chown -R "${USER}.${USER}" "${dir}"
+    dir="${gopath0}/pkg/docker_amd64_race"
     time rsync -a --delete "${dir}/" node0:"${dir}"
   fi
 fi
@@ -218,8 +180,7 @@ if is_shard 0; then
   # building an overlapping set of packages.
   if ! is_shard 2; then
     node=$((2 % $CIRCLE_NODE_TOTAL))
-    dir="${gopath0}/pkg/linux_amd64"
-    time sudo chown -R "${USER}.${USER}" "${dir}"
+    dir="${gopath0}/pkg/docker_amd64"
     time rsync -au node${node}:"${dir}/" "${dir}"
   fi
 fi

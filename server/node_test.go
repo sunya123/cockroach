@@ -19,6 +19,7 @@ package server
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"net"
 	"reflect"
 	"sort"
@@ -30,9 +31,9 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/cockroachdb/cockroach/base"
-	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/gossip/resolver"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/kv"
 	"github.com/cockroachdb/cockroach/roachpb"
@@ -42,13 +43,16 @@ import (
 	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/testutils"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/metric"
+	"github.com/cockroachdb/cockroach/util/netutil"
 	"github.com/cockroachdb/cockroach/util/stop"
 	"github.com/cockroachdb/cockroach/util/tracing"
 	"github.com/cockroachdb/cockroach/util/uuid"
+	"github.com/pkg/errors"
 )
 
 // createTestNode creates an rpc server using the specified address,
@@ -65,12 +69,12 @@ func createTestNode(addr net.Addr, engines []engine.Engine, gossipBS net.Addr, t
 	ctx.ScanInterval = 10 * time.Hour
 	ctx.ConsistencyCheckInterval = 10 * time.Hour
 	grpcServer := rpc.NewServer(nodeRPCContext)
-	ln, err := util.ListenAndServeGRPC(stopper, grpcServer, addr)
+	serverCtx := makeTestContext()
+	g := gossip.New(nodeRPCContext, grpcServer, serverCtx.GossipBootstrapResolvers, stopper, metric.NewRegistry())
+	ln, err := netutil.ListenAndServeGRPC(stopper, grpcServer, addr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverCtx := NewTestContext()
-	g := gossip.New(nodeRPCContext, serverCtx.GossipBootstrapResolvers, stopper)
 	if gossipBS != nil {
 		// Handle possibility of a :0 port specification.
 		if gossipBS.Network() == addr.Network() && gossipBS.String() == addr.String() {
@@ -81,11 +85,11 @@ func createTestNode(addr net.Addr, engines []engine.Engine, gossipBS net.Addr, t
 			t.Fatalf("bad gossip address %s: %s", gossipBS, err)
 		}
 		g.SetResolvers([]resolver.Resolver{r})
-		g.Start(grpcServer, ln.Addr())
+		g.Start(ln.Addr())
 	}
 	ctx.Gossip = g
 	retryOpts := base.DefaultRetryOptions()
-	retryOpts.Closer = stopper.ShouldDrain()
+	retryOpts.Closer = stopper.ShouldQuiesce()
 	distSender := kv.NewDistSender(&kv.DistSenderContext{
 		Clock:           ctx.Clock,
 		RPCContext:      nodeRPCContext,
@@ -107,10 +111,10 @@ func createTestNode(addr net.Addr, engines []engine.Engine, gossipBS net.Addr, t
 func createAndStartTestNode(addr net.Addr, engines []engine.Engine, gossipBS net.Addr, t *testing.T) (
 	*grpc.Server, net.Addr, *Node, *stop.Stopper) {
 	grpcServer, addr, _, node, stopper := createTestNode(addr, engines, gossipBS, t)
-	if err := node.start(addr, engines, roachpb.Attributes{}); err != nil {
+	if err := node.start(context.Background(), addr, engines, roachpb.Attributes{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := waitForInitialSplits(node.ctx.DB); err != nil {
+	if err := WaitForInitialSplits(node.ctx.DB); err != nil {
 		t.Fatal(err)
 	}
 	return grpcServer, addr, node, stopper
@@ -143,7 +147,7 @@ func TestBootstrapCluster(t *testing.T) {
 	}
 
 	// Scan the complete contents of the local database directly from the engine.
-	rows, _, err := engine.MVCCScan(context.Background(), e, keys.LocalMax, roachpb.KeyMax, 0, roachpb.MaxTimestamp, true, nil)
+	rows, _, err := engine.MVCCScan(context.Background(), e, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +159,6 @@ func TestBootstrapCluster(t *testing.T) {
 		testutils.MakeKey(roachpb.Key("\x02"), roachpb.KeyMax),
 		testutils.MakeKey(roachpb.Key("\x03"), roachpb.KeyMax),
 		roachpb.Key("\x04node-idgen"),
-		roachpb.Key("\x04range-tree-root"),
 		roachpb.Key("\x04store-idgen"),
 	}
 	// Add the initial keys for sql.
@@ -199,15 +202,15 @@ func TestBootstrapNewStore(t *testing.T) {
 	// new node.
 	util.SucceedsSoon(t, func() error {
 		if n := node.stores.GetStoreCount(); n != 3 {
-			return util.Errorf("expected 3 stores but got %d", n)
+			return errors.Errorf("expected 3 stores but got %d", n)
 		}
 		return nil
 	})
 
 	// Check whether all stores are started properly.
 	if err := node.stores.VisitStores(func(s *storage.Store) error {
-		if s.IsStarted() == false {
-			return util.Errorf("fail to start store: %s", s)
+		if !s.IsStarted() {
+			return errors.Errorf("fail to start store: %s", s)
 		}
 		return nil
 	}); err != nil {
@@ -239,7 +242,7 @@ func TestNodeJoin(t *testing.T) {
 	// Verify new node is able to bootstrap its store.
 	util.SucceedsSoon(t, func() error {
 		if sc := node2.stores.GetStoreCount(); sc != 1 {
-			return util.Errorf("GetStoreCount() expected 1; got %d", sc)
+			return errors.Errorf("GetStoreCount() expected 1; got %d", sc)
 		}
 		return nil
 	})
@@ -253,14 +256,14 @@ func TestNodeJoin(t *testing.T) {
 			return err
 		}
 		if addr2Str, server2AddrStr := nodeDesc1.Address.String(), server2Addr.String(); addr2Str != server2AddrStr {
-			return util.Errorf("addr2 gossip %s doesn't match addr2 address %s", addr2Str, server2AddrStr)
+			return errors.Errorf("addr2 gossip %s doesn't match addr2 address %s", addr2Str, server2AddrStr)
 		}
 		var nodeDesc2 roachpb.NodeDescriptor
 		if err := node2.ctx.Gossip.GetInfoProto(node1Key, &nodeDesc2); err != nil {
 			return err
 		}
 		if addr1Str, server1AddrStr := nodeDesc2.Address.String(), server1Addr.String(); addr1Str != server1AddrStr {
-			return util.Errorf("addr1 gossip %s doesn't match addr1 address %s", addr1Str, server1AddrStr)
+			return errors.Errorf("addr1 gossip %s doesn't match addr1 address %s", addr1Str, server1AddrStr)
 		}
 		return nil
 	})
@@ -276,7 +279,7 @@ func TestNodeJoinSelf(t *testing.T) {
 	engines := []engine.Engine{engine.NewInMem(roachpb.Attributes{}, 1<<20, engineStopper)}
 	_, addr, _, node, stopper := createTestNode(util.TestAddr, engines, util.TestAddr, t)
 	defer stopper.Stop()
-	err := node.start(addr, engines, roachpb.Attributes{})
+	err := node.start(context.Background(), addr, engines, roachpb.Attributes{})
 	if err != errCannotJoinSelf {
 		t.Fatalf("expected err %s; got %s", errCannotJoinSelf, err)
 	}
@@ -299,14 +302,14 @@ func TestCorruptedClusterID(t *testing.T) {
 		NodeID:    1,
 		StoreID:   1,
 	}
-	if err := engine.MVCCPutProto(context.Background(), e, nil, keys.StoreIdentKey(), roachpb.ZeroTimestamp, nil, &sIdent); err != nil {
+	if err := engine.MVCCPutProto(context.Background(), e, nil, keys.StoreIdentKey(), hlc.ZeroTimestamp, nil, &sIdent); err != nil {
 		t.Fatal(err)
 	}
 
 	engines := []engine.Engine{e}
 	_, serverAddr, _, node, stopper := createTestNode(util.TestAddr, engines, nil, t)
 	stopper.Stop()
-	if err := node.start(serverAddr, engines, roachpb.Attributes{}); !testutils.IsError(err, "unidentified store") {
+	if err := node.start(context.Background(), serverAddr, engines, roachpb.Attributes{}); !testutils.IsError(err, "unidentified store") {
 		t.Errorf("unexpected error %v", err)
 	}
 }
@@ -437,13 +440,9 @@ func TestStatusSummaries(t *testing.T) {
 	// ========================================
 	// Start test server and wait for full initialization.
 	// ========================================
-	ts := &TestServer{}
-	ts.Ctx = NewTestContext()
-	ts.StoresPerNode = 3
-	if err := ts.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer ts.Stop()
+	srv, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop()
+	ts := srv.(*TestServer)
 
 	// Retrieve the first store from the Node.
 	s, err := ts.node.stores.GetStore(roachpb.StoreID(1))
@@ -456,8 +455,8 @@ func TestStatusSummaries(t *testing.T) {
 	content := "junk"
 	leftKey := "a"
 
-	// Scan over all keys to "wake up" all replicas (force a leader election).
-	if _, err := ts.db.Scan(keys.MetaMax, keys.MaxKey, 0); err != nil {
+	// Scan over all keys to "wake up" all replicas (force a lease holder election).
+	if _, err := kvDB.Scan(keys.MetaMax, keys.MaxKey, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -466,7 +465,7 @@ func TestStatusSummaries(t *testing.T) {
 	util.SucceedsSoon(t, func() error {
 		for i := 1; i <= int(initialRanges); i++ {
 			if s.RaftStatus(roachpb.RangeID(i)) == nil {
-				return util.Errorf("Store %d replica %d is not present in raft", s.StoreID(), i)
+				return errors.Errorf("Store %d replica %d is not present in raft", s.StoreID(), i)
 			}
 		}
 		return nil

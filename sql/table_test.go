@@ -19,10 +19,15 @@ package sql
 import (
 	"reflect"
 	"testing"
+	"time"
 
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/testutils"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
@@ -35,8 +40,13 @@ func TestMakeTableDescColumns(t *testing.T) {
 		nullable bool
 	}{
 		{
-			"BIT(1)",
+			"BIT",
 			sqlbase.ColumnType{Kind: sqlbase.ColumnType_INT, Width: 1},
+			true,
+		},
+		{
+			"BIT(3)",
+			sqlbase.ColumnType{Kind: sqlbase.ColumnType_INT, Width: 3},
 			true,
 		},
 		{
@@ -110,7 +120,7 @@ func TestMakeTableDescColumns(t *testing.T) {
 		if err := create.Table.NormalizeTableName(""); err != nil {
 			t.Fatalf("%d: %v", i, err)
 		}
-		schema, err := sqlbase.MakeTableDesc(create, 1)
+		schema, err := MakeTableDesc(create, 1)
 		if err != nil {
 			t.Fatalf("%d: %v", i, err)
 		}
@@ -211,7 +221,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 		if err := create.Table.NormalizeTableName(""); err != nil {
 			t.Fatalf("%d: %v", i, err)
 		}
-		schema, err := sqlbase.MakeTableDesc(create, 1)
+		schema, err := MakeTableDesc(create, 1)
 		if err != nil {
 			t.Fatalf("%d: %v", i, err)
 		}
@@ -236,12 +246,61 @@ func TestPrimaryKeyUnspecified(t *testing.T) {
 	if err := create.Table.NormalizeTableName(""); err != nil {
 		t.Fatal(err)
 	}
-	desc, err := sqlbase.MakeTableDesc(create, 1)
+	desc, err := MakeTableDesc(create, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	err = desc.AllocateIDs()
 	if !testutils.IsError(err, sqlbase.ErrMissingPrimaryKey.Error()) {
 		t.Fatalf("unexpected error: %s", err)
+	}
+}
+
+func TestRemoveLeaseIfExpiring(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	p := planner{session: &Session{context: context.Background()}}
+	mc := hlc.NewManualClock(0)
+	p.leaseMgr = &LeaseManager{LeaseStore: LeaseStore{clock: hlc.NewClock(mc.UnixNano)}}
+	p.leases = make([]*LeaseState, 0)
+	txn := client.Txn{Context: context.Background()}
+	p.setTxn(&txn)
+
+	if p.removeLeaseIfExpiring(nil) {
+		t.Error("expected false with nil input")
+	}
+
+	// Add a lease to the planner.
+	d := int64(LeaseDuration)
+	l1 := &LeaseState{expiration: parser.DTimestamp{Time: time.Unix(0, mc.UnixNano()+d+1)}}
+	p.leases = append(p.leases, l1)
+	et := hlc.Timestamp{WallTime: l1.Expiration().UnixNano()}
+	txn.UpdateDeadlineMaybe(et)
+
+	if p.removeLeaseIfExpiring(l1) {
+		t.Error("expected false with a non-expiring lease")
+	}
+	if !p.txn.GetDeadline().Equal(et) {
+		t.Errorf("expected deadline %s but got %s", et, p.txn.GetDeadline())
+	}
+
+	// Advance the clock so that l1 will be expired.
+	mc.Increment(d + 1)
+
+	// Add another lease.
+	l2 := &LeaseState{expiration: parser.DTimestamp{Time: time.Unix(0, mc.UnixNano()+d+1)}}
+	p.leases = append(p.leases, l2)
+	if !p.removeLeaseIfExpiring(l1) {
+		t.Error("expected true with an expiring lease")
+	}
+	et = hlc.Timestamp{WallTime: l2.Expiration().UnixNano()}
+	txn.UpdateDeadlineMaybe(et)
+
+	if !(len(p.leases) == 1 && p.leases[0] == l2) {
+		t.Errorf("expected leases to contain %s but has %s", l2, p.leases)
+	}
+
+	if !p.txn.GetDeadline().Equal(et) {
+		t.Errorf("expected deadline %s, but got %s", et, p.txn.GetDeadline())
 	}
 }

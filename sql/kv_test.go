@@ -25,13 +25,12 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/base"
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/security"
-	"github.com/cockroachdb/cockroach/server"
-	"github.com/cockroachdb/cockroach/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/util/tracing"
+	"github.com/pkg/errors"
 )
 
 type kvInterface interface {
@@ -54,7 +53,7 @@ type kvNative struct {
 
 func newKVNative(b *testing.B) kvInterface {
 	enableTracing := tracing.Disable()
-	s := server.StartTestServer(b)
+	s, _, _ := serverutils.StartServer(b, base.TestServerArgs{})
 
 	// TestServer.DB() returns the TxnCoordSender wrapped client. But that isn't
 	// a fair comparison with SQL as we want these client requests to be sent
@@ -74,7 +73,7 @@ func newKVNative(b *testing.B) kvInterface {
 	return &kvNative{
 		db: client.NewDB(sender),
 		doneFn: func() {
-			s.Stop()
+			s.Stopper().Stop()
 			enableTracing()
 		},
 	}
@@ -110,10 +109,7 @@ func (kv *kvNative) update(rows, run int) error {
 			v := result.Rows[0].ValueInt()
 			wb.Put(fmt.Sprintf("%s%06d", kv.prefix, perm[i]), v+1)
 		}
-		if err := txn.CommitInBatch(wb); err != nil {
-			return err
-		}
-		return nil
+		return txn.CommitInBatch(wb)
 	})
 	return err
 }
@@ -139,7 +135,7 @@ func (kv *kvNative) scan(rows, run int) error {
 		return err
 	})
 	if len(kvs) != rows {
-		return util.Errorf("expected %d rows; got %d", rows, len(kvs))
+		return errors.Errorf("expected %d rows; got %d", rows, len(kvs))
 	}
 	return err
 }
@@ -172,13 +168,9 @@ type kvSQL struct {
 
 func newKVSQL(b *testing.B) kvInterface {
 	enableTracing := tracing.Disable()
-	s := server.StartTestServer(b)
-	pgURL, cleanupURL := sqlutils.PGUrl(b, s.ServingAddr(), security.RootUser, "benchmarkCockroach")
-	pgURL.Path = "bench"
-	db, err := gosql.Open("postgres", pgURL.String())
-	if err != nil {
-		b.Fatal(err)
-	}
+	s, db, _ := serverutils.StartServer(
+		b, base.TestServerArgs{UseDatabase: "bench"})
+
 	if _, err := db.Exec(`CREATE DATABASE IF NOT EXISTS bench`); err != nil {
 		b.Fatal(err)
 	}
@@ -186,9 +178,7 @@ func newKVSQL(b *testing.B) kvInterface {
 	kv := &kvSQL{}
 	kv.db = db
 	kv.doneFn = func() {
-		db.Close()
-		cleanupURL()
-		s.Stop()
+		s.Stopper().Stop()
 		enableTracing()
 	}
 	return kv
@@ -252,7 +242,7 @@ func (kv *kvSQL) scan(count, run int) error {
 		return err
 	}
 	if n != count {
-		return util.Errorf("unexpected result count: %d (expected %d)", n, count)
+		return errors.Errorf("unexpected result count: %d (expected %d)", n, count)
 	}
 	return nil
 }
@@ -261,7 +251,14 @@ func (kv *kvSQL) prep(rows int, initData bool) error {
 	if _, err := kv.db.Exec(`DROP TABLE IF EXISTS bench.kv`); err != nil {
 		return err
 	}
-	if _, err := kv.db.Exec(`CREATE TABLE IF NOT EXISTS bench.kv (k STRING PRIMARY KEY, v INT)`); err != nil {
+	schema := `
+CREATE TABLE IF NOT EXISTS bench.kv (
+  k STRING PRIMARY KEY,
+  v INT,
+  FAMILY (k, v)
+)
+`
+	if _, err := kv.db.Exec(schema); err != nil {
 		return err
 	}
 	if !initData {

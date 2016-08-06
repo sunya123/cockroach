@@ -5,7 +5,11 @@ CREATE TABLE t (
   c INT,
   d INT,
   INDEX b (b),
-  UNIQUE INDEX c (c)
+  UNIQUE INDEX c (c),
+  FAMILY (a),
+  FAMILY (b),
+  FAMILY (c),
+  FAMILY (d)
 )
 
 statement ok
@@ -97,15 +101,15 @@ EXPLAIN SELECT * FROM t ORDER BY c
 query ITT
 EXPLAIN SELECT * FROM t ORDER BY c LIMIT 5
 ----
-0 limit      count: 5, offset: 0
+0 limit      count: 5
 1 index-join
-2 scan       t@c -
+2 scan       t@c - (max 5 rows)
 2 scan       t@primary
 
 query ITT
 EXPLAIN SELECT * FROM t ORDER BY c OFFSET 5
 ----
-0 limit      count: ALL, offset: 5
+0 limit      offset: 5
 1 sort       +c
 2 scan       t@primary -
 
@@ -114,12 +118,12 @@ EXPLAIN SELECT * FROM t ORDER BY c LIMIT 5 OFFSET 5
 ----
 0 limit      count: 5, offset: 5
 1 index-join
-2 scan       t@c -
+2 scan       t@c - (max 10 rows)
 2 scan       t@primary
 
 query ITT
 EXPLAIN SELECT * FROM t ORDER BY c LIMIT 1000000
 ----
-0 limit      count: 1000000, offset: 0
+0 limit      count: 1000000
 1 sort       +c (top 1000000)
 2 scan       t@primary -

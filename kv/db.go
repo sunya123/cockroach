@@ -19,32 +19,34 @@ package kv
 import (
 	"fmt"
 
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
 
 	"github.com/cockroachdb/cockroach/base"
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/security"
-	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/stop"
 )
 
 var allExternalMethods = [...]roachpb.Request{
-	roachpb.Get:              &roachpb.GetRequest{},
-	roachpb.Put:              &roachpb.PutRequest{},
-	roachpb.ConditionalPut:   &roachpb.ConditionalPutRequest{},
-	roachpb.Increment:        &roachpb.IncrementRequest{},
-	roachpb.Delete:           &roachpb.DeleteRequest{},
-	roachpb.DeleteRange:      &roachpb.DeleteRangeRequest{},
-	roachpb.Scan:             &roachpb.ScanRequest{},
-	roachpb.ReverseScan:      &roachpb.ReverseScanRequest{},
-	roachpb.BeginTransaction: &roachpb.BeginTransactionRequest{},
-	roachpb.EndTransaction:   &roachpb.EndTransactionRequest{},
-	roachpb.AdminSplit:       &roachpb.AdminSplitRequest{},
-	roachpb.AdminMerge:       &roachpb.AdminMergeRequest{},
-	roachpb.CheckConsistency: &roachpb.CheckConsistencyRequest{},
+	roachpb.Get:                &roachpb.GetRequest{},
+	roachpb.Put:                &roachpb.PutRequest{},
+	roachpb.ConditionalPut:     &roachpb.ConditionalPutRequest{},
+	roachpb.Increment:          &roachpb.IncrementRequest{},
+	roachpb.Delete:             &roachpb.DeleteRequest{},
+	roachpb.DeleteRange:        &roachpb.DeleteRangeRequest{},
+	roachpb.Scan:               &roachpb.ScanRequest{},
+	roachpb.ReverseScan:        &roachpb.ReverseScanRequest{},
+	roachpb.BeginTransaction:   &roachpb.BeginTransactionRequest{},
+	roachpb.EndTransaction:     &roachpb.EndTransactionRequest{},
+	roachpb.AdminSplit:         &roachpb.AdminSplitRequest{},
+	roachpb.AdminMerge:         &roachpb.AdminMergeRequest{},
+	roachpb.AdminTransferLease: &roachpb.AdminTransferLeaseRequest{},
+	roachpb.CheckConsistency:   &roachpb.CheckConsistencyRequest{},
+	roachpb.RangeLookup:        &roachpb.RangeLookupRequest{},
 }
 
 // A DBServer provides an HTTP server endpoint serving the key-value API.
@@ -97,16 +99,20 @@ func (s *DBServer) Batch(
 				return nil, err
 			}
 			if certUser != security.NodeUser {
-				return nil, util.Errorf("user %s is not allowed", certUser)
+				return nil, errors.Errorf("user %s is not allowed", certUser)
 			}
 		}
 	}
 
-	f := func() {
-		if err = verifyRequest(args); err != nil {
-			return
-		}
+	if err = verifyRequest(args); err != nil {
+		return br, err
+	}
+
+	err = s.stopper.RunTask(func() {
 		var pErr *roachpb.Error
+		// TODO(wiz): This is required to be a different context from the one
+		// provided by grpc since it has to last for the entire transaction and not
+		// just this one RPC call. See comment for (*TxnCoordSender).hearbeatLoop.
 		br, pErr = s.sender.Send(context.TODO(), *args)
 		if pErr != nil {
 			br = &roachpb.BatchResponse{}
@@ -115,11 +121,7 @@ func (s *DBServer) Batch(
 			panic(roachpb.ErrorUnexpectedlySet(s.sender, br))
 		}
 		br.Error = pErr
-	}
-
-	if !s.stopper.RunTask(f) {
-		err = util.Errorf("node stopped")
-	}
+	})
 	return br, err
 }
 
@@ -138,7 +140,7 @@ func verifyRequest(ba *roachpb.BatchRequest) error {
 		method := req.Method()
 
 		if int(method) >= len(allExternalMethods) || allExternalMethods[method] == nil {
-			return util.Errorf("Batch contains an internal request %s", method)
+			return errors.Errorf("Batch contains an internal request %s", method)
 		}
 	}
 	return nil
@@ -146,7 +148,7 @@ func verifyRequest(ba *roachpb.BatchRequest) error {
 
 func verifyEndTransaction(req *roachpb.EndTransactionRequest) error {
 	if req.InternalCommitTrigger != nil {
-		return util.Errorf("EndTransaction request from external KV API contains commit trigger: %+v", req.InternalCommitTrigger)
+		return errors.Errorf("EndTransaction request from external KV API contains commit trigger: %+v", req.InternalCommitTrigger)
 	}
 	return nil
 }

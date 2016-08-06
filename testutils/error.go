@@ -17,7 +17,10 @@
 package testutils
 
 import (
+	"bytes"
+	"fmt"
 	"regexp"
+	"runtime"
 
 	"github.com/cockroachdb/cockroach/roachpb"
 )
@@ -46,4 +49,33 @@ func IsPError(pErr *roachpb.Error, re string) bool {
 		return false
 	}
 	return matched
+}
+
+// IsSQLRetryError returns true if err is retryable. This is true for errors
+// that show a connection issue or an issue with the node itself. This can
+// occur when a node is restarting or is unstable in some other way.
+func IsSQLRetryError(err error) bool {
+	return IsError(err, "(connection reset by peer|connection refused|failed to send RPC|EOF|context deadline exceeded)")
+}
+
+// Caller returns filename and line number info for the specified stack
+// depths. The info is formated as <file>:<line> and each entry is separated
+// for a space.
+func Caller(depth ...int) string {
+	var sep string
+	var buf bytes.Buffer
+	for _, d := range depth {
+		_, file, line, _ := runtime.Caller(d + 1)
+		fmt.Fprintf(&buf, "%s%s:%d", sep, file, line)
+		sep = " "
+	}
+	return buf.String()
+}
+
+// MakeCaller returns a function which will invoke Caller with the specified
+// arguments.
+func MakeCaller(depth ...int) func() string {
+	return func() string {
+		return Caller(depth...)
+	}
 }

@@ -39,9 +39,6 @@ const nonCoveringIndexPenalty = 10
 // Both the number of matching columns and the total columns in the desired
 // ordering are returned.
 //
-// In addition, singleKey indicates if the ordering is such that we only need to
-// retrieve one key (cases like `SELECT MIN(x) ..` and we have an index on x).
-//
 // For example, consider the table t {
 //    a INT,
 //    b INT,
@@ -65,7 +62,7 @@ const nonCoveringIndexPenalty = 10
 //    matchingCols is 1.
 //  - the bac index, along with the fact that b is constrained to a single
 //    value, matches the desired ordering; matchingCols is 2.
-type analyzeOrderingFn func(indexOrdering orderingInfo) (matchingCols, totalCols int, singleKey bool)
+type analyzeOrderingFn func(indexOrdering orderingInfo) (matchingCols, totalCols int)
 
 // selectIndex analyzes the scanNode to determine if there is an index
 // available that can fulfill the query with a more restrictive scan.
@@ -74,7 +71,7 @@ type analyzeOrderingFn func(indexOrdering orderingInfo) (matchingCols, totalCols
 // replacing expressions which are not usable by indexes by "true". The
 // simplified expression is then considered for each index and a set of range
 // constraints is created for the index. The candidate indexes are ranked using
-// these constraints and the best index is selected. The contraints are then
+// these constraints and the best index is selected. The constraints are then
 // transformed into a set of spans to scan within the index.
 //
 // The analyzeOrdering function is used to determine how useful the ordering of
@@ -121,7 +118,7 @@ func selectIndex(
 		// possibly overlapping ranges.
 		exprs, equivalent := analyzeExpr(s.filter)
 		if log.V(2) {
-			log.Infof("analyzeExpr: %s -> %s [equivalent=%v]", s.filter, exprs, equivalent)
+			log.Infof(s.p.ctx(), "analyzeExpr: %s -> %s [equivalent=%v]", s.filter, exprs, equivalent)
 		}
 
 		// Check to see if the filter simplified to a constant.
@@ -191,7 +188,7 @@ func selectIndex(
 
 	if log.V(2) {
 		for i, c := range candidates {
-			log.Infof("%d: selectIndex(%s): cost=%v constraints=%s reverse=%t",
+			log.Infof(s.p.ctx(), "%d: selectIndex(%s): cost=%v constraints=%s reverse=%t",
 				i, c.index.Name, c.cost, c.constraints, c.reverse)
 		}
 	}
@@ -201,13 +198,12 @@ func selectIndex(
 	c := candidates[0]
 	s.index = c.index
 	s.isSecondaryIndex = (c.index != &s.desc.PrimaryIndex)
-	s.spans = makeSpans(c.constraints, c.desc.ID, c.index)
+	s.spans = makeSpans(c.constraints, c.desc, c.index)
 	if len(s.spans) == 0 {
 		// There are no spans to scan.
 		return &emptyNode{}, nil
 	}
 	s.filter = applyIndexConstraints(s.filter, c.constraints)
-	noFilter := (s.filter == nil)
 	s.reverse = c.reverse
 
 	var plan planNode
@@ -221,22 +217,10 @@ func selectIndex(
 		plan, s = s.p.makeIndexJoin(s, c.exactPrefix)
 	}
 
-	// If we have no filter, we can request a single key in some cases.
-	if noFilter && analyzeOrdering != nil && s.isSecondaryIndex {
-		_, _, singleKey := analyzeOrdering(plan.Ordering())
-		if singleKey {
-			// We only need to retrieve one key, but some spans might contain no
-			// keys so we need to keep all of them.
-			for i := range s.spans {
-				s.spans[i].Count = 1
-			}
-		}
-	}
-
 	if log.V(3) {
-		log.Infof("%s: filter=%v", c.index.Name, s.filter)
+		log.Infof(s.p.ctx(), "%s: filter=%v", c.index.Name, s.filter)
 		for i, span := range s.spans {
-			log.Infof("%s/%d: %s", c.index.Name, i, sqlbase.PrettySpan(span, 2))
+			log.Infof(s.p.ctx(), "%s/%d: %s", c.index.Name, i, sqlbase.PrettySpan(span, 2))
 		}
 	}
 
@@ -395,8 +379,8 @@ func (v *indexInfo) analyzeOrdering(scan *scanNode, analyzeOrdering analyzeOrder
 	// Analyze the ordering provided by the index (either forward or reverse).
 	fwdIndexOrdering := scan.computeOrdering(v.index, v.exactPrefix, false)
 	revIndexOrdering := scan.computeOrdering(v.index, v.exactPrefix, true)
-	fwdMatch, orderCols, _ := analyzeOrdering(fwdIndexOrdering)
-	revMatch, orderCols, _ := analyzeOrdering(revIndexOrdering)
+	fwdMatch, orderCols := analyzeOrdering(fwdIndexOrdering)
+	revMatch, orderCols := analyzeOrdering(revIndexOrdering)
 
 	// Weigh the cost by how much of the ordering matched.
 	//
@@ -418,7 +402,7 @@ func (v *indexInfo) analyzeOrdering(scan *scanNode, analyzeOrdering analyzeOrder
 	}
 
 	if log.V(2) {
-		log.Infof("%s: analyzeOrdering: weight=%0.2f reverse=%v match=%d",
+		log.Infof(scan.p.ctx(), "%s: analyzeOrdering: weight=%0.2f reverse=%v match=%d",
 			v.index.Name, weight, v.reverse, match)
 	}
 }
@@ -473,7 +457,7 @@ func (v *indexInfo) makeOrConstraints(orExprs []parser.TypedExprs) error {
 // This method generates one indexConstraint for a prefix of the columns in
 // the index (except for tuple constraints which can account for more than
 // one column). A prefix of the generated constraints has a .start, and
-// similarly a prefix of the contraints has a .end (in other words,
+// similarly a prefix of the constraints has a .end (in other words,
 // once a constraint doesn't have a .start, no further constraints will
 // have one). This is because they wouldn't be useful when generating spans.
 //
@@ -1101,14 +1085,14 @@ func (a spanEvents) Less(i, j int) bool {
 // merging the spans for the disjunctions (top-level OR branches). The resulting
 // spans are non-overlapping and ordered.
 func makeSpans(
-	constraints orIndexConstraints, tableID sqlbase.ID, index *sqlbase.IndexDescriptor,
+	constraints orIndexConstraints, tableDesc *sqlbase.TableDescriptor, index *sqlbase.IndexDescriptor,
 ) sqlbase.Spans {
 	if len(constraints) == 0 {
-		return makeSpansForIndexConstraints(nil, tableID, index)
+		return makeSpansForIndexConstraints(nil, tableDesc, index)
 	}
 	var allSpans sqlbase.Spans
 	for _, c := range constraints {
-		s := makeSpansForIndexConstraints(c, tableID, index)
+		s := makeSpansForIndexConstraints(c, tableDesc, index)
 		allSpans = append(allSpans, s...)
 	}
 	return mergeAndSortSpans(allSpans)
@@ -1161,9 +1145,9 @@ func mergeAndSortSpans(s sqlbase.Spans) sqlbase.Spans {
 // instance of indexConstraints. The resulting spans are non-overlapping (by
 // virtue of the input constraints being disjunct).
 func makeSpansForIndexConstraints(
-	constraints indexConstraints, tableID sqlbase.ID, index *sqlbase.IndexDescriptor,
+	constraints indexConstraints, tableDesc *sqlbase.TableDescriptor, index *sqlbase.IndexDescriptor,
 ) sqlbase.Spans {
-	prefix := roachpb.Key(sqlbase.MakeIndexKeyPrefix(tableID, index.ID))
+	prefix := roachpb.Key(sqlbase.MakeIndexKeyPrefix(tableDesc, index.ID))
 	// We have one constraint per column, so each contributes something
 	// to the start and/or the end key of the span.
 	// But we also have (...) IN <tuple> constraints that span multiple columns.

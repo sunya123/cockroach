@@ -20,48 +20,38 @@ package server
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
-	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"golang.org/x/net/context"
-	// Register the net/trace endpoint with http.DefaultServeMux.
-	"golang.org/x/net/trace"
-	// This is imported for its side-effect of registering pprof
-	// endpoints with the http.DefaultServeMux.
-	_ "net/http/pprof"
-
-	gwruntime "github.com/gengo/grpc-gateway/runtime"
 	"github.com/gogo/protobuf/proto"
-	"github.com/rcrowley/go-metrics"
-	"github.com/rcrowley/go-metrics/exp"
+	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
+	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 
 	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/build"
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/config"
 	"github.com/cockroachdb/cockroach/gossip"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/security"
+	"github.com/cockroachdb/cockroach/server/serverpb"
 	"github.com/cockroachdb/cockroach/sql"
 	"github.com/cockroachdb/cockroach/sql/parser"
+	"github.com/cockroachdb/cockroach/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/retry"
+	"github.com/cockroachdb/cockroach/util/syncutil"
 	"github.com/cockroachdb/cockroach/util/uuid"
 )
 
 const (
-	// debugEndpoint is the prefix of golang's standard debug functionality
-	// for access to exported vars and pprof tools.
-	debugEndpoint = "/debug/"
-
 	// adminEndpoint is the prefix for RESTful endpoints used to
 	// provide an administrative interface to the cockroach cluster.
 	adminEndpoint = "/_admin/"
@@ -79,140 +69,37 @@ const (
 	serverUIDataKeyPrefix = "server."
 )
 
-var (
-	// We use the default http mux for the debug endpoint (as pprof and net/trace
-	// register to that via import, and go-metrics registers to that via exp.Exp())
-	debugServeMux = http.DefaultServeMux
-
-	// apiServerMessage is the standard body for all HTTP 500 responses.
-	errAdminAPIError = grpc.Errorf(codes.Internal, "An internal server error has occurred. Please "+
-		"check your CockroachDB logs for more details.")
-)
-
-func init() {
-	// Tweak the authentication logic for the tracing endpoint. By default it's
-	// open for localhost only, but with Docker we want to get there from
-	// anywhere. We maintain the default behavior of only allowing access to
-	// sensitive logs from localhost.
-	//
-	// TODO(mberhault): properly secure this once we require client certs.
-	origAuthRequest := trace.AuthRequest
-	trace.AuthRequest = func(req *http.Request) (bool, bool) {
-		_, sensitive := origAuthRequest(req)
-		return true, sensitive
-	}
-
-	debugServeMux.HandleFunc(debugEndpoint, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != debugEndpoint {
-			http.Redirect(w, r, debugEndpoint, http.StatusMovedPermanently)
-		}
-
-		// The explicit header is necessary or (at least Chrome) will try to
-		// download a gzipped file (Content-type comes back application/x-gzip).
-		w.Header().Add("Content-type", "text/html")
-
-		fmt.Fprint(w, `
-<html>
-<head>
-<style>
-table tr td {
-  vertical-align: top;
-}
-</style>
-<title>Debug endpoints</title>
-</head>
-<body>
-<h1>Debug endpoints</h1>
-<table>
-<tr>
-<td>trace (local node only)</td>
-<td><a href="./requests">requests</a>, <a href="./events">events</a></td>
-</tr>
-<tr>
-<td>stopper</td>
-<td><a href="./stopper">active tasks</a></td>
-</tr>
-<tr>
-<td>metrics</td>
-<td><a href="./metrics">variables</a></td>
-</tr>
-<tr>
-<td>node status</td>
-<td>
-<a href="/_status/gossip/local">gossip</a><br />
-<a href="/_status/ranges/local">ranges</a><br />
-</td>
-</tr>
-<tr>
-<td>pprof</td>
-<td>
-<!-- cribbed from the /debug/pprof endpoint -->
-<a href="./pprof/block?debug=1">block</a><br />
-<a href="./pprof/goroutine?debug=1">goroutine</a> (<a href="./pprof/goroutine?debug=2">all</a>)<br />
-<a href="./pprof/heap?debug=1">heap</a><br />
-<a href="./pprof/threadcreate?debug=1">threadcreate</a><br />
-</td>
-</tr>
-</table>
-</body></html>
-`)
-	})
-
-	// This registers a superset of the variables exposed through the /debug/vars endpoint
-	// onto the /debug/metrics endpoint. It includes all expvars registered globally and
-	// all metrics registered on the DefaultRegistry.
-	exp.Exp(metrics.DefaultRegistry)
-}
+// apiServerMessage is the standard body for all HTTP 500 responses.
+var errAdminAPIError = grpc.Errorf(codes.Internal, "An internal server error "+
+	"has occurred. Please check your CockroachDB logs for more details.")
 
 // A adminServer provides a RESTful HTTP API to administration of
 // the cockroach cluster.
 type adminServer struct {
-	*http.ServeMux
-
 	server *Server
 }
 
-// newAdminServer allocates and returns a new REST server for
+// makeAdminServer allocates and returns a new REST server for
 // administrative APIs.
-func newAdminServer(s *Server) *adminServer {
-	server := &adminServer{
-		ServeMux: http.NewServeMux(),
-		server:   s,
+func makeAdminServer(s *Server) adminServer {
+	return adminServer{
+		server: s,
 	}
-
-	// Register HTTP handlers.
-	server.ServeMux.HandleFunc(debugEndpoint, server.handleDebug)
-	return server
 }
 
 // RegisterService registers the GRPC service.
 func (s *adminServer) RegisterService(g *grpc.Server) {
-	RegisterAdminServer(g, s)
+	serverpb.RegisterAdminServer(g, s)
 }
 
-// Register starts the gateway (i.e. reverse proxy) that proxies HTTP requests
+// RegisterGateway starts the gateway (i.e. reverse proxy) that proxies HTTP requests
 // to the appropriate gRPC endpoints.
 func (s *adminServer) RegisterGateway(
 	ctx context.Context,
 	mux *gwruntime.ServeMux,
-	addr string,
-	opts []grpc.DialOption,
+	conn *grpc.ClientConn,
 ) error {
-	if err := RegisterAdminHandlerFromEndpoint(ctx, mux, addr, opts); err != nil {
-		return util.Errorf("error constructing grpc-gateway: %s. are your certificates valid?", err)
-	}
-
-	// Pass all requests for gRPC-based API endpoints to the gateway mux.
-	s.ServeMux.Handle(apiEndpoint, mux)
-	return nil
-}
-
-// handleDebug passes requests with the debugPathPrefix onto the default
-// serve mux, which is preconfigured (by import of net/http/pprof and registration
-// of go-metrics) to serve endpoints which access exported variables and pprof tools.
-func (s *adminServer) handleDebug(w http.ResponseWriter, r *http.Request) {
-	handler, _ := debugServeMux.Handler(r)
-	handler.ServeHTTP(w, r)
+	return serverpb.RegisterAdminHandler(ctx, mux, conn)
 }
 
 // getUserProto will return the authenticated user. For now, this is just a stub until we
@@ -227,21 +114,21 @@ func (s *adminServer) getUser(_ proto.Message) string {
 // serverError logs the provided error and returns an error that should be returned by
 // the RPC endpoint method.
 func (s *adminServer) serverError(err error) error {
-	log.ErrorfDepth(1, "%s", err)
+	log.ErrorfDepth(context.TODO(), 1, "%s", err)
 	return errAdminAPIError
 }
 
 // serverErrorf logs the provided error and returns an error that should be returned by
 // the RPC endpoint method.
 func (s *adminServer) serverErrorf(format string, args ...interface{}) error {
-	log.ErrorfDepth(1, format, args...)
+	log.ErrorfDepth(context.TODO(), 1, format, args...)
 	return errAdminAPIError
 }
 
 // serverErrors logs the provided errors and returns an error that should be returned by
 // the RPC endpoint method.
 func (s *adminServer) serverErrors(errors []error) error {
-	log.ErrorfDepth(1, "%v", errors)
+	log.ErrorfDepth(context.TODO(), 1, "%v", errors)
 	return errAdminAPIError
 }
 
@@ -249,12 +136,12 @@ func (s *adminServer) serverErrors(errors []error) error {
 // the first error that was found.
 func (s *adminServer) checkQueryResults(results []sql.Result, numResults int) error {
 	if a, e := len(results), numResults; a != e {
-		return util.Errorf("# of results %d != expected %d", a, e)
+		return errors.Errorf("# of results %d != expected %d", a, e)
 	}
 
 	for _, result := range results {
 		if result.Err != nil {
-			return util.Errorf("%s", result.Err)
+			return errors.Errorf("%s", result.Err)
 		}
 	}
 
@@ -276,14 +163,17 @@ func (s *adminServer) firstNotFoundError(results []sql.Result) error {
 }
 
 // Databases is an endpoint that returns a list of databases.
-func (s *adminServer) Databases(ctx context.Context, req *DatabasesRequest) (*DatabasesResponse, error) {
-	session := sql.NewSession(sql.SessionArgs{User: s.getUser(req)}, s.server.sqlExecutor, nil)
-	r := s.server.sqlExecutor.ExecuteStatements(ctx, session, "SHOW DATABASES;", nil)
+func (s *adminServer) Databases(
+	ctx context.Context, req *serverpb.DatabasesRequest,
+) (*serverpb.DatabasesResponse, error) {
+	args := sql.SessionArgs{User: s.getUser(req)}
+	session := sql.NewSession(ctx, args, s.server.sqlExecutor, nil)
+	r := s.server.sqlExecutor.ExecuteStatements(session, "SHOW DATABASES;", nil)
 	if err := s.checkQueryResults(r.ResultList, 1); err != nil {
 		return nil, s.serverError(err)
 	}
 
-	var resp DatabasesResponse
+	var resp serverpb.DatabasesResponse
 	for _, row := range r.ResultList[0].Rows {
 		dbname, ok := row.Values[0].(*parser.DString)
 		if !ok {
@@ -297,8 +187,11 @@ func (s *adminServer) Databases(ctx context.Context, req *DatabasesRequest) (*Da
 
 // DatabaseDetails is an endpoint that returns grants and a list of table names
 // for the specified database.
-func (s *adminServer) DatabaseDetails(ctx context.Context, req *DatabaseDetailsRequest) (*DatabaseDetailsResponse, error) {
-	session := sql.NewSession(sql.SessionArgs{User: s.getUser(req)}, s.server.sqlExecutor, nil)
+func (s *adminServer) DatabaseDetails(
+	ctx context.Context, req *serverpb.DatabaseDetailsRequest,
+) (*serverpb.DatabaseDetailsResponse, error) {
+	args := sql.SessionArgs{User: s.getUser(req)}
+	session := sql.NewSession(ctx, args, s.server.sqlExecutor, nil)
 
 	// Placeholders don't work with SHOW statements, so we need to manually
 	// escape the database name.
@@ -306,7 +199,7 @@ func (s *adminServer) DatabaseDetails(ctx context.Context, req *DatabaseDetailsR
 	// TODO(cdo): Use placeholders when they're supported by SHOW.
 	escDBName := parser.Name(req.Database).String()
 	query := fmt.Sprintf("SHOW GRANTS ON DATABASE %s; SHOW TABLES FROM %s;", escDBName, escDBName)
-	r := s.server.sqlExecutor.ExecuteStatements(ctx, session, query, nil)
+	r := s.server.sqlExecutor.ExecuteStatements(session, query, nil)
 	if err := s.firstNotFoundError(r.ResultList); err != nil {
 		return nil, grpc.Errorf(codes.NotFound, "%s", err)
 	}
@@ -315,7 +208,7 @@ func (s *adminServer) DatabaseDetails(ctx context.Context, req *DatabaseDetailsR
 	}
 
 	// Marshal grants.
-	var resp DatabaseDetailsResponse
+	var resp serverpb.DatabaseDetailsResponse
 	{
 		const (
 			userCol       = "User"
@@ -325,7 +218,7 @@ func (s *adminServer) DatabaseDetails(ctx context.Context, req *DatabaseDetailsR
 		scanner := makeResultScanner(r.ResultList[0].Columns)
 		for _, row := range r.ResultList[0].Rows {
 			// Marshal grant, splitting comma-separated privileges into a proper slice.
-			var grant DatabaseDetailsResponse_Grant
+			var grant serverpb.DatabaseDetailsResponse_Grant
 			var privileges string
 			if err := scanner.Scan(row, userCol, &grant.User); err != nil {
 				return nil, err
@@ -359,26 +252,28 @@ func (s *adminServer) DatabaseDetails(ctx context.Context, req *DatabaseDetailsR
 
 // TableDetails is an endpoint that returns columns, indices, and other
 // relevant details for the specified table.
-func (s *adminServer) TableDetails(ctx context.Context, req *TableDetailsRequest) (
-	*TableDetailsResponse, error) {
-	session := sql.NewSession(sql.SessionArgs{User: s.getUser(req)}, s.server.sqlExecutor, nil)
+func (s *adminServer) TableDetails(
+	ctx context.Context, req *serverpb.TableDetailsRequest,
+) (*serverpb.TableDetailsResponse, error) {
+	args := sql.SessionArgs{User: s.getUser(req)}
+	session := sql.NewSession(ctx, args, s.server.sqlExecutor, nil)
 
 	// TODO(cdo): Use real placeholders for the table and database names when we've extended our SQL
 	// grammar to allow that.
-	escDbName := parser.Name(req.Database).String()
+	escDBName := parser.Name(req.Database).String()
 	escTableName := parser.Name(req.Table).String()
-	escQualTable := fmt.Sprintf("%s.%s", escDbName, escTableName)
-	query := fmt.Sprintf("SHOW COLUMNS FROM %s; SHOW INDEX FROM %s; SHOW GRANTS ON TABLE %s",
-		escQualTable, escQualTable, escQualTable)
-	r := s.server.sqlExecutor.ExecuteStatements(ctx, session, query, nil)
+	escQualTable := fmt.Sprintf("%s.%s", escDBName, escTableName)
+	query := fmt.Sprintf("SHOW COLUMNS FROM %s; SHOW INDEX FROM %s; SHOW GRANTS ON TABLE %s; SHOW CREATE TABLE %s;",
+		escQualTable, escQualTable, escQualTable, escQualTable)
+	r := s.server.sqlExecutor.ExecuteStatements(session, query, nil)
 	if err := s.firstNotFoundError(r.ResultList); err != nil {
 		return nil, grpc.Errorf(codes.NotFound, "%s", err)
 	}
-	if err := s.checkQueryResults(r.ResultList, 3); err != nil {
+	if err := s.checkQueryResults(r.ResultList, 4); err != nil {
 		return nil, err
 	}
 
-	var resp TableDetailsResponse
+	var resp serverpb.TableDetailsResponse
 
 	// Marshal SHOW COLUMNS result.
 	//
@@ -395,7 +290,7 @@ func (s *adminServer) TableDetails(ctx context.Context, req *TableDetailsRequest
 		)
 		scanner := makeResultScanner(r.ResultList[0].Columns)
 		for _, row := range r.ResultList[0].Rows {
-			var col TableDetailsResponse_Column
+			var col serverpb.TableDetailsResponse_Column
 			if err := scanner.Scan(row, fieldCol, &col.Name); err != nil {
 				return nil, err
 			}
@@ -431,7 +326,7 @@ func (s *adminServer) TableDetails(ctx context.Context, req *TableDetailsRequest
 		scanner := makeResultScanner(r.ResultList[1].Columns)
 		for _, row := range r.ResultList[1].Rows {
 			// Marshal grant, splitting comma-separated privileges into a proper slice.
-			var index TableDetailsResponse_Index
+			var index serverpb.TableDetailsResponse_Index
 			if err := scanner.Scan(row, nameCol, &index.Name); err != nil {
 				return nil, err
 			}
@@ -463,7 +358,7 @@ func (s *adminServer) TableDetails(ctx context.Context, req *TableDetailsRequest
 		scanner := makeResultScanner(r.ResultList[2].Columns)
 		for _, row := range r.ResultList[2].Rows {
 			// Marshal grant, splitting comma-separated privileges into a proper slice.
-			var grant TableDetailsResponse_Grant
+			var grant serverpb.TableDetailsResponse_Grant
 			var privileges string
 			if err := scanner.Scan(row, userCol, &grant.User); err != nil {
 				return nil, err
@@ -476,6 +371,23 @@ func (s *adminServer) TableDetails(ctx context.Context, req *TableDetailsRequest
 		}
 	}
 
+	// Marshal SHOW CREATE TABLE result.
+	{
+		const createTableCol = "CreateTable"
+		showResult := r.ResultList[3]
+		if len(showResult.Rows) != 1 {
+			return nil, s.serverErrorf("CreateTable response not available.")
+		}
+
+		scanner := makeResultScanner(showResult.Columns)
+		var createStmt string
+		if err := scanner.Scan(showResult.Rows[0], createTableCol, &createStmt); err != nil {
+			return nil, err
+		}
+
+		resp.CreateTableStatement = createStmt
+	}
+
 	// Get the number of ranges in the table. We get the key span for the table
 	// data. Then, we count the number of ranges that make up that key span.
 	{
@@ -483,7 +395,7 @@ func (s *adminServer) TableDetails(ctx context.Context, req *TableDetailsRequest
 		var tableSpan roachpb.Span
 		if err := s.server.db.Txn(func(txn *client.Txn) error {
 			var err error
-			tableSpan, err = iexecutor.GetTableSpan(s.getUser(req), txn, escDbName, escTableName)
+			tableSpan, err = iexecutor.GetTableSpan(s.getUser(req), txn, escDBName, escTableName)
 			return err
 		}); err != nil {
 			return nil, s.serverError(err)
@@ -505,21 +417,163 @@ func (s *adminServer) TableDetails(ctx context.Context, req *TableDetailsRequest
 		resp.RangeCount = rangeCount
 	}
 
+	// Query the zone configuration for this table.
+	{
+		path, err := s.queryDescriptorIDPath(session, []string{escDBName, escTableName})
+		if err != nil {
+			return nil, s.serverError(err)
+		}
+
+		id, zone, zoneExists, err := s.queryZonePath(session, path)
+		if err != nil {
+			return nil, s.serverError(err)
+		}
+
+		if !zoneExists {
+			zone = config.DefaultZoneConfig()
+		}
+		resp.ZoneConfig = zone
+
+		switch id {
+		case path[1]:
+			resp.ZoneConfigLevel = serverpb.ZoneConfigurationLevel_DATABASE
+		case path[2]:
+			resp.ZoneConfigLevel = serverpb.ZoneConfigurationLevel_TABLE
+		default:
+			resp.ZoneConfigLevel = serverpb.ZoneConfigurationLevel_CLUSTER
+		}
+	}
+
 	return &resp, nil
 }
 
+// TableStats is an endpoint that returns columns, indices, and other
+// relevant details for the specified table.
+func (s *adminServer) TableStats(ctx context.Context, req *serverpb.TableStatsRequest) (
+	*serverpb.TableStatsResponse, error,
+) {
+	// Get table span.
+	var tableSpan roachpb.Span
+	var iexecutor sql.InternalExecutor
+	if err := s.server.db.Txn(func(txn *client.Txn) error {
+		var err error
+		tableSpan, err = iexecutor.GetTableSpan(s.getUser(req), txn, req.Database, req.Table)
+		return err
+	}); err != nil {
+		return nil, s.serverError(err)
+	}
+
+	startKey, err := keys.Addr(tableSpan.Key)
+	if err != nil {
+		return nil, s.serverError(err)
+	}
+	endKey, err := keys.Addr(tableSpan.EndKey)
+	if err != nil {
+		return nil, s.serverError(err)
+	}
+
+	// Get current range descriptors for table. This is done by scanning over
+	// meta2 keys for the range.
+	rangeDescKVs, err := s.server.db.Scan(keys.RangeMetaKey(startKey), keys.RangeMetaKey(endKey), 0)
+	if err != nil {
+		return nil, s.serverError(err)
+	}
+
+	// Extract a list of node IDs from the response.
+	nodeIDs := make(map[roachpb.NodeID]struct{})
+	for _, kv := range rangeDescKVs {
+		var rng roachpb.RangeDescriptor
+		if err := kv.Value.GetProto(&rng); err != nil {
+			return nil, s.serverError(err)
+		}
+		for _, repl := range rng.Replicas {
+			nodeIDs[repl.NodeID] = struct{}{}
+		}
+	}
+
+	// Construct TableStatsResponse by sending an RPC to every node involved.
+	tableStatResponse := serverpb.TableStatsResponse{
+		NodeCount:  int64(len(nodeIDs)),
+		RangeCount: int64(len(rangeDescKVs)),
+	}
+	type nodeResponse struct {
+		nodeID roachpb.NodeID
+		resp   *serverpb.SpanStatsResponse
+		err    error
+	}
+
+	// Send a SpanStats query to each node. Set a timeout on the context for
+	// these queries.
+	responses := make(chan nodeResponse)
+	ctx, cancel := context.WithTimeout(ctx, base.NetworkTimeout)
+	defer cancel()
+	for nodeID := range nodeIDs {
+		nodeID := nodeID
+		if err := s.server.stopper.RunAsyncTask(func() {
+			var spanResponse *serverpb.SpanStatsResponse
+			client, err := s.server.status.dialNode(nodeID)
+			if err == nil {
+				req := serverpb.SpanStatsRequest{
+					StartKey: startKey,
+					EndKey:   endKey,
+					NodeID:   nodeID.String(),
+				}
+				spanResponse, err = client.SpanStats(ctx, &req)
+			}
+
+			response := nodeResponse{
+				nodeID: nodeID,
+				resp:   spanResponse,
+				err:    err,
+			}
+			select {
+			case responses <- response:
+				// Response processed.
+			case <-ctx.Done():
+				// Context completed, response no longer needed.
+			}
+		}); err != nil {
+			return nil, err
+		}
+	}
+	for remainingResponses := len(nodeIDs); remainingResponses > 0; remainingResponses-- {
+		select {
+		case resp := <-responses:
+			// For nodes which returned an error, note that the node's data
+			// is missing. For successful calls, aggregate statistics.
+			if resp.err != nil {
+				tableStatResponse.MissingNodes = append(
+					tableStatResponse.MissingNodes,
+					serverpb.TableStatsResponse_MissingNode{
+						NodeID:       resp.nodeID.String(),
+						ErrorMessage: resp.err.Error(),
+					},
+				)
+			} else {
+				tableStatResponse.Stats.Add(resp.resp.TotalStats)
+				tableStatResponse.ReplicaCount += int64(resp.resp.RangeCount)
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	return &tableStatResponse, nil
+}
+
 // Users returns a list of users, stripped of any passwords.
-func (s *adminServer) Users(ctx context.Context, req *UsersRequest) (*UsersResponse, error) {
-	session := sql.NewSession(sql.SessionArgs{User: s.getUser(req)}, s.server.sqlExecutor, nil)
+func (s *adminServer) Users(ctx context.Context, req *serverpb.UsersRequest) (*serverpb.UsersResponse, error) {
+	args := sql.SessionArgs{User: s.getUser(req)}
+	session := sql.NewSession(ctx, args, s.server.sqlExecutor, nil)
 	query := "SELECT username FROM system.users"
-	r := s.server.sqlExecutor.ExecuteStatements(ctx, session, query, nil)
+	r := s.server.sqlExecutor.ExecuteStatements(session, query, nil)
 	if err := s.checkQueryResults(r.ResultList, 1); err != nil {
 		return nil, s.serverError(err)
 	}
 
-	var resp UsersResponse
+	var resp serverpb.UsersResponse
 	for _, row := range r.ResultList[0].Rows {
-		resp.Users = append(resp.Users, UsersResponse_User{string(*row.Values[0].(*parser.DString))})
+		resp.Users = append(resp.Users, serverpb.UsersResponse_User{Username: string(*row.Values[0].(*parser.DString))})
 	}
 	return &resp, nil
 }
@@ -529,11 +583,12 @@ func (s *adminServer) Users(ctx context.Context, req *UsersRequest) (*UsersRespo
 //
 // type=STRING  returns events with this type (e.g. "create_table")
 // targetID=INT returns events for that have this targetID
-func (s *adminServer) Events(ctx context.Context, req *EventsRequest) (*EventsResponse, error) {
-	session := sql.NewSession(sql.SessionArgs{User: s.getUser(req)}, s.server.sqlExecutor, nil)
+func (s *adminServer) Events(ctx context.Context, req *serverpb.EventsRequest) (*serverpb.EventsResponse, error) {
+	args := sql.SessionArgs{User: s.getUser(req)}
+	session := sql.NewSession(ctx, args, s.server.sqlExecutor, nil)
 
 	// Execute the query.
-	q := &sqlQuery{}
+	q := makeSQLQuery()
 	q.Append("SELECT timestamp, eventType, targetID, reportingID, info, uniqueID ")
 	q.Append("FROM system.eventlog ")
 	q.Append("WHERE true ") // This simplifies the WHERE clause logic below.
@@ -548,21 +603,21 @@ func (s *adminServer) Events(ctx context.Context, req *EventsRequest) (*EventsRe
 	if len(q.Errors()) > 0 {
 		return nil, s.serverErrors(q.Errors())
 	}
-	r := s.server.sqlExecutor.ExecuteStatements(ctx, session, q.String(), q.Params())
+	r := s.server.sqlExecutor.ExecuteStatements(session, q.String(), q.QueryArguments())
 	if err := s.checkQueryResults(r.ResultList, 1); err != nil {
 		return nil, s.serverError(err)
 	}
 
 	// Marshal response.
-	var resp EventsResponse
+	var resp serverpb.EventsResponse
 	scanner := makeResultScanner(r.ResultList[0].Columns)
 	for _, row := range r.ResultList[0].Rows {
-		var event EventsResponse_Event
+		var event serverpb.EventsResponse_Event
 		var ts time.Time
 		if err := scanner.ScanIndex(row, 0, &ts); err != nil {
 			return nil, err
 		}
-		event.Timestamp = EventsResponse_Event_Timestamp{Sec: ts.Unix(), Nsec: uint32(ts.Nanosecond())}
+		event.Timestamp = serverpb.EventsResponse_Event_Timestamp{Sec: ts.Unix(), Nsec: uint32(ts.Nanosecond())}
 		if err := scanner.ScanIndex(row, 1, &event.EventType); err != nil {
 			return nil, err
 		}
@@ -586,13 +641,13 @@ func (s *adminServer) Events(ctx context.Context, req *EventsRequest) (*EventsRe
 
 // getUIData returns the values and timestamps for the given UI keys. Keys
 // that are not found will not be returned.
-func (s *adminServer) getUIData(session *sql.Session, user string, keys []string) (*GetUIDataResponse, error) {
+func (s *adminServer) getUIData(session *sql.Session, user string, keys []string) (*serverpb.GetUIDataResponse, error) {
 	if len(keys) == 0 {
-		return &GetUIDataResponse{}, nil
+		return &serverpb.GetUIDataResponse{}, nil
 	}
 
 	// Query database.
-	var query sqlQuery
+	query := makeSQLQuery()
 	query.Append("SELECT key, value, lastUpdated FROM system.ui WHERE key IN (")
 	for i, key := range keys {
 		if i != 0 {
@@ -604,14 +659,13 @@ func (s *adminServer) getUIData(session *sql.Session, user string, keys []string
 	if err := query.Errors(); err != nil {
 		return nil, s.serverErrorf("error constructing query: %v", err)
 	}
-	r := s.server.sqlExecutor.ExecuteStatements(context.Background(),
-		session, query.String(), query.Params())
+	r := s.server.sqlExecutor.ExecuteStatements(session, query.String(), query.QueryArguments())
 	if err := s.checkQueryResults(r.ResultList, 1); err != nil {
 		return nil, s.serverError(err)
 	}
 
 	// Marshal results.
-	resp := GetUIDataResponse{KeyValues: make(map[string]GetUIDataResponse_Value)}
+	resp := serverpb.GetUIDataResponse{KeyValues: make(map[string]serverpb.GetUIDataResponse_Value)}
 	for _, row := range r.ResultList[0].Rows {
 		dKey, ok := row.Values[0].(*parser.DString)
 		if !ok {
@@ -626,9 +680,9 @@ func (s *adminServer) getUIData(session *sql.Session, user string, keys []string
 			return nil, s.serverErrorf("unexpected type for UI lastUpdated: %T", row.Values[2])
 		}
 
-		resp.KeyValues[string(*dKey)] = GetUIDataResponse_Value{
+		resp.KeyValues[string(*dKey)] = serverpb.GetUIDataResponse_Value{
 			Value:       []byte(*dValue),
-			LastUpdated: GetUIDataResponse_Timestamp{Sec: dLastUpdated.Unix(), Nsec: uint32(dLastUpdated.Nanosecond())},
+			LastUpdated: serverpb.GetUIDataResponse_Timestamp{Sec: dLastUpdated.Unix(), Nsec: uint32(dLastUpdated.Nanosecond())},
 		}
 	}
 	return &resp, nil
@@ -636,17 +690,18 @@ func (s *adminServer) getUIData(session *sql.Session, user string, keys []string
 
 // SetUIData is an endpoint that stores the given key/value pairs in the
 // system.ui table. See GetUIData for more details on semantics.
-func (s *adminServer) SetUIData(ctx context.Context, req *SetUIDataRequest) (*SetUIDataResponse, error) {
+func (s *adminServer) SetUIData(ctx context.Context, req *serverpb.SetUIDataRequest) (*serverpb.SetUIDataResponse, error) {
 	if len(req.KeyValues) == 0 {
 		return nil, grpc.Errorf(codes.InvalidArgument, "KeyValues cannot be empty")
 	}
 
-	session := sql.NewSession(sql.SessionArgs{User: s.getUser(req)}, s.server.sqlExecutor, nil)
+	args := sql.SessionArgs{User: s.getUser(req)}
+	session := sql.NewSession(ctx, args, s.server.sqlExecutor, nil)
 
 	for key, val := range req.KeyValues {
 		// Do an upsert of the key. We update each key in a separate transaction to
 		// avoid long-running transactions and possible deadlocks.
-		br := s.server.sqlExecutor.ExecuteStatements(ctx, session, "BEGIN;", nil)
+		br := s.server.sqlExecutor.ExecuteStatements(session, "BEGIN;", nil)
 		if err := s.checkQueryResults(br.ResultList, 1); err != nil {
 			return nil, s.serverError(err)
 		}
@@ -661,11 +716,10 @@ func (s *adminServer) SetUIData(ctx context.Context, req *SetUIDataRequest) (*Se
 		// INSERT or UPDATE as appropriate.
 		if alreadyExists {
 			query := "UPDATE system.ui SET value = $1, lastUpdated = NOW() WHERE key = $2; COMMIT;"
-			params := []parser.Datum{
-				parser.NewDString(string(val)), // $1
-				parser.NewDString(key),         // $2
-			}
-			r := s.server.sqlExecutor.ExecuteStatements(ctx, session, query, params)
+			qargs := parser.NewPlaceholderInfo()
+			qargs.SetValue(`1`, parser.NewDString(string(val)))
+			qargs.SetValue(`2`, parser.NewDString(key))
+			r := s.server.sqlExecutor.ExecuteStatements(session, query, qargs)
 			if err := s.checkQueryResults(r.ResultList, 2); err != nil {
 				return nil, s.serverError(err)
 			}
@@ -674,11 +728,10 @@ func (s *adminServer) SetUIData(ctx context.Context, req *SetUIDataRequest) (*Se
 			}
 		} else {
 			query := "INSERT INTO system.ui (key, value, lastUpdated) VALUES ($1, $2, NOW()); COMMIT;"
-			params := []parser.Datum{
-				parser.NewDString(key),               // $1
-				parser.NewDBytes(parser.DBytes(val)), // $2
-			}
-			r := s.server.sqlExecutor.ExecuteStatements(ctx, session, query, params)
+			qargs := parser.NewPlaceholderInfo()
+			qargs.SetValue(`1`, parser.NewDString(key))
+			qargs.SetValue(`2`, parser.NewDBytes(parser.DBytes(val)))
+			r := s.server.sqlExecutor.ExecuteStatements(session, query, qargs)
 			if err := s.checkQueryResults(r.ResultList, 2); err != nil {
 				return nil, s.serverError(err)
 			}
@@ -688,7 +741,7 @@ func (s *adminServer) SetUIData(ctx context.Context, req *SetUIDataRequest) (*Se
 		}
 	}
 
-	return &SetUIDataResponse{}, nil
+	return &serverpb.SetUIDataResponse{}, nil
 }
 
 // GetUIData returns data associated with the given keys, which was stored
@@ -697,8 +750,9 @@ func (s *adminServer) SetUIData(ctx context.Context, req *SetUIDataRequest) (*Se
 // The stored values are meant to be opaque to the server. In the rare case that
 // the server code needs to call this method, it should only read from keys that
 // have the prefix `serverUIDataKeyPrefix`.
-func (s *adminServer) GetUIData(_ context.Context, req *GetUIDataRequest) (*GetUIDataResponse, error) {
-	session := sql.NewSession(sql.SessionArgs{User: s.getUser(req)}, s.server.sqlExecutor, nil)
+func (s *adminServer) GetUIData(ctx context.Context, req *serverpb.GetUIDataRequest) (*serverpb.GetUIDataResponse, error) {
+	args := sql.SessionArgs{User: s.getUser(req)}
+	session := sql.NewSession(ctx, args, s.server.sqlExecutor, nil)
 
 	if len(req.Keys) == 0 {
 		return nil, grpc.Errorf(codes.InvalidArgument, "keys cannot be empty")
@@ -713,64 +767,76 @@ func (s *adminServer) GetUIData(_ context.Context, req *GetUIDataRequest) (*GetU
 }
 
 // Cluster returns cluster metadata.
-func (s *adminServer) Cluster(_ context.Context, req *ClusterRequest) (*ClusterResponse, error) {
+func (s *adminServer) Cluster(_ context.Context, req *serverpb.ClusterRequest) (*serverpb.ClusterResponse, error) {
 	clusterID := s.server.node.ClusterID
 	if uuid.Equal(clusterID, *uuid.EmptyUUID) {
 		return nil, grpc.Errorf(codes.Unavailable, "cluster ID not yet available")
 	}
-	return &ClusterResponse{ClusterID: clusterID.String()}, nil
+	return &serverpb.ClusterResponse{ClusterID: clusterID.String()}, nil
 }
 
-func (s *adminServer) Health(ctx context.Context, req *HealthRequest) (*HealthResponse, error) {
-	return &HealthResponse{}, nil
+func (s *adminServer) Health(ctx context.Context, req *serverpb.HealthRequest) (*serverpb.HealthResponse, error) {
+	return &serverpb.HealthResponse{}, nil
 }
 
-func (s *adminServer) Drain(ctx context.Context, req *DrainRequest) (*DrainResponse, error) {
-	on := make([]DrainMode, len(req.On))
+func (s *adminServer) Drain(req *serverpb.DrainRequest, stream serverpb.Admin_DrainServer) error {
+	on := make([]serverpb.DrainMode, len(req.On))
 	for i := range req.On {
-		on[i] = DrainMode(req.On[i])
+		on[i] = serverpb.DrainMode(req.On[i])
 	}
-	off := make([]DrainMode, len(req.Off))
+	off := make([]serverpb.DrainMode, len(req.Off))
 	for i := range req.Off {
-		off[i] = DrainMode(req.Off[i])
+		off[i] = serverpb.DrainMode(req.Off[i])
 	}
 
 	_ = s.server.Undrain(off)
 
 	nowOn, err := s.server.Drain(on)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	nowOnInts := make([]int32, len(nowOn))
+	res := serverpb.DrainResponse{
+		On: make([]int32, len(nowOn)),
+	}
 	for i := range nowOn {
-		nowOnInts[i] = int32(nowOn[i])
+		res.On[i] = int32(nowOn[i])
 	}
+	if err := stream.Send(&res); err != nil {
+		return err
+	}
+
 	if req.Shutdown {
-		s.server.stopper.Quiesce()
-		go func() {
-			time.Sleep(50 * time.Millisecond)
-			s.server.stopper.Stop()
-		}()
+		s.server.grpc.Stop()
+		go s.server.stopper.Stop()
 	}
-	return &DrainResponse{On: nowOnInts}, nil
+
+	ctx := stream.Context()
+
+	select {
+	case <-s.server.stopper.IsStopped():
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // waitForStoreFrozen polls the given stores until they all report having no
 // unfrozen Replicas (or an error or timeout occurs).
 func (s *adminServer) waitForStoreFrozen(
+	stream serverpb.Admin_ClusterFreezeServer,
 	stores map[roachpb.StoreID]roachpb.NodeID,
 	wantFrozen bool,
 ) error {
 	mu := struct {
-		sync.Mutex
+		syncutil.Mutex
 		oks map[roachpb.StoreID]bool
 	}{
 		oks: make(map[roachpb.StoreID]bool),
 	}
 
 	opts := base.DefaultRetryOptions()
-	opts.Closer = s.server.stopper.ShouldDrain()
+	opts.Closer = s.server.stopper.ShouldQuiesce()
 	opts.MaxRetries = 20
 	sem := make(chan struct{}, 256)
 	errChan := make(chan error, 1)
@@ -780,6 +846,7 @@ func (s *adminServer) waitForStoreFrozen(
 		default:
 		}
 	}
+
 	numWaiting := len(stores) // loop until this drops to zero
 	var err error
 	for r := retry.Start(opts); r.Next(); {
@@ -800,47 +867,64 @@ func (s *adminServer) waitForStoreFrozen(
 			action := func() (err error) {
 				var resp *roachpb.PollFrozenResponse
 				defer func() {
+					message := fmt.Sprintf("node %d, store %d: ", nodeID, storeID)
+
 					if err != nil {
-						return
-					}
-					mu.Lock()
-					ok := (wantFrozen && resp.NumThawed == 0) ||
-						(!wantFrozen && resp.NumFrozen == 0)
-					if ok {
-						// If the Store is in the right state, mark it as such.
-						// This means we won't try it again.
-						mu.oks[storeID] = true
+						message += err.Error()
 					} else {
-						// Otherwise, forget that we tried the Store so that
-						// the retry loop picks it up again.
-						delete(mu.oks, storeID)
+						numMismatching := len(resp.Results)
+						mu.Lock()
+						if numMismatching == 0 {
+							// If the Store is in the right state, mark it as such.
+							// This means we won't try it again.
+							message += "ready"
+							mu.oks[storeID] = true
+						} else {
+							// Otherwise, forget that we tried the Store so that
+							// the retry loop picks it up again.
+							message += fmt.Sprintf("%d replicas report wrong status", numMismatching)
+							if limit := 10; numMismatching > limit {
+								message += " [truncated]: "
+								resp.Results = resp.Results[:limit]
+							} else {
+								message += ": "
+							}
+							message += fmt.Sprintf("%+v", resp.Results)
+							delete(mu.oks, storeID)
+						}
+						mu.Unlock()
+						err = stream.Send(&serverpb.ClusterFreezeResponse{
+							Message: message,
+						})
 					}
-					mu.Unlock()
 				}()
 				conn, err := s.server.rpcContext.GRPCDial(addr)
 				if err != nil {
 					return err
 				}
-				client := roachpb.NewInternalClient(conn)
+				client := roachpb.NewInternalStoresClient(conn)
 				resp, err = client.PollFrozen(context.Background(),
 					&roachpb.PollFrozenRequest{
 						StoreRequestHeader: roachpb.StoreRequestHeader{
 							NodeID:  nodeID,
 							StoreID: storeID,
 						},
+						// If we are looking to freeze everything, we want to
+						// collect thawed Replicas, and vice versa.
+						CollectFrozen: !wantFrozen,
 					})
 				return err
 			}
 			// Run a limited, non-blocking task. That means the task simply
 			// won't run if the semaphore is full (or the node is draining).
 			// Both are handled by the surrounding retry loop.
-			if !s.server.stopper.RunLimitedAsyncTask(sem, func() {
+			if err := s.server.stopper.RunLimitedAsyncTask(sem, func() {
 				if err := action(); err != nil {
 					sendErr(err)
 				}
-			}) {
+			}); err != nil {
 				// Node draining.
-				sendErr(errors.New("node is shutting down"))
+				sendErr(err)
 				break
 			}
 		}
@@ -864,6 +948,12 @@ func (s *adminServer) waitForStoreFrozen(
 		if err != nil || numWaiting == 0 {
 			break
 		}
+		if err := stream.Send(&serverpb.ClusterFreezeResponse{
+			Message: fmt.Sprintf("waiting for %d store%s to apply operation",
+				numWaiting, util.Pluralize(int64(numWaiting))),
+		}); err != nil {
+			return err
+		}
 	}
 	if err != nil {
 		return err
@@ -876,9 +966,10 @@ func (s *adminServer) waitForStoreFrozen(
 }
 
 func (s *adminServer) ClusterFreeze(
-	ctx context.Context, req *ClusterFreezeRequest,
-) (*ClusterFreezeResponse, error) {
-	var resp ClusterFreezeResponse
+	req *serverpb.ClusterFreezeRequest,
+	stream serverpb.Admin_ClusterFreezeServer,
+) error {
+	var totalAffected int64
 	stores := make(map[roachpb.StoreID]roachpb.NodeID)
 	process := func(from, to roachpb.Key) (roachpb.Key, error) {
 		b := &client.Batch{}
@@ -888,14 +979,16 @@ func (s *adminServer) ClusterFreeze(
 			return nil, err
 		}
 		fr := b.RawResponse().Responses[0].GetInner().(*roachpb.ChangeFrozenResponse)
-		resp.RangesAffected += fr.RangesAffected
+		totalAffected += fr.RangesAffected
 		for storeID, nodeID := range fr.Stores {
 			stores[storeID] = nodeID
 		}
 		return fr.MinStartKey.AsRawKey(), nil
 	}
 
+	task := "thaw"
 	if req.Freeze {
+		task = "freeze"
 		// When freezing, we save the meta2 and meta1 range for last to avoid
 		// interfering with command routing.
 		// Note that we freeze only Ranges whose StartKey is included. In
@@ -913,7 +1006,7 @@ func (s *adminServer) ClusterFreeze(
 		for _, freezeFrom := range freezeFroms {
 			var err error
 			if freezeTo, err = process(freezeFrom, freezeTo); err != nil {
-				return nil, err
+				return err
 			}
 		}
 	} else {
@@ -926,20 +1019,32 @@ func (s *adminServer) ClusterFreeze(
 		// descriptor unconditionally or we won't always be able to unfreeze
 		// (except by restarting a node which holds the first range).
 		if _, err := process(keys.LocalMax, roachpb.KeyMax); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return &resp, s.waitForStoreFrozen(stores, req.Freeze)
+	if err := stream.Send(&serverpb.ClusterFreezeResponse{
+		RangesAffected: totalAffected,
+		Message:        fmt.Sprintf("proposed %s to %d ranges", task, totalAffected),
+	}); err != nil {
+		return err
+	}
+	return s.waitForStoreFrozen(stream, stores, req.Freeze)
 }
 
 // sqlQuery allows you to incrementally build a SQL query that uses
 // placeholders. Instead of specific placeholders like $1, you instead use the
 // temporary placeholder $.
 type sqlQuery struct {
-	buf    bytes.Buffer
-	pidx   int
-	params []parser.Datum
-	errs   []error
+	buf   bytes.Buffer
+	pidx  int
+	qargs parser.PlaceholderInfo
+	errs  []error
+}
+
+func makeSQLQuery() *sqlQuery {
+	res := &sqlQuery{}
+	res.qargs.Clear()
+	return res
 }
 
 // String returns the full query.
@@ -956,10 +1061,10 @@ func (q *sqlQuery) Errors() []error {
 	return q.errs
 }
 
-// Params returns a slice containing all parameters that have been passed into
-// this query through Append.
-func (q *sqlQuery) Params() []parser.Datum {
-	return q.params
+// QueryArguments returns a filled map of placeholders containing all arguments
+// provided to this query through Append.
+func (q *sqlQuery) QueryArguments() *parser.PlaceholderInfo {
+	return &q.qargs
 }
 
 // Append appends the provided string and any number of query parameters.
@@ -981,20 +1086,23 @@ func (q *sqlQuery) Params() []parser.Datum {
 // query construction code exceedingly tedious.
 func (q *sqlQuery) Append(s string, params ...parser.Datum) {
 	var placeholders int
+	firstpidx := q.pidx
 	for _, r := range s {
 		q.buf.WriteRune(r)
 		if r == '$' {
 			q.pidx++
 			placeholders++
-			q.buf.WriteString(strconv.FormatInt(int64(q.pidx), 10)) // SQL placeholders are 1-based
+			q.buf.WriteString(strconv.Itoa(q.pidx)) // SQL placeholders are 1-based
 		}
 	}
 
 	if placeholders != len(params) {
 		q.errs = append(q.errs,
-			util.Errorf("# of placeholders %d != # of params %d", placeholders, len(params)))
+			errors.Errorf("# of placeholders %d != # of params %d", placeholders, len(params)))
 	}
-	q.params = append(q.params, params...)
+	for i, param := range params {
+		q.qargs.SetValue(fmt.Sprint(firstpidx+i+1), param)
+	}
 }
 
 // resultScanner scans columns from sql.ResultRow instances into variables,
@@ -1018,7 +1126,7 @@ func makeResultScanner(cols []sql.ResultColumn) resultScanner {
 func (rs resultScanner) IsNull(row sql.ResultRow, col string) (bool, error) {
 	idx, ok := rs.colNameToIdx[col]
 	if !ok {
-		return false, util.Errorf("result is missing column %s", col)
+		return false, errors.Errorf("result is missing column %s", col)
 	}
 	return row.Values[idx] == parser.DNull, nil
 }
@@ -1030,57 +1138,57 @@ func (rs resultScanner) ScanIndex(row sql.ResultRow, index int, dst interface{})
 	switch d := dst.(type) {
 	case *string:
 		if dst == nil {
-			return util.ErrorfSkipFrames(1, "nil destination pointer passed in")
+			return errors.Errorf("nil destination pointer passed in")
 		}
 		s, ok := src.(*parser.DString)
 		if !ok {
-			return util.ErrorfSkipFrames(1, "source type assertion failed")
+			return errors.Errorf("source type assertion failed")
 		}
 		*d = string(*s)
 
 	case *bool:
 		if dst == nil {
-			return util.ErrorfSkipFrames(1, "nil destination pointer passed in")
+			return errors.Errorf("nil destination pointer passed in")
 		}
 		s, ok := src.(*parser.DBool)
 		if !ok {
-			return util.ErrorfSkipFrames(1, "source type assertion failed")
+			return errors.Errorf("source type assertion failed")
 		}
 		*d = bool(*s)
 
 	case *int64:
 		if dst == nil {
-			return util.ErrorfSkipFrames(1, "nil destination pointer passed in")
+			return errors.Errorf("nil destination pointer passed in")
 		}
 		s, ok := src.(*parser.DInt)
 		if !ok {
-			return util.ErrorfSkipFrames(1, "source type assertion failed")
+			return errors.Errorf("source type assertion failed")
 		}
 		*d = int64(*s)
 
 	case *time.Time:
 		if dst == nil {
-			return util.ErrorfSkipFrames(1, "nil destination pointer passed in")
+			return errors.Errorf("nil destination pointer passed in")
 		}
 		s, ok := src.(*parser.DTimestamp)
 		if !ok {
-			return util.ErrorfSkipFrames(1, "source type assertion failed")
+			return errors.Errorf("source type assertion failed")
 		}
-		*d = time.Time(s.Time)
+		*d = s.Time
 
 	case *[]byte:
 		if dst == nil {
-			return util.ErrorfSkipFrames(1, "nil destination pointer passed in")
+			return errors.Errorf("nil destination pointer passed in")
 		}
 		s, ok := src.(*parser.DBytes)
 		if !ok {
-			return util.ErrorfSkipFrames(1, "source type assertion failed")
+			return errors.Errorf("source type assertion failed")
 		}
 		// Yes, this copies, but this probably isn't in the critical path.
 		*d = []byte(*s)
 
 	default:
-		return util.ErrorfSkipFrames(1, "unimplemented type for scanCol: %T", dst)
+		return errors.Errorf("unimplemented type for scanCol: %T", dst)
 	}
 
 	return nil
@@ -1090,7 +1198,111 @@ func (rs resultScanner) ScanIndex(row sql.ResultRow, index int, dst interface{})
 func (rs resultScanner) Scan(row sql.ResultRow, colName string, dst interface{}) error {
 	idx, ok := rs.colNameToIdx[colName]
 	if !ok {
-		return util.Errorf("result is missing column %s", colName)
+		return errors.Errorf("result is missing column %s", colName)
 	}
 	return rs.ScanIndex(row, idx, dst)
+}
+
+// TODO(mrtracy): The following methods, used to look up the zone configuration
+// for a database or table, use the same algorithm as a set of methods in
+// cli/zone.go for the same purpose. However, as that code connects to the
+// server with a SQL connections, while this code uses a sql.Executor directly,
+// the code cannot be commonized.
+//
+// Github issue #4869 is the most likely candidate for addressing this
+// incompatibility; when that issue has been resolved, this code from
+// cli/zone.go should be moved to a common location and shared with this system.
+
+// queryZone retrieves the specific ZoneConfig associated with the supplied ID,
+// if it exists.
+func (s *adminServer) queryZone(
+	session *sql.Session, id sqlbase.ID,
+) (config.ZoneConfig, bool, error) {
+	const query = `SELECT config FROM system.zones WHERE id = $1`
+	params := parser.NewPlaceholderInfo()
+	params.SetValue(`1`, parser.NewDInt(parser.DInt(id)))
+	r := s.server.sqlExecutor.ExecuteStatements(session, query, params)
+	if err := s.checkQueryResults(r.ResultList, 1); err != nil {
+		return config.ZoneConfig{}, false, err
+	}
+
+	result := r.ResultList[0]
+	if len(result.Rows) == 0 {
+		return config.ZoneConfig{}, false, nil
+	}
+
+	var zoneBytes []byte
+	scanner := resultScanner{}
+	err := scanner.ScanIndex(result.Rows[0], 0, &zoneBytes)
+	if err != nil {
+		return config.ZoneConfig{}, false, err
+	}
+
+	var zone config.ZoneConfig
+	if err := zone.Unmarshal(zoneBytes); err != nil {
+		return config.ZoneConfig{}, false, err
+	}
+	return zone, true, nil
+}
+
+// queryZonePath queries a path of sql object IDs, as generated by
+// queryDescriptorIDPath(), for a ZoneConfig. It returns the most specific
+// ZoneConfig specified for the object IDs in the path.
+func (s *adminServer) queryZonePath(
+	session *sql.Session, path []sqlbase.ID,
+) (sqlbase.ID, config.ZoneConfig, bool, error) {
+	for i := len(path) - 1; i >= 0; i-- {
+		zone, zoneExists, err := s.queryZone(session, path[i])
+		if err != nil || zoneExists {
+			return path[i], zone, true, err
+		}
+	}
+	return 0, config.ZoneConfig{}, false, nil
+}
+
+// queryNamespaceID queries for the ID of the namespace with the given name and
+// parent ID.
+func (s *adminServer) queryNamespaceID(
+	session *sql.Session, parentID sqlbase.ID, name string,
+) (sqlbase.ID, error) {
+	const query = `SELECT id FROM system.namespace WHERE parentID = $1 AND name = $2`
+	params := parser.NewPlaceholderInfo()
+	params.SetValue(`1`, parser.NewDInt(parser.DInt(parentID)))
+	params.SetValue(`2`, parser.NewDString(name))
+	r := s.server.sqlExecutor.ExecuteStatements(session, query, params)
+	if err := s.checkQueryResults(r.ResultList, 1); err != nil {
+		return 0, err
+	}
+
+	result := r.ResultList[0]
+	if len(result.Rows) == 0 {
+		return 0, errors.Errorf("namespace %s with ParentID %d not found", name, parentID)
+	}
+
+	var id int64
+	scanner := resultScanner{}
+	err := scanner.ScanIndex(result.Rows[0], 0, &id)
+	if err != nil {
+		return 0, err
+	}
+
+	return sqlbase.ID(id), nil
+}
+
+// queryDescriptorIDPath converts a path of namespaces into a path of namespace
+// IDs. For example, if this function is called with a database/table name pair,
+// it will return a list of IDs consisting of the root namespace ID, the
+// databases ID, and the table ID (in that order).
+func (s *adminServer) queryDescriptorIDPath(
+	session *sql.Session, names []string,
+) ([]sqlbase.ID, error) {
+	path := []sqlbase.ID{keys.RootNamespaceID}
+	for _, name := range names {
+		id, err := s.queryNamespaceID(session, path[len(path)-1], name)
+		if err != nil {
+			return nil, err
+		}
+		path = append(path, id)
+	}
+	return path, nil
 }

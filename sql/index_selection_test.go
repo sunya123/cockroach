@@ -472,11 +472,11 @@ func TestMakeSpans(t *testing.T) {
 		// When encoding an end constraint for a maximal datum, we use
 		// bytes.PrefixEnd() to go beyond the normal encodings of that datatype.
 		{fmt.Sprintf(`a = %d`, math.MaxInt64), `a`,
-			`/9223372036854775807-/<util/encoding/encoding.go: ` +
-				`varint 9223372036854775808 overflows int64>`, `/9223372036854775807-/9223372036854775806`},
+			`/9223372036854775807-/<varint 9223372036854775808 overflows int64>`,
+			`/9223372036854775807-/9223372036854775806`},
 		{fmt.Sprintf(`a = %d`, math.MinInt64), `a`,
 			`/-9223372036854775808-/-9223372036854775807`,
-			`/-9223372036854775808-/<util/encoding/encoding.go: varint 9223372036854775808 overflows int64>`},
+			`/-9223372036854775808-/<varint 9223372036854775808 overflows int64>`},
 
 		{`(a, b) >= (1, 4)`, `a,b`, `/1/4-`, `-/1/3`},
 		{`(a, b) > (1, 4)`, `a,b`, `/1/5-`, `-/1/4`},
@@ -494,7 +494,7 @@ func TestMakeSpans(t *testing.T) {
 			}
 			desc, index := makeTestIndex(t, columns, dirs)
 			constraints, _ := makeConstraints(t, d.expr, desc, index)
-			spans := makeSpans(constraints, desc.ID, index)
+			spans := makeSpans(constraints, desc, index)
 			s := sqlbase.PrettySpans(spans, 2)
 			var expected string
 			if dir == encoding.Ascending {
@@ -536,7 +536,7 @@ func TestMakeSpans(t *testing.T) {
 	for _, d := range testData2 {
 		desc, index := makeTestIndexFromStr(t, d.columns)
 		constraints, _ := makeConstraints(t, d.expr, desc, index)
-		spans := makeSpans(constraints, desc.ID, index)
+		spans := makeSpans(constraints, desc, index)
 		var got string
 		raw := false
 		if strings.HasPrefix(d.expected, "raw:") {
@@ -544,7 +544,7 @@ func TestMakeSpans(t *testing.T) {
 			span := spans[0]
 			d.expected = d.expected[4:]
 			// Trim the index prefix from the span.
-			prefix := string(sqlbase.MakeIndexKeyPrefix(desc.ID, index.ID))
+			prefix := string(sqlbase.MakeIndexKeyPrefix(desc, index.ID))
 			got = strings.TrimPrefix(string(span.Start), prefix) + "-" +
 				strings.TrimPrefix(string(span.End), prefix)
 		} else {

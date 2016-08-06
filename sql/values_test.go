@@ -27,9 +27,9 @@ import (
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/timeutil"
+	"github.com/pkg/errors"
 )
 
 func TestValues(t *testing.T) {
@@ -110,7 +110,7 @@ func TestValues(t *testing.T) {
 		plan, err := func() (_ planNode, err error) {
 			defer func() {
 				if r := recover(); r != nil {
-					err = util.Errorf("%v", r)
+					err = errors.Errorf("%v", r)
 				}
 			}()
 			return p.ValuesClause(tc.stmt, nil)
@@ -128,8 +128,13 @@ func TestValues(t *testing.T) {
 				continue
 			}
 			var rows []parser.DTuple
-			for plan.Next() {
+			next, err := plan.Next()
+			for ; next; next, err = plan.Next() {
 				rows = append(rows, plan.Values())
+			}
+			if err != nil {
+				t.Error(err)
+				continue
 			}
 			if !reflect.DeepEqual(rows, tc.rows) {
 				t.Errorf("%d: expected rows:\n%+v\nactual rows:\n%+v", i, tc.rows, rows)
@@ -142,7 +147,7 @@ type floatAlias float32
 type boolAlias bool
 type stringAlias string
 
-func TestGolangParams(t *testing.T) {
+func TestGolangQueryArgs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	// Each test case pairs an arbitrary value and parser.Datum which has the same
 	// type
@@ -197,9 +202,10 @@ func TestGolangParams(t *testing.T) {
 		{roachpb.RKey("key"), reflect.TypeOf(parser.TypeBytes)},
 	}
 
+	pinfo := &parser.PlaceholderInfo{}
 	for i, tcase := range testCases {
-		params := golangParameters([]interface{}{tcase.value})
-		output, valid := params.Arg("1")
+		golangFillQueryArguments(pinfo, []interface{}{tcase.value})
+		output, valid := pinfo.Type("1")
 		if !valid {
 			t.Errorf("case %d failed: argument was invalid", i)
 			continue

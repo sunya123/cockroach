@@ -30,11 +30,11 @@ import (
 const upsertExcludedTable = "excluded"
 
 type upsertHelper struct {
-	evalCtx            parser.EvalContext
+	p                  *planner
 	qvals              qvalMap
 	evalExprs          []parser.TypedExpr
-	table              *tableInfo
-	excludedAliasTable *tableInfo
+	sourceInfo         *dataSourceInfo
+	excludedSourceInfo *dataSourceInfo
 	allExprsIdentity   bool
 }
 
@@ -47,7 +47,7 @@ func (p *planner) makeUpsertHelper(
 	updateExprs parser.UpdateExprs,
 	upsertConflictIndex *sqlbase.IndexDescriptor,
 ) (*upsertHelper, error) {
-	defaultExprs, err := makeDefaultExprs(updateCols, &p.parser, p.evalCtx)
+	defaultExprs, err := makeDefaultExprs(updateCols, &p.parser, &p.evalCtx)
 	if err != nil {
 		return nil, err
 	}
@@ -88,47 +88,48 @@ func (p *planner) makeUpsertHelper(
 		}
 	}
 
-	table := &tableInfo{alias: tableDesc.Name, columns: makeResultColumns(tableDesc.Columns)}
-	excludedAliasTable := &tableInfo{
-		alias:   upsertExcludedTable,
-		columns: makeResultColumns(insertCols),
-	}
-	tables := []*tableInfo{table, excludedAliasTable}
+	sourceInfo := newSourceInfoForSingleTable(tableDesc.Name, makeResultColumns(tableDesc.Columns))
+	excludedSourceInfo := newSourceInfoForSingleTable(upsertExcludedTable, makeResultColumns(insertCols))
 
-	var normExprs []parser.TypedExpr
+	var evalExprs []parser.TypedExpr
 	qvals := make(qvalMap)
+	sources := multiSourceInfo{sourceInfo, excludedSourceInfo}
 	for _, expr := range untupledExprs {
-		expandedExpr, err := p.expandSubqueries(expr, 1)
+		normExpr, err := p.analyzeExpr(expr, sources, qvals, parser.NoTypePreference, false, "")
 		if err != nil {
 			return nil, err
 		}
-
-		resolvedExpr, err := resolveQNames(expandedExpr, tables, qvals, &p.qnameVisitor)
-		if err != nil {
-			return nil, err
-		}
-
-		typedExpr, err := parser.TypeCheck(resolvedExpr, p.evalCtx.Args, parser.NoTypePreference)
-		if err != nil {
-			return nil, err
-		}
-
-		normExpr, err := p.parser.NormalizeExpr(p.evalCtx, typedExpr)
-		if err != nil {
-			return nil, err
-		}
-		normExprs = append(normExprs, normExpr)
+		evalExprs = append(evalExprs, normExpr)
 	}
 
 	helper := &upsertHelper{
-		evalCtx:            p.evalCtx,
+		p:                  p,
 		qvals:              qvals,
-		evalExprs:          normExprs,
-		table:              table,
-		excludedAliasTable: excludedAliasTable,
+		evalExprs:          evalExprs,
+		sourceInfo:         sourceInfo,
+		excludedSourceInfo: excludedSourceInfo,
 		allExprsIdentity:   allExprsIdentity,
 	}
+
 	return helper, nil
+}
+
+func (uh *upsertHelper) expand() error {
+	for _, evalExpr := range uh.evalExprs {
+		if err := uh.p.expandSubqueryPlans(evalExpr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (uh *upsertHelper) start() error {
+	for _, evalExpr := range uh.evalExprs {
+		if err := uh.p.startSubqueryPlans(evalExpr); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // eval returns the values for the update case of an upsert, given the row
@@ -136,13 +137,13 @@ func (p *planner) makeUpsertHelper(
 func (uh *upsertHelper) eval(
 	insertRow parser.DTuple, existingRow parser.DTuple,
 ) (parser.DTuple, error) {
-	uh.qvals.populateQVals(uh.table, existingRow)
-	uh.qvals.populateQVals(uh.excludedAliasTable, insertRow)
+	uh.qvals.populateQVals(uh.sourceInfo, existingRow)
+	uh.qvals.populateQVals(uh.excludedSourceInfo, insertRow)
 
 	var err error
 	ret := make([]parser.Datum, len(uh.evalExprs))
 	for i, evalExpr := range uh.evalExprs {
-		ret[i], err = evalExpr.Eval(uh.evalCtx)
+		ret[i], err = evalExpr.Eval(&uh.p.evalCtx)
 		if err != nil {
 			return nil, err
 		}

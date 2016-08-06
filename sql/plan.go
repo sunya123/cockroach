@@ -18,8 +18,8 @@ package sql
 
 import (
 	"github.com/cockroachdb/cockroach/sql/parser"
-	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/tracing"
+	"github.com/pkg/errors"
 )
 
 type planMaker interface {
@@ -78,14 +78,26 @@ type planNode interface {
 	// SetLimitHint tells this node to optimize things under the assumption that
 	// we will only need the first `numRows` rows.
 	//
+	// The special value math.MaxInt64 indicates "no limit".
+	//
 	// If soft is true, this is a "soft" limit and is only a hint; the node must
 	// still be able to produce all results if requested.
 	//
 	// If soft is false, this is a "hard" limit and is a promise that Next will
 	// never be called more than numRows times.
 	//
+	// The action of calling this method triggers limit-based query plan
+	// optimizations, e.g. in selectNode.expandPlan(). The primary user
+	// is limitNode.Start() after it has fully evaluated the limit and
+	// offset expressions. EXPLAIN also does this, see
+	// explainTypesNode.expandPlan() and explainPlanNode.expandPlan().
+	//
+	// TODO(radu) Arguably, this interface has room for improvement.  A
+	// limitNode may have a hard limit locally which is larger than the
+	// soft limit propagated up by nodes downstream. We may want to
+	// improve this API to pass both the soft and hard limit.
+	//
 	// Available during/after newPlan().
-	// TODO(knz) This should only be used during expandPlan().
 	SetLimitHint(numRows int64, soft bool)
 
 	// expandPlan finalizes type checking of placeholders and expands
@@ -140,8 +152,9 @@ type planNode interface {
 	// of results each time that Next() returns true.
 	// See executor.go: countRowsAffected() and execStmt() for an example.
 	//
-	// Available after Start().
-	Next() bool
+	// Available after Start(). It is illegal to call Next() after it returns
+	// false.
+	Next() (bool, error)
 
 	// Values returns the values at the current row. The result is only valid
 	// until the next call to Next().
@@ -158,11 +171,6 @@ type planNode interface {
 	// Available after Next() and MarkDebug(explainDebug), see
 	// explain.go.
 	DebugValues() debugValues
-
-	// Err returns the error, if any, encountered during iteration.
-	//
-	// Available after Next().
-	Err() error
 }
 
 // planNodeFastPath is implemented by nodes that can perform all their
@@ -181,6 +189,7 @@ var _ planNode = &limitNode{}
 var _ planNode = &scanNode{}
 var _ planNode = &sortNode{}
 var _ planNode = &valuesNode{}
+var _ planNode = &selectTopNode{}
 var _ planNode = &selectNode{}
 var _ planNode = &unionNode{}
 var _ planNode = &emptyNode{}
@@ -196,6 +205,7 @@ var _ planNode = &dropDatabaseNode{}
 var _ planNode = &dropTableNode{}
 var _ planNode = &dropIndexNode{}
 var _ planNode = &alterTableNode{}
+var _ planNode = &joinNode{}
 
 // makePlan implements the Planner interface.
 func (p *planner) makePlan(stmt parser.Statement, autoCommit bool) (planNode, error) {
@@ -263,7 +273,7 @@ func (p *planner) newPlan(stmt parser.Statement, desiredTypes []parser.Datum, au
 	case *parser.Select:
 		return p.Select(n, desiredTypes, autoCommit)
 	case *parser.SelectClause:
-		return p.SelectClause(n, nil, nil, desiredTypes)
+		return p.SelectClause(n, nil, nil, desiredTypes, publicColumns)
 	case *parser.Set:
 		return p.Set(n)
 	case *parser.SetTimeZone:
@@ -284,6 +294,8 @@ func (p *planner) newPlan(stmt parser.Statement, desiredTypes []parser.Datum, au
 		return p.ShowGrants(n)
 	case *parser.ShowIndex:
 		return p.ShowIndex(n)
+	case *parser.ShowConstraints:
+		return p.ShowConstraints(n)
 	case *parser.ShowTables:
 		return p.ShowTables(n)
 	case *parser.Truncate:
@@ -295,7 +307,7 @@ func (p *planner) newPlan(stmt parser.Statement, desiredTypes []parser.Datum, au
 	case *parser.ValuesClause:
 		return p.ValuesClause(n, desiredTypes)
 	default:
-		return nil, util.Errorf("unknown statement type: %T", stmt)
+		return nil, errors.Errorf("unknown statement type: %T", stmt)
 	}
 }
 
@@ -308,7 +320,7 @@ func (p *planner) prepare(stmt parser.Statement) (planNode, error) {
 	case *parser.Select:
 		return p.Select(n, nil, false)
 	case *parser.SelectClause:
-		return p.SelectClause(n, nil, nil, nil)
+		return p.SelectClause(n, nil, nil, nil, publicColumns)
 	case *parser.Show:
 		return p.Show(n)
 	case *parser.ShowCreateTable:
@@ -321,6 +333,8 @@ func (p *planner) prepare(stmt parser.Statement) (planNode, error) {
 		return p.ShowGrants(n)
 	case *parser.ShowIndex:
 		return p.ShowIndex(n)
+	case *parser.ShowConstraints:
+		return p.ShowConstraints(n)
 	case *parser.ShowTables:
 		return p.ShowTables(n)
 	case *parser.Update:

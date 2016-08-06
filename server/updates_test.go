@@ -22,23 +22,18 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/build"
 	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
-func TestSetupReportingURLs(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	s := new(Server) // don't actually need a testserver here
-
-	if err := s.SetupReportingURLs(); err != nil {
-		t.Fatal(err)
-	}
-	if s.parsedReportingURL == nil {
-		t.Fatal("reporting url should be set")
-	}
-	if s.parsedUpdatesURL == nil {
-		t.Fatal("updates url should be set")
+func stubURL(target **url.URL, stubURL *url.URL) func() {
+	realURL := *target
+	*target = stubURL
+	return func() {
+		*target = realURL
 	}
 }
 
@@ -55,18 +50,22 @@ func TestCheckVersion(t *testing.T) {
 		uuid = r.URL.Query().Get("uuid")
 		version = r.URL.Query().Get("version")
 	}))
+	u, err := url.Parse(recorder.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stubURL(&updatesURL, u)()
 
-	s := StartTestServer(t)
-	s.parsedUpdatesURL, _ = url.Parse(recorder.URL)
-	s.checkForUpdates()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s.(*TestServer).checkForUpdates()
 	recorder.Close()
-	s.Stop()
+	s.Stopper().Stop()
 
 	if expected, actual := int32(1), atomic.LoadInt32(&updateChecks); actual != expected {
 		t.Fatalf("expected %v update checks, got %v", expected, actual)
 	}
 
-	if expected, actual := s.node.ClusterID.String(), uuid; expected != actual {
+	if expected, actual := s.(*TestServer).node.ClusterID.String(), uuid; expected != actual {
 		t.Errorf("expected uuid %v, got %v", expected, actual)
 	}
 
@@ -90,23 +89,24 @@ func TestReportUsage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}))
-
-	var s TestServer
-	s.Ctx = NewTestContext()
-	s.StoresPerNode = 2
-	if err := s.Start(); err != nil {
-		t.Fatalf("failed to start test server: %s", err)
+	u, err := url.Parse(recorder.URL)
+	if err != nil {
+		t.Fatal(err)
 	}
-	s.parsedReportingURL, _ = url.Parse(recorder.URL)
+	defer stubURL(&reportingURL, u)()
 
-	if err := s.WaitForInitialSplits(); err != nil {
+	params := base.TestServerArgs{StoresPerNode: 2}
+	s, _, _ := serverutils.StartServer(t, params)
+	ts := s.(*TestServer)
+
+	if err := ts.WaitForInitialSplits(); err != nil {
 		t.Fatal(err)
 	}
 
-	node := s.node.recorder.GetStatusSummary()
-	s.reportUsage()
+	node := ts.node.recorder.GetStatusSummary()
+	ts.reportUsage()
 
-	s.Stop() // stopper will wait for the update/report loop to finish too.
+	ts.Stopper().Stop() // stopper will wait for the update/report loop to finish too.
 	recorder.Close()
 
 	keyCounts := make(map[roachpb.StoreID]int)
@@ -132,10 +132,10 @@ func TestReportUsage(t *testing.T) {
 	if expected, actual := int32(1), atomic.LoadInt32(&usageReports); expected != actual {
 		t.Fatalf("expected %v reports, got %v", expected, actual)
 	}
-	if expected, actual := s.node.ClusterID.String(), uuid; expected != actual {
+	if expected, actual := ts.node.ClusterID.String(), uuid; expected != actual {
 		t.Errorf("expected cluster id %v got %v", expected, actual)
 	}
-	if expected, actual := s.node.Descriptor.NodeID, reported.Node.NodeID; expected != actual {
+	if expected, actual := ts.node.Descriptor.NodeID, reported.Node.NodeID; expected != actual {
 		t.Errorf("expected node id %v got %v", expected, actual)
 	}
 	if minExpected, actual := totalKeys, reported.Node.KeyCount; minExpected > actual {
@@ -144,7 +144,7 @@ func TestReportUsage(t *testing.T) {
 	if minExpected, actual := totalRanges, reported.Node.RangeCount; minExpected > actual {
 		t.Errorf("expected node ranges at least %v got %v", minExpected, actual)
 	}
-	if minExpected, actual := s.StoresPerNode, len(reported.Stores); minExpected > actual {
+	if minExpected, actual := params.StoresPerNode, len(reported.Stores); minExpected > actual {
 		t.Errorf("expected at least %v stores got %v", minExpected, actual)
 	}
 

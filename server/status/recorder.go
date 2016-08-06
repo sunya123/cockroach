@@ -19,17 +19,20 @@ package status
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"strconv"
-	"sync"
+
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/build"
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/cockroachdb/cockroach/storage/engine"
-	"github.com/cockroachdb/cockroach/ts"
-	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/ts/tspb"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/metric"
+	"github.com/cockroachdb/cockroach/util/syncutil"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -63,7 +66,7 @@ var recordHistogramQuantiles = []quantile{
 type storeMetrics interface {
 	StoreID() roachpb.StoreID
 	Descriptor() (*roachpb.StoreDescriptor, error)
-	MVCCStats() engine.MVCCStats
+	MVCCStats() enginepb.MVCCStats
 	Registry() *metric.Registry
 }
 
@@ -81,7 +84,7 @@ type MetricsRecorder struct {
 
 	// Fields below are locked by this mutex.
 	mu struct {
-		sync.Mutex
+		syncutil.Mutex
 		// storeRegistries contains a registry for each store on the node. These
 		// are not stored as subregistries, but rather are treated as wholly
 		// independent.
@@ -154,7 +157,7 @@ func (mr *MetricsRecorder) MarshalJSON() ([]byte, error) {
 		// We haven't yet processed initialization information; return an empty
 		// JSON object.
 		if log.V(1) {
-			log.Warning("MetricsRecorder.MarshalJSON() called before NodeID allocation")
+			log.Warning(context.TODO(), "MetricsRecorder.MarshalJSON() called before NodeID allocation")
 		}
 		return []byte("{}"), nil
 	}
@@ -171,21 +174,44 @@ func (mr *MetricsRecorder) MarshalJSON() ([]byte, error) {
 	return json.Marshal(topLevel)
 }
 
+// PrintAsText writes the current metrics values as plain-text to the writer.
+func (mr *MetricsRecorder) PrintAsText(w io.Writer) error {
+	mr.mu.Lock()
+	defer mr.mu.Unlock()
+	if mr.mu.nodeID == 0 {
+		// We haven't yet processed initialization information; output nothing.
+		if log.V(1) {
+			log.Warning(context.TODO(), "MetricsRecorder.MarshalText() called before NodeID allocation")
+		}
+		return nil
+	}
+
+	if err := mr.nodeRegistry.PrintAsText(w); err != nil {
+		return err
+	}
+	for _, reg := range mr.mu.storeRegistries {
+		if err := reg.PrintAsText(w); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // GetTimeSeriesData serializes registered metrics for consumption by
 // CockroachDB's time series system.
-func (mr *MetricsRecorder) GetTimeSeriesData() []ts.TimeSeriesData {
+func (mr *MetricsRecorder) GetTimeSeriesData() []tspb.TimeSeriesData {
 	mr.mu.Lock()
 	defer mr.mu.Unlock()
 
 	if mr.mu.desc.NodeID == 0 {
 		// We haven't yet processed initialization information; do nothing.
 		if log.V(1) {
-			log.Warning("MetricsRecorder.GetTimeSeriesData() called before NodeID allocation")
+			log.Warning(context.TODO(), "MetricsRecorder.GetTimeSeriesData() called before NodeID allocation")
 		}
 		return nil
 	}
 
-	data := make([]ts.TimeSeriesData, 0, mr.mu.lastDataCount)
+	data := make([]tspb.TimeSeriesData, 0, mr.mu.lastDataCount)
 
 	// Record time series from node-level registries.
 	now := mr.mu.clock.PhysicalNow()
@@ -221,7 +247,7 @@ func (mr *MetricsRecorder) GetStatusSummary() *NodeStatus {
 	if mr.mu.nodeID == 0 {
 		// We haven't yet processed initialization information; do nothing.
 		if log.V(1) {
-			log.Warning("MetricsRecorder.GetStatusSummary called before NodeID allocation.")
+			log.Warning(context.TODO(), "MetricsRecorder.GetStatusSummary called before NodeID allocation.")
 		}
 		return nil
 	}
@@ -252,7 +278,8 @@ func (mr *MetricsRecorder) GetStatusSummary() *NodeStatus {
 		// Gather descriptor from store.
 		descriptor, err := mr.mu.stores[storeID].Descriptor()
 		if err != nil {
-			log.Errorf("Could not record status summaries: Store %d could not return descriptor, error: %s", storeID, err)
+			log.Errorf(context.TODO(), "Could not record status summaries: Store %d could not return descriptor, error: %s", storeID, err)
+			continue
 		}
 
 		nodeStat.StoreStatuses = append(nodeStat.StoreStatuses, StoreStatus{
@@ -292,7 +319,7 @@ func extractValue(mtr interface{}) (float64, error) {
 	case *metric.GaugeFloat64:
 		return mtr.Value(), nil
 	default:
-		return 0, util.Errorf("cannot extract value for type %T", mtr)
+		return 0, errors.Errorf("cannot extract value for type %T", mtr)
 	}
 }
 
@@ -310,7 +337,7 @@ func eachRecordableValue(reg *metric.Registry, fn func(string, float64)) {
 		} else {
 			val, err := extractValue(mtr)
 			if err != nil {
-				log.Warning(err)
+				log.Warning(context.TODO(), err)
 				return
 			}
 			fn(name, val)
@@ -318,12 +345,12 @@ func eachRecordableValue(reg *metric.Registry, fn func(string, float64)) {
 	})
 }
 
-func (rr registryRecorder) record(dest *[]ts.TimeSeriesData) {
+func (rr registryRecorder) record(dest *[]tspb.TimeSeriesData) {
 	eachRecordableValue(rr.registry, func(name string, val float64) {
-		*dest = append(*dest, ts.TimeSeriesData{
+		*dest = append(*dest, tspb.TimeSeriesData{
 			Name:   fmt.Sprintf(rr.format, name),
 			Source: rr.source,
-			Datapoints: []ts.TimeSeriesDatapoint{
+			Datapoints: []tspb.TimeSeriesDatapoint{
 				{
 					TimestampNanos: rr.timestampNanos,
 					Value:          val,

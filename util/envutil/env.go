@@ -25,8 +25,11 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/syncutil"
 )
 
 type envVarInfo struct {
@@ -35,7 +38,10 @@ type envVarInfo struct {
 	value    string
 }
 
-var envVarRegistry map[string]envVarInfo
+var envVarRegistry struct {
+	mu    syncutil.Mutex
+	cache map[string]envVarInfo
+}
 
 func init() {
 	ClearEnvCache()
@@ -56,28 +62,38 @@ func VarName(name string) string {
 func getEnv(name string) (string, bool) {
 	_, consumer, _, _ := runtime.Caller(2)
 	varName := VarName(name)
-	if f, ok := envVarRegistry[varName]; ok {
+
+	envVarRegistry.mu.Lock()
+	defer envVarRegistry.mu.Unlock()
+
+	if f, ok := envVarRegistry.cache[varName]; ok {
 		if f.consumer != consumer {
 			panic("environment variable " + varName + " already used from " + f.consumer)
 		}
 		return f.value, f.present
 	}
 	v, found := os.LookupEnv(varName)
-	envVarRegistry[varName] = envVarInfo{consumer: consumer, present: found, value: v}
+	envVarRegistry.cache[varName] = envVarInfo{consumer: consumer, present: found, value: v}
 	return v, found
 }
 
 // ClearEnvCache clears saved environment values so that
 // a new read access the environment again. (Used for testing)
 func ClearEnvCache() {
-	envVarRegistry = make(map[string]envVarInfo)
+	envVarRegistry.mu.Lock()
+	defer envVarRegistry.mu.Unlock()
+
+	envVarRegistry.cache = make(map[string]envVarInfo)
 }
 
 // GetEnvReport dumps all configuration variables that may have been
 // used and their value.
 func GetEnvReport() string {
+	envVarRegistry.mu.Lock()
+	defer envVarRegistry.mu.Unlock()
+
 	var b bytes.Buffer
-	for k, v := range envVarRegistry {
+	for k, v := range envVarRegistry.cache {
 		if v.present {
 			fmt.Fprintf(&b, "%s = %s # %s\n", k, v.value, v.consumer)
 		} else {
@@ -118,7 +134,7 @@ func EnvOrDefaultBool(name string, value bool) bool {
 	if str, present := getEnv(name); present {
 		v, err := strconv.ParseBool(str)
 		if err != nil {
-			log.Errorf("error parsing %s: %s", VarName(name), err)
+			log.Errorf(context.TODO(), "error parsing %s: %s", VarName(name), err)
 			return value
 		}
 		return v
@@ -132,7 +148,7 @@ func EnvOrDefaultInt(name string, value int) int {
 	if str, present := getEnv(name); present {
 		v, err := strconv.ParseInt(str, 0, 0)
 		if err != nil {
-			log.Errorf("error parsing %s: %s", VarName(name), err)
+			log.Errorf(context.TODO(), "error parsing %s: %s", VarName(name), err)
 			return value
 		}
 		return int(v)
@@ -146,7 +162,7 @@ func EnvOrDefaultInt64(name string, value int64) int64 {
 	if str, present := getEnv(name); present {
 		v, err := strconv.ParseInt(str, 0, 64)
 		if err != nil {
-			log.Errorf("error parsing %s: %s", VarName(name), err)
+			log.Errorf(context.TODO(), "error parsing %s: %s", VarName(name), err)
 			return value
 		}
 		return v
@@ -160,7 +176,7 @@ func EnvOrDefaultBytes(name string, value int64) int64 {
 	if str, present := getEnv(name); present {
 		v, err := humanizeutil.ParseBytes(str)
 		if err != nil {
-			log.Errorf("error parsing %s: %s", VarName(name), err)
+			log.Errorf(context.TODO(), "error parsing %s: %s", VarName(name), err)
 			return value
 		}
 		return v
@@ -174,7 +190,7 @@ func EnvOrDefaultDuration(name string, value time.Duration) time.Duration {
 	if str, present := getEnv(name); present {
 		v, err := time.ParseDuration(str)
 		if err != nil {
-			log.Errorf("error parsing %s: %s", VarName(name), err)
+			log.Errorf(context.TODO(), "error parsing %s: %s", VarName(name), err)
 			return value
 		}
 		return v

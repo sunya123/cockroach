@@ -26,12 +26,18 @@ import (
 	"golang.org/x/net/trace"
 
 	"github.com/cockroachdb/cockroach/base"
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/cockroachdb/cockroach/sql/parser"
+	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/util/envutil"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/retry"
+	"github.com/cockroachdb/cockroach/util/tracing"
+	basictracer "github.com/opentracing/basictracer-go"
+	opentracing "github.com/opentracing/opentracing-go"
 )
+
+var traceSQL = envutil.EnvOrDefaultBool("trace_sql", false)
 
 // Session contains the state of a SQL client connection.
 // Create instances using NewSession().
@@ -43,11 +49,15 @@ type Session struct {
 	// Info about the open transaction (if any).
 	TxnState txnState
 
-	planner planner
+	planner            planner
+	PreparedStatements PreparedStatements
+	PreparedPortals    PreparedPortals
 
 	Location              *time.Location
-	DefaultIsolationLevel roachpb.IsolationType
+	DefaultIsolationLevel enginepb.IsolationType
 	Trace                 trace.Trace
+	context               context.Context
+	cancel                context.CancelFunc
 }
 
 // SessionArgs contains arguments for creating a new Session with NewSession().
@@ -57,36 +67,55 @@ type SessionArgs struct {
 }
 
 // NewSession creates and initializes new Session object.
+// ctx can be nil (in which case the Executor's context will be used).
 // remote can be nil.
-func NewSession(args SessionArgs, e *Executor, remote net.Addr) *Session {
-	s := Session{Location: time.UTC}
-	s.Database = args.Database
-	s.User = args.User
+func NewSession(ctx context.Context, args SessionArgs, e *Executor, remote net.Addr) *Session {
+	s := &Session{
+		Database: args.Database,
+		User:     args.User,
+		Location: time.UTC,
+	}
 	cfg, cache := e.getSystemConfig()
 	s.planner = planner{
-		// evalCtx is set in the Executor, for each Prepare or Execute.
-		evalCtx:       parser.EvalContext{Location: s.Location},
 		leaseMgr:      e.ctx.LeaseManager,
 		systemConfig:  cfg,
 		databaseCache: cache,
-		session:       &s,
+		session:       s,
 		execCtx:       &e.ctx,
 	}
+	s.PreparedStatements = makePreparedStatements(s)
+	s.PreparedPortals = makePreparedPortals(s)
 	remoteStr := ""
 	if remote != nil {
 		remoteStr = remote.String()
 	}
 	s.Trace = trace.New("sql."+args.User, remoteStr)
 	s.Trace.SetMaxEvents(100)
-	return &s
+	s.context, s.cancel = context.WithCancel(ctx)
+	return s
 }
 
 // Finish releases resources held by the Session.
 func (s *Session) Finish() {
+	// Cleanup leases. We might have unreleased leases if we're finishing the
+	// session abruptly in the middle of a transaction, or, until #7648 is
+	// addressed, there might be leases accumulated by preparing statements.
+	s.planner.releaseLeases()
 	if s.Trace != nil {
 		s.Trace.Finish()
 		s.Trace = nil
 	}
+	s.cancel()
+}
+
+// Ctx returns the current context for the session. If there is an active
+// transaction it returns the transaction context, otherwise it returns the
+// session context.
+func (s *Session) Ctx() context.Context {
+	if s.TxnState.txn != nil {
+		return s.TxnState.txn.Context
+	}
+	return s.context
 }
 
 // TxnStateEnum represents the state of a SQL txn.
@@ -117,10 +146,10 @@ type txnState struct {
 	txn   *client.Txn
 	State TxnStateEnum
 
-	// false at first, true since the moment when a transaction is retried.
-	// TODO(andrei): this duplicates the retrying field in client.Txn, but the
-	// state of that one is not reliable because of #5531. Clean this field up
-	// once that bug is settled.
+	// retrying is used to work around the non-idempotence of SAVEPOINT
+	// queries.
+	//
+	// See the comment at the site of its use for more detail.
 	retrying bool
 
 	// If set, the user declared the intention to retry the txn in case of retriable
@@ -142,6 +171,7 @@ type txnState struct {
 	// TODO(andrei): this is the same as Session.Trace. Consider removing this and
 	// passing the Session along everywhere the trace is needed.
 	tr trace.Trace
+	sp opentracing.Span
 
 	// The timestamp to report for current_timestamp(), now() etc.
 	// This must be constant for the lifetime of a SQL transaction.
@@ -152,10 +182,23 @@ type txnState struct {
 func (ts *txnState) reset(ctx context.Context, e *Executor, s *Session) {
 	*ts = txnState{}
 	ts.txn = client.NewTxn(ctx, *e.ctx.DB)
+	ts.txn.Context = s.context
 	ts.txn.Proto.Isolation = s.DefaultIsolationLevel
 	ts.tr = s.Trace
 	// Discard the old schemaChangers, if any.
 	ts.schemaChangers = schemaChangerCollection{}
+
+	if traceSQL {
+		sp, err := tracing.JoinOrNewSnowball("coordinator", nil, func(sp basictracer.RawSpan) {
+			ts.txn.CollectedSpans = append(ts.txn.CollectedSpans, sp)
+		})
+		if err != nil {
+			log.Warningf(ctx, "unable to create snowball tracer: %s", err)
+			return
+		}
+		ts.txn.Context = opentracing.ContextWithSpan(ts.txn.Context, sp)
+		ts.sp = sp
+	}
 }
 
 func (ts *txnState) willBeRetried() bool {
@@ -172,8 +215,20 @@ func (ts *txnState) resetStateAndTxn(state TxnStateEnum) {
 				"(finalized: %t)", state, ts.txn.Proto.Status, ts.txn.IsFinalized()))
 	}
 
+	ts.dumpTrace()
 	ts.State = state
 	ts.txn = nil
+}
+
+func (ts *txnState) dumpTrace() {
+	if traceSQL && ts.txn != nil {
+		ts.sp.Finish()
+		dump := tracing.FormatRawSpans(ts.txn.CollectedSpans)
+		if len(dump) > 0 {
+			log.Infof(context.Background(), "%s\n%s", ts.txn.Proto.ID, dump)
+		}
+	}
+	ts.sp = nil
 }
 
 // updateStateAndCleanupOnErr updates txnState based on the type of error that we
@@ -239,7 +294,8 @@ func (scc *schemaChangerCollection) queueSchemaChanger(
 //    schema changes we're about to execute. Results corresponding to the
 //    schema change statements will be changed in case an error occurs.
 func (scc *schemaChangerCollection) execSchemaChanges(
-	e *Executor, planMaker *planner, results ResultList) {
+	e *Executor, planMaker *planner, results ResultList,
+) {
 	if planMaker.txn != nil {
 		panic("trying to execute schema changes while still in a transaction")
 	}
@@ -255,7 +311,7 @@ func (scc *schemaChangerCollection) execSchemaChanges(
 		sc.db = *e.ctx.DB
 		for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
 			if done, err := sc.IsDone(); err != nil {
-				log.Warning(err)
+				log.Warning(e.ctx.Context, err)
 				break
 			} else if done {
 				break
@@ -279,7 +335,7 @@ func (scc *schemaChangerCollection) execSchemaChanges(
 				if scEntry.epoch == scc.curGroupNum {
 					results[scEntry.idx] = Result{Err: err}
 				}
-				log.Warningf("Error executing schema change: %s", err)
+				log.Warningf(e.ctx.Context, "Error executing schema change: %s", err)
 			}
 			break
 		}

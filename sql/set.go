@@ -17,21 +17,28 @@
 package sql
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"gopkg.in/inf.v0"
 
-	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
 )
 
 // Set sets session variables.
 // Privileges: None.
 //   Notes: postgres/mysql do not require privileges for session variables (some exceptions).
 func (p *planner) Set(n *parser.Set) (planNode, error) {
+	if n.Name == nil {
+		// A client has sent the reserved internal syntax SET ROW ...
+		// Reject it.
+		return nil, errors.New("invalid statement: SET ROW")
+	}
+
 	// By using QualifiedName.String() here any variables that are keywords will
 	// be double quoted.
 	name := strings.ToUpper(n.Name.String())
@@ -51,12 +58,8 @@ func (p *planner) Set(n *parser.Set) (planNode, error) {
 		}
 		if len(dbName) != 0 {
 			// Verify database descriptor exists.
-			dbDesc, err := p.getDatabaseDesc(dbName)
-			if err != nil {
+			if _, err := p.mustGetDatabaseDesc(dbName); err != nil {
 				return nil, err
-			}
-			if dbDesc == nil {
-				return nil, newUndefinedDatabaseError(dbName)
 			}
 		}
 		p.session.Database = dbName
@@ -88,7 +91,7 @@ func (p *planner) getStringVal(name string, values []parser.TypedExpr) (string, 
 	if len(values) != 1 {
 		return "", fmt.Errorf("%s: requires a single string value", name)
 	}
-	val, err := values[0].Eval(p.evalCtx)
+	val, err := values[0].Eval(&p.evalCtx)
 	if err != nil {
 		return "", err
 	}
@@ -103,9 +106,9 @@ func (p *planner) getStringVal(name string, values []parser.TypedExpr) (string, 
 func (p *planner) SetDefaultIsolation(n *parser.SetDefaultIsolation) (planNode, error) {
 	switch n.Isolation {
 	case parser.SerializableIsolation:
-		p.session.DefaultIsolationLevel = roachpb.SERIALIZABLE
+		p.session.DefaultIsolationLevel = enginepb.SERIALIZABLE
 	case parser.SnapshotIsolation:
-		p.session.DefaultIsolationLevel = roachpb.SNAPSHOT
+		p.session.DefaultIsolationLevel = enginepb.SNAPSHOT
 	default:
 		return nil, fmt.Errorf("unsupported default isolation level: %s", n.Isolation)
 	}
@@ -117,7 +120,7 @@ func (p *planner) SetTimeZone(n *parser.SetTimeZone) (planNode, error) {
 	if err != nil {
 		return nil, err
 	}
-	d, err := typedValue.Eval(p.evalCtx)
+	d, err := typedValue.Eval(&p.evalCtx)
 	if err != nil {
 		return nil, err
 	}
@@ -161,6 +164,5 @@ func (p *planner) SetTimeZone(n *parser.SetTimeZone) (planNode, error) {
 	if offset != 0 {
 		p.session.Location = time.FixedZone("", int(offset))
 	}
-	p.evalCtx.Location = p.session.Location
 	return &emptyNode{}, nil
 }

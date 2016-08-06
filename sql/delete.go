@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"fmt"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/privilege"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
@@ -45,19 +47,23 @@ type deleteNode struct {
 //   Notes: postgres requires DELETE. Also requires SELECT for "USING" and "WHERE" with tables.
 //          mysql requires DELETE. Also requires SELECT if a table is used in the "WHERE" clause.
 func (p *planner) Delete(n *parser.Delete, desiredTypes []parser.Datum, autoCommit bool) (planNode, error) {
-	en, err := p.makeEditNode(n.Table, n.Returning, desiredTypes, autoCommit, privilege.DELETE)
+	en, err := p.makeEditNode(n.Table, autoCommit, privilege.DELETE)
 	if err != nil {
 		return nil, err
 	}
 
 	var requestedCols []sqlbase.ColumnDescriptor
-	if len(en.rh.exprs) > 0 {
+	if len(n.Returning) > 0 {
 		// TODO(dan): This could be made tighter, just the rows needed for RETURNING
 		// exprs.
 		requestedCols = en.tableDesc.Columns
 	}
 
-	rd, err := makeRowDeleter(en.tableDesc, requestedCols)
+	fkTables := TablesNeededForFKs(*en.tableDesc, CheckDeletes)
+	if err := p.fillFKTableMap(fkTables); err != nil {
+		return nil, err
+	}
+	rd, err := makeRowDeleter(p.txn, en.tableDesc, fkTables, requestedCols, checkFKs)
 	if err != nil {
 		return nil, err
 	}
@@ -68,16 +74,12 @@ func (p *planner) Delete(n *parser.Delete, desiredTypes []parser.Datum, autoComm
 	// this node's initSelect() method both does type checking and also
 	// performs index selection. We cannot perform index selection
 	// properly until the placeholder values are known.
-	_, err = p.SelectClause(&parser.SelectClause{
+	rows, err := p.SelectClause(&parser.SelectClause{
 		Exprs: sqlbase.ColumnsSelectors(rd.fetchCols),
-		From:  []parser.TableExpr{n.Table},
+		From:  &parser.From{Tables: []parser.TableExpr{n.Table}},
 		Where: n.Where,
-	}, nil, nil, nil)
+	}, nil, nil, nil, publicAndNonPublicColumns)
 	if err != nil {
-		return nil, err
-	}
-
-	if err := en.rh.TypeCheck(); err != nil {
 		return nil, err
 	}
 
@@ -86,43 +88,41 @@ func (p *planner) Delete(n *parser.Delete, desiredTypes []parser.Datum, autoComm
 		editNodeBase: en,
 		tw:           tw,
 	}
+
+	if err := dn.run.initEditNode(&dn.editNodeBase, rows, n.Returning, desiredTypes); err != nil {
+		return nil, err
+	}
+
 	return dn, nil
 }
 
 func (d *deleteNode) expandPlan() error {
-	// TODO(knz): See the comment above in Delete().
-	rows, err := d.p.SelectClause(&parser.SelectClause{
-		Exprs: sqlbase.ColumnsSelectors(d.tw.rd.fetchCols),
-		From:  []parser.TableExpr{d.n.Table},
-		Where: d.n.Where,
-	}, nil, nil, nil)
-	if err != nil {
-		return err
-	}
-
-	if err := rows.expandPlan(); err != nil {
-		return err
-	}
-
-	d.run.buildEditNodePlan(&d.editNodeBase, rows, &d.tw)
-	return nil
+	return d.run.expandEditNodePlan(&d.editNodeBase, &d.tw)
 }
 
 func (d *deleteNode) Start() error {
-	if err := d.run.rows.Start(); err != nil {
+	if err := d.run.startEditNode(); err != nil {
 		return err
 	}
 
-	// Check if we can avoid doing a round-trip to read the values and just
-	// "fast-path" skip to deleting the key ranges without reading them first.
-	// TODO(dt): We could probably be smarter when presented with an index-join,
-	// but this goes away anyway once we push-down more of SQL.
-	sel := d.run.rows.(*selectNode)
-	if scan, ok := sel.table.node.(*scanNode); ok && canDeleteWithoutScan(d.n, scan, &d.tw) {
-		d.run.fastPath = true
-		d.run.err = d.fastDelete()
-		d.run.done = true
-		return d.run.err
+	if d.run.explain != explainDebug {
+		// Check if we can avoid doing a round-trip to read the values and just
+		// "fast-path" skip to deleting the key ranges without reading them first.
+		// TODO(dt): We could probably be smarter when presented with an index-join,
+		// but this goes away anyway once we push-down more of SQL.
+		//
+		// (When explain == explainDebug, we use the slow path so that
+		// each debugVal gets a chance to be reported via Next().)
+		sel := d.run.rows.(*selectTopNode).source.(*selectNode)
+		if scan, ok := sel.source.plan.(*scanNode); ok && canDeleteWithoutScan(d.n, scan, &d.tw) {
+			d.run.fastPath = true
+			err := d.fastDelete(scan)
+			return err
+		}
+	}
+
+	if err := d.rh.startPlans(); err != nil {
+		return err
 	}
 
 	return d.run.tw.init(d.p.txn)
@@ -135,52 +135,54 @@ func (d *deleteNode) FastPathResults() (int, bool) {
 	return 0, false
 }
 
-func (d *deleteNode) Next() bool {
-	if d.run.done || d.run.err != nil {
-		return false
+func (d *deleteNode) Next() (bool, error) {
+	ctx := context.TODO()
+	next, err := d.run.rows.Next()
+	if !next {
+		if err == nil {
+			// We're done. Finish the batch.
+			err = d.tw.finalize(ctx)
+		}
+		return false, err
 	}
 
-	if !d.run.rows.Next() {
-		// We're done. Finish the batch.
-		d.run.err = d.tw.finalize()
-		d.run.done = true
-		return false
+	if d.run.explain == explainDebug {
+		return true, nil
 	}
 
 	rowVals := d.run.rows.Values()
 
-	_, err := d.tw.row(rowVals)
-	d.run.err = err
-	if d.run.err != nil {
-		return false
+	_, err = d.tw.row(ctx, rowVals)
+	if err != nil {
+		return false, err
 	}
 
 	resultRow, err := d.rh.cookResultRow(rowVals)
 	if err != nil {
-		d.run.err = err
-		return false
+		return false, err
 	}
 	d.run.resultRow = resultRow
 
-	return true
+	return true, nil
 }
 
 // Determine if the deletion of `rows` can be done without actually scanning them,
 // i.e. if we do not need to know their values for filtering expressions or a
 // RETURNING clause or for updating secondary indexes.
 func canDeleteWithoutScan(n *parser.Delete, scan *scanNode, td *tableDeleter) bool {
-	if !td.fastPathAvailable() {
+	ctx := context.TODO()
+	if !td.fastPathAvailable(ctx) {
 		return false
 	}
 	if n.Returning != nil {
 		if log.V(2) {
-			log.Infof("delete forced to scan: values required for RETURNING")
+			log.Infof(ctx, "delete forced to scan: values required for RETURNING")
 		}
 		return false
 	}
 	if scan.filter != nil {
 		if log.V(2) {
-			log.Infof("delete forced to scan: values required for filter (%s)", scan.filter)
+			log.Infof(ctx, "delete forced to scan: values required for filter (%s)", scan.filter)
 		}
 		return false
 	}
@@ -190,16 +192,15 @@ func canDeleteWithoutScan(n *parser.Delete, scan *scanNode, td *tableDeleter) bo
 // `fastDelete` skips the scan of rows and just deletes the ranges that
 // `rows` would scan. Should only be used if `canDeleteWithoutScan` indicates
 // that it is safe to do so.
-func (d *deleteNode) fastDelete() error {
-	scan := d.run.rows.(*selectNode).table.node.(*scanNode)
-	if !scan.initScan() {
-		return scan.err
+func (d *deleteNode) fastDelete(scan *scanNode) error {
+	if err := scan.initScan(); err != nil {
+		return err
 	}
 
 	if err := d.tw.init(d.p.txn); err != nil {
 		return err
 	}
-	rowCount, err := d.tw.fastDelete(scan)
+	rowCount, err := d.tw.fastDelete(context.TODO(), scan)
 	if err != nil {
 		return err
 	}
@@ -216,6 +217,10 @@ func (d *deleteNode) Values() parser.DTuple {
 }
 
 func (d *deleteNode) MarkDebug(mode explainMode) {
+	if mode != explainDebug {
+		panic(fmt.Sprintf("unknown debug mode %d", mode))
+	}
+	d.run.explain = mode
 	d.run.rows.MarkDebug(mode)
 }
 
@@ -225,10 +230,6 @@ func (d *deleteNode) DebugValues() debugValues {
 
 func (d *deleteNode) Ordering() orderingInfo {
 	return d.run.rows.Ordering()
-}
-
-func (d *deleteNode) Err() error {
-	return d.run.err
 }
 
 func (d *deleteNode) ExplainPlan(v bool) (name, description string, children []planNode) {
@@ -243,7 +244,13 @@ func (d *deleteNode) ExplainPlan(v bool) (name, description string, children []p
 		}
 		fmt.Fprintf(&buf, ")")
 	}
-	return "delete", buf.String(), []planNode{d.run.rows}
+
+	subplans := []planNode{d.run.rows}
+	for _, e := range d.rh.exprs {
+		subplans = d.p.collectSubqueryPlans(e, subplans)
+	}
+
+	return "delete", buf.String(), subplans
 }
 
 func (d *deleteNode) ExplainTypes(regTypes func(string, string)) {

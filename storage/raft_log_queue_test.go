@@ -18,25 +18,100 @@ package storage
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
+	"github.com/coreos/etcd/raft"
+	"github.com/pkg/errors"
 )
 
-// TestGetTruncatableIndexes verifies that the correctly returns when there are
-// indexes to be truncated.
+// TestGetBehindIndexes verifies that the indexes that are behind the quorum
+// committed index are correctly returned in ascending order.
+func TestGetBehindIndexes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCases := []struct {
+		progress []uint64
+		commit   uint64
+		expected []uint64
+	}{
+		// Basic cases.
+		{[]uint64{1}, 1, nil},
+		{[]uint64{1, 2}, 2, []uint64{1}},
+		{[]uint64{2, 3, 4}, 4, []uint64{2, 3}},
+		{[]uint64{1, 2, 3, 4, 5}, 3, []uint64{1, 2}},
+		// sorting.
+		{[]uint64{5, 4, 3, 2, 1}, 3, []uint64{1, 2}},
+	}
+	for i, c := range testCases {
+		status := &raft.Status{
+			Progress: make(map[uint64]raft.Progress),
+		}
+		status.Commit = c.commit
+		for j, v := range c.progress {
+			status.Progress[uint64(j)] = raft.Progress{Match: v}
+		}
+		out := getBehindIndexes(status)
+		if !reflect.DeepEqual(c.expected, out) {
+			t.Errorf("%d: getBehindIndexes(...) expected %d, but got %d", i, c.expected, out)
+		}
+	}
+}
+
+// TestComputeTruncatableIndex verifies that the correc
+func TestComputeTruncatableIndex(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const targetSize = 1000
+
+	testCases := []struct {
+		progress    []uint64
+		commit      uint64
+		raftLogSize int64
+		firstIndex  uint64
+		expected    uint64
+	}{
+		{[]uint64{1, 2}, 1, 100, 1, 1},
+		{[]uint64{1, 2, 3, 4}, 3, 100, 1, 1},
+		{[]uint64{1, 2, 3, 4}, 3, 100, 2, 2},
+		// If over targetSize, should truncate to next behind replica, or quorum
+		// committed index.
+		{[]uint64{1, 2, 3, 4}, 3, 2000, 1, 2},
+		{[]uint64{1, 2, 3, 4}, 3, 2000, 2, 3},
+		{[]uint64{1, 2, 3, 4}, 3, 2000, 3, 3},
+		// Never truncate past raftStatus.Commit.
+		{[]uint64{4, 5, 6}, 3, 100, 4, 3},
+	}
+	for i, c := range testCases {
+		status := &raft.Status{
+			Progress: make(map[uint64]raft.Progress),
+		}
+		status.Commit = c.commit
+		for j, v := range c.progress {
+			status.Progress[uint64(j)] = raft.Progress{Match: v}
+		}
+		out := computeTruncatableIndex(status, c.raftLogSize, targetSize, c.firstIndex)
+		if !reflect.DeepEqual(c.expected, out) {
+			t.Errorf("%d: computeTruncatableIndex(...) expected %d, but got %d", i, c.expected, out)
+		}
+	}
+}
+
+// TestGetTruncatableIndexes verifies that old raft log entries are correctly
+// removed.
 func TestGetTruncatableIndexes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	store, _, stopper := createTestStore(t)
 	defer stopper.Stop()
 	if _, err := store.GetReplica(0); err == nil {
-		t.Error("expected GetRange to fail on missing range")
+		t.Fatal("expected GetRange to fail on missing range")
 	}
 
-	store.DisableRaftLogQueue(true)
+	store.SetRaftLogQueueActive(false)
 
 	// Test on a new range which should not have a raft group yet.
 	rngNew := createRange(store, 100, roachpb.RKey("a"), roachpb.RKey("c"))
@@ -53,18 +128,18 @@ func TestGetTruncatableIndexes(t *testing.T) {
 
 	r, err := store.GetReplica(1)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 
 	r.mu.Lock()
 	firstIndex, err := r.FirstIndex()
 	r.mu.Unlock()
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 
 	// Write a few keys to the range.
-	for i := 0; i < 10; i++ {
+	for i := 0; i < RaftLogQueueStaleThreshold+1; i++ {
 		key := roachpb.Key(fmt.Sprintf("key%02d", i))
 		args := putArgs(key, []byte(fmt.Sprintf("value%02d", i)))
 		if _, err := client.SendWrapped(store.testSender(), nil, &args); err != nil {
@@ -85,7 +160,7 @@ func TestGetTruncatableIndexes(t *testing.T) {
 	}
 
 	// Enable the raft log scanner and and force a truncation.
-	store.DisableRaftLogQueue(false)
+	store.SetRaftLogQueueActive(true)
 	store.ForceRaftLogScanAndProcess()
 	// Wait for tasks to finish, in case the processLoop grabbed the event
 	// before ForceRaftLogScanAndProcess but is still working on it.
@@ -110,14 +185,61 @@ func TestGetTruncatableIndexes(t *testing.T) {
 		store.ForceRaftLogScanAndProcess()
 		truncatableIndexes, oldestIndex, err := getTruncatableIndexes(rngNew)
 		if err != nil {
-			return util.Errorf("expected no error, got %s", err)
+			return errors.Errorf("expected no error, got %s", err)
 		}
 		if truncatableIndexes != 0 {
-			return util.Errorf("expected 0 for truncatable index, got %d", truncatableIndexes)
+			return errors.Errorf("expected 0 for truncatable index, got %d", truncatableIndexes)
 		}
 		if oldestIndex != 0 {
-			return util.Errorf("expected 0 for oldest index, got %d", oldestIndex)
+			return errors.Errorf("expected 0 for oldest index, got %d", oldestIndex)
 		}
 		return nil
 	})
+}
+
+// TestProactiveRaftLogTruncate verifies that we proactively truncate the raft
+// log even when replica scanning is disabled.
+func TestProactiveRaftLogTruncate(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	store, _, stopper := createTestStore(t)
+	defer stopper.Stop()
+
+	store.SetReplicaScannerActive(false)
+
+	r, err := store.GetReplica(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r.mu.Lock()
+	oldFirstIndex, err := r.FirstIndex()
+	r.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a few keys to the range. While writing these keys, the raft log
+	// should be proactively truncated even though replica scanning is disabled.
+	for i := 0; i < 2*RaftLogQueueStaleThreshold; i++ {
+		key := roachpb.Key(fmt.Sprintf("key%02d", i))
+		args := putArgs(key, []byte(fmt.Sprintf("value%02d", i)))
+		if _, err := client.SendWrapped(store.testSender(), nil, &args); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Wait for any asynchronous tasks to finish.
+	stopper.Quiesce()
+
+	r.mu.Lock()
+	newFirstIndex, err := r.FirstIndex()
+	r.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if newFirstIndex <= oldFirstIndex {
+		t.Errorf("log was not correctly truncated, old first index:%d, current first index:%d",
+			oldFirstIndex, newFirstIndex)
+	}
 }

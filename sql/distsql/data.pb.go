@@ -7,7 +7,7 @@ package distsql
 import proto "github.com/gogo/protobuf/proto"
 import fmt "fmt"
 import math "math"
-import cockroach_roachpb1 "github.com/cockroachdb/cockroach/roachpb"
+import _ "github.com/cockroachdb/cockroach/roachpb"
 import cockroach_roachpb2 "github.com/cockroachdb/cockroach/roachpb"
 import cockroach_sql_sqlbase1 "github.com/cockroachdb/cockroach/sql/sqlbase"
 import cockroach_sql_sqlbase2 "github.com/cockroachdb/cockroach/sql/sqlbase"
@@ -20,6 +20,81 @@ import io "io"
 var _ = proto.Marshal
 var _ = fmt.Errorf
 var _ = math.Inf
+
+// The direction of the desired ordering for a column.
+type Ordering_Column_Direction int32
+
+const (
+	Ordering_Column_ASC  Ordering_Column_Direction = 0
+	Ordering_Column_DESC Ordering_Column_Direction = 1
+)
+
+var Ordering_Column_Direction_name = map[int32]string{
+	0: "ASC",
+	1: "DESC",
+}
+var Ordering_Column_Direction_value = map[string]int32{
+	"ASC":  0,
+	"DESC": 1,
+}
+
+func (x Ordering_Column_Direction) Enum() *Ordering_Column_Direction {
+	p := new(Ordering_Column_Direction)
+	*p = x
+	return p
+}
+func (x Ordering_Column_Direction) String() string {
+	return proto.EnumName(Ordering_Column_Direction_name, int32(x))
+}
+func (x *Ordering_Column_Direction) UnmarshalJSON(data []byte) error {
+	value, err := proto.UnmarshalJSONEnum(Ordering_Column_Direction_value, data, "Ordering_Column_Direction")
+	if err != nil {
+		return err
+	}
+	*x = Ordering_Column_Direction(value)
+	return nil
+}
+func (Ordering_Column_Direction) EnumDescriptor() ([]byte, []int) {
+	return fileDescriptorData, []int{1, 0, 0}
+}
+
+type InputSyncSpec_Type int32
+
+const (
+	// Rows from the input streams are interleaved arbitrarily.
+	InputSyncSpec_UNORDERED InputSyncSpec_Type = 0
+	// The input streams are guaranteed to be ordered according to the column
+	// ordering field; rows from the streams are interleaved to preserve that
+	// ordering.
+	InputSyncSpec_ORDERED InputSyncSpec_Type = 1
+)
+
+var InputSyncSpec_Type_name = map[int32]string{
+	0: "UNORDERED",
+	1: "ORDERED",
+}
+var InputSyncSpec_Type_value = map[string]int32{
+	"UNORDERED": 0,
+	"ORDERED":   1,
+}
+
+func (x InputSyncSpec_Type) Enum() *InputSyncSpec_Type {
+	p := new(InputSyncSpec_Type)
+	*p = x
+	return p
+}
+func (x InputSyncSpec_Type) String() string {
+	return proto.EnumName(InputSyncSpec_Type_name, int32(x))
+}
+func (x *InputSyncSpec_Type) UnmarshalJSON(data []byte) error {
+	value, err := proto.UnmarshalJSONEnum(InputSyncSpec_Type_value, data, "InputSyncSpec_Type")
+	if err != nil {
+		return err
+	}
+	*x = InputSyncSpec_Type(value)
+	return nil
+}
+func (InputSyncSpec_Type) EnumDescriptor() ([]byte, []int) { return fileDescriptorData, []int{4, 0} }
 
 type OutputRouterSpec_Type int32
 
@@ -69,7 +144,7 @@ func (OutputRouterSpec_Type) EnumDescriptor() ([]byte, []int) { return fileDescr
 type Expression struct {
 	// TODO(radu): TBD how this will be used
 	Version string `protobuf:"bytes,1,opt,name=version" json:"version"`
-	// SQL expressions are passed as a string, with ValArgs ($0, $1, ..) used for
+	// SQL expressions are passed as a string, with Placeholders ($1, $2 ..) used for
 	// "input" variables.
 	Expr string `protobuf:"bytes,2,opt,name=expr" json:"expr"`
 }
@@ -79,42 +154,29 @@ func (m *Expression) String() string            { return proto.CompactTextString
 func (*Expression) ProtoMessage()               {}
 func (*Expression) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{0} }
 
-type TableReaderSpan struct {
-	// TODO(radu): the dist_sql APIs should be agnostic to how we map tables to
-	// KVs. The span should be described as starting and ending lists of values
-	// for a prefix of the index columns, along with inclusive/exclusive flags.
-	Span cockroach_roachpb1.Span `protobuf:"bytes,1,opt,name=span" json:"span"`
+// Ordering defines an order - specifically a list of column indices and
+// directions. See sqlbase.ColumnOrdering.
+type Ordering struct {
+	Columns []Ordering_Column `protobuf:"bytes,1,rep,name=columns" json:"columns"`
 }
 
-func (m *TableReaderSpan) Reset()                    { *m = TableReaderSpan{} }
-func (m *TableReaderSpan) String() string            { return proto.CompactTextString(m) }
-func (*TableReaderSpan) ProtoMessage()               {}
-func (*TableReaderSpan) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{1} }
+func (m *Ordering) Reset()                    { *m = Ordering{} }
+func (m *Ordering) String() string            { return proto.CompactTextString(m) }
+func (*Ordering) ProtoMessage()               {}
+func (*Ordering) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{1} }
 
-// TableReaderSpec is the specification for a table reader. A table reader
-// performs KV operations to retrieve rows for a table and outputs the desired
-// columns of the rows that pass a filter expression.
-type TableReaderSpec struct {
-	Table cockroach_sql_sqlbase1.TableDescriptor `protobuf:"bytes,1,opt,name=table" json:"table"`
-	// If 0, we use the primary index. If non-zero, we use the index_idx-th index,
-	// i.e. table.indexes[index_idx-1]
-	IndexIdx uint32            `protobuf:"varint,2,opt,name=index_idx,json=indexIdx" json:"index_idx"`
-	Reverse  bool              `protobuf:"varint,3,opt,name=reverse" json:"reverse"`
-	Spans    []TableReaderSpan `protobuf:"bytes,4,rep,name=spans" json:"spans"`
-	// The filter expression references the columns in the table (table.columns)
-	// via $0, $1, etc. If a secondary index is used, the columns that are not
-	// available as part of the index cannot be referenced.
-	Filter Expression `protobuf:"bytes,5,opt,name=filter" json:"filter"`
-	// The table reader will only produce values for these columns, referenced by
-	// their indices in table.columns.
-	OutputColumns []uint32 `protobuf:"varint,6,rep,packed,name=output_columns,json=outputColumns" json:"output_columns,omitempty"`
+type Ordering_Column struct {
+	ColIdx    uint32                    `protobuf:"varint,1,opt,name=col_idx,json=colIdx" json:"col_idx"`
+	Direction Ordering_Column_Direction `protobuf:"varint,2,opt,name=direction,enum=cockroach.sql.distsql.Ordering_Column_Direction" json:"direction"`
 }
 
-func (m *TableReaderSpec) Reset()                    { *m = TableReaderSpec{} }
-func (m *TableReaderSpec) String() string            { return proto.CompactTextString(m) }
-func (*TableReaderSpec) ProtoMessage()               {}
-func (*TableReaderSpec) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{2} }
+func (m *Ordering_Column) Reset()                    { *m = Ordering_Column{} }
+func (m *Ordering_Column) String() string            { return proto.CompactTextString(m) }
+func (*Ordering_Column) ProtoMessage()               {}
+func (*Ordering_Column) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{1, 0} }
 
+// A mailbox is where a stream "crosses" hosts - it is an endpoint of a local
+// stream which receives data from or sends to a remote host.
 type MailboxSpec struct {
 	// If set, we are in a special "simple flow" mode. In this mode, we return
 	// results directly as part of the RPC call that set up the flow. This saves
@@ -122,19 +184,24 @@ type MailboxSpec struct {
 	// up the flow. In this mode there are no remote endpoints so this must be the
 	// only mailbox in that flow.
 	SimpleResponse bool `protobuf:"varint,1,opt,name=simple_response,json=simpleResponse" json:"simple_response"`
+	// The ID used to refer to this mailbox in a StreamHeader.
+	StreamID StreamID `protobuf:"varint,2,opt,name=stream_id,json=streamId,casttype=StreamID" json:"stream_id"`
+	// Serving address for the target host, used for outgoing mailboxes.
+	TargetAddr string `protobuf:"bytes,3,opt,name=target_addr,json=targetAddr" json:"target_addr"`
 }
 
 func (m *MailboxSpec) Reset()                    { *m = MailboxSpec{} }
 func (m *MailboxSpec) String() string            { return proto.CompactTextString(m) }
 func (*MailboxSpec) ProtoMessage()               {}
-func (*MailboxSpec) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{3} }
+func (*MailboxSpec) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{2} }
 
 // StreamEndpointSpec describes one of the endpoints (input or output) of a physical
 // stream.
 type StreamEndpointSpec struct {
 	// If set, both ends of the stream are part of the flow on this machine. There
-	// will be a corresponding endpoint with the same local stream ID.
-	LocalStreamID *int32 `protobuf:"varint,1,opt,name=local_stream_id,json=localStreamId" json:"local_stream_id,omitempty"`
+	// will be a corresponding endpoint with the same local stream ID. Can only be
+	// set if mailbox is not set.
+	LocalStreamID LocalStreamID `protobuf:"varint,1,opt,name=local_stream_id,json=localStreamId,casttype=LocalStreamID" json:"local_stream_id"`
 	// If set, the stream crosses flows; the endpoint is a mailbox.
 	Mailbox *MailboxSpec `protobuf:"bytes,2,opt,name=mailbox" json:"mailbox,omitempty"`
 }
@@ -142,7 +209,20 @@ type StreamEndpointSpec struct {
 func (m *StreamEndpointSpec) Reset()                    { *m = StreamEndpointSpec{} }
 func (m *StreamEndpointSpec) String() string            { return proto.CompactTextString(m) }
 func (*StreamEndpointSpec) ProtoMessage()               {}
-func (*StreamEndpointSpec) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{4} }
+func (*StreamEndpointSpec) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{3} }
+
+// InputSyncSpec is the specification for an input synchronizer; it decides how
+// to interleave rows from multiple input streams.
+type InputSyncSpec struct {
+	Type     InputSyncSpec_Type   `protobuf:"varint,1,opt,name=type,enum=cockroach.sql.distsql.InputSyncSpec_Type" json:"type"`
+	Ordering Ordering             `protobuf:"bytes,2,opt,name=ordering" json:"ordering"`
+	Streams  []StreamEndpointSpec `protobuf:"bytes,3,rep,name=streams" json:"streams"`
+}
+
+func (m *InputSyncSpec) Reset()                    { *m = InputSyncSpec{} }
+func (m *InputSyncSpec) String() string            { return proto.CompactTextString(m) }
+func (*InputSyncSpec) ProtoMessage()               {}
+func (*InputSyncSpec) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{4} }
 
 // OutputRouterSpec is the specification for the output router of a processor;
 // it decides how to send results to multiple output streams.
@@ -156,56 +236,28 @@ func (m *OutputRouterSpec) String() string            { return proto.CompactText
 func (*OutputRouterSpec) ProtoMessage()               {}
 func (*OutputRouterSpec) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{5} }
 
-type ProcessorCoreUnion struct {
-	TableReader *TableReaderSpec `protobuf:"bytes,1,opt,name=tableReader" json:"tableReader,omitempty"`
-}
-
-func (m *ProcessorCoreUnion) Reset()                    { *m = ProcessorCoreUnion{} }
-func (m *ProcessorCoreUnion) String() string            { return proto.CompactTextString(m) }
-func (*ProcessorCoreUnion) ProtoMessage()               {}
-func (*ProcessorCoreUnion) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{6} }
-
-type ProcessorSpec struct {
-	Core ProcessorCoreUnion `protobuf:"bytes,1,opt,name=core" json:"core"`
-	// In most cases, there is one output.
-	Output []OutputRouterSpec `protobuf:"bytes,2,rep,name=output" json:"output"`
-}
-
-func (m *ProcessorSpec) Reset()                    { *m = ProcessorSpec{} }
-func (m *ProcessorSpec) String() string            { return proto.CompactTextString(m) }
-func (*ProcessorSpec) ProtoMessage()               {}
-func (*ProcessorSpec) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{7} }
-
-// FlowSpec describes a "flow" which is a subgraph of a distributed SQL
-// computation consisting of processors and streams.
-type FlowSpec struct {
-	Processors []ProcessorSpec `protobuf:"bytes,1,rep,name=processors" json:"processors"`
-}
-
-func (m *FlowSpec) Reset()                    { *m = FlowSpec{} }
-func (m *FlowSpec) String() string            { return proto.CompactTextString(m) }
-func (*FlowSpec) ProtoMessage()               {}
-func (*FlowSpec) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{8} }
-
 type DatumInfo struct {
-	Encoding cockroach_sql_sqlbase2.DatumEncoding `protobuf:"varint,1,opt,name=encoding,enum=cockroach.sql.sqlbase.DatumEncoding" json:"encoding"`
+	Encoding cockroach_sql_sqlbase2.DatumEncoding   `protobuf:"varint,1,opt,name=encoding,enum=cockroach.sql.sqlbase.DatumEncoding" json:"encoding"`
+	Type     cockroach_sql_sqlbase1.ColumnType_Kind `protobuf:"varint,2,opt,name=type,enum=cockroach.sql.sqlbase.ColumnType_Kind" json:"type"`
 }
 
 func (m *DatumInfo) Reset()                    { *m = DatumInfo{} }
 func (m *DatumInfo) String() string            { return proto.CompactTextString(m) }
 func (*DatumInfo) ProtoMessage()               {}
-func (*DatumInfo) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{9} }
+func (*DatumInfo) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{6} }
 
 // StreamHeader is a message that is sent once at the beginning of a stream.
 type StreamHeader struct {
+	FlowID   FlowID   `protobuf:"bytes,1,opt,name=flow_id,json=flowId,customtype=FlowID" json:"flow_id"`
+	StreamID StreamID `protobuf:"varint,2,opt,name=stream_id,json=streamId,casttype=StreamID" json:"stream_id"`
 	// There is one DatumInfo for each element in a row.
-	Info []DatumInfo `protobuf:"bytes,1,rep,name=info" json:"info"`
+	Info []DatumInfo `protobuf:"bytes,3,rep,name=info" json:"info"`
 }
 
 func (m *StreamHeader) Reset()                    { *m = StreamHeader{} }
 func (m *StreamHeader) String() string            { return proto.CompactTextString(m) }
 func (*StreamHeader) ProtoMessage()               {}
-func (*StreamHeader) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{10} }
+func (*StreamHeader) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{7} }
 
 // StreamData is a message that can be sent multiple times as part of a stream.
 type StreamData struct {
@@ -217,7 +269,7 @@ type StreamData struct {
 func (m *StreamData) Reset()                    { *m = StreamData{} }
 func (m *StreamData) String() string            { return proto.CompactTextString(m) }
 func (*StreamData) ProtoMessage()               {}
-func (*StreamData) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{11} }
+func (*StreamData) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{8} }
 
 // StreamTrailer is a message that is sent once at the end of a stream.
 type StreamTrailer struct {
@@ -227,7 +279,7 @@ type StreamTrailer struct {
 func (m *StreamTrailer) Reset()                    { *m = StreamTrailer{} }
 func (m *StreamTrailer) String() string            { return proto.CompactTextString(m) }
 func (*StreamTrailer) ProtoMessage()               {}
-func (*StreamTrailer) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{12} }
+func (*StreamTrailer) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{9} }
 
 type StreamMessage struct {
 	// Header is present in the first message.
@@ -241,23 +293,23 @@ type StreamMessage struct {
 func (m *StreamMessage) Reset()                    { *m = StreamMessage{} }
 func (m *StreamMessage) String() string            { return proto.CompactTextString(m) }
 func (*StreamMessage) ProtoMessage()               {}
-func (*StreamMessage) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{13} }
+func (*StreamMessage) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{10} }
 
 func init() {
 	proto.RegisterType((*Expression)(nil), "cockroach.sql.distsql.Expression")
-	proto.RegisterType((*TableReaderSpan)(nil), "cockroach.sql.distsql.TableReaderSpan")
-	proto.RegisterType((*TableReaderSpec)(nil), "cockroach.sql.distsql.TableReaderSpec")
+	proto.RegisterType((*Ordering)(nil), "cockroach.sql.distsql.Ordering")
+	proto.RegisterType((*Ordering_Column)(nil), "cockroach.sql.distsql.Ordering.Column")
 	proto.RegisterType((*MailboxSpec)(nil), "cockroach.sql.distsql.MailboxSpec")
 	proto.RegisterType((*StreamEndpointSpec)(nil), "cockroach.sql.distsql.StreamEndpointSpec")
+	proto.RegisterType((*InputSyncSpec)(nil), "cockroach.sql.distsql.InputSyncSpec")
 	proto.RegisterType((*OutputRouterSpec)(nil), "cockroach.sql.distsql.OutputRouterSpec")
-	proto.RegisterType((*ProcessorCoreUnion)(nil), "cockroach.sql.distsql.ProcessorCoreUnion")
-	proto.RegisterType((*ProcessorSpec)(nil), "cockroach.sql.distsql.ProcessorSpec")
-	proto.RegisterType((*FlowSpec)(nil), "cockroach.sql.distsql.FlowSpec")
 	proto.RegisterType((*DatumInfo)(nil), "cockroach.sql.distsql.DatumInfo")
 	proto.RegisterType((*StreamHeader)(nil), "cockroach.sql.distsql.StreamHeader")
 	proto.RegisterType((*StreamData)(nil), "cockroach.sql.distsql.StreamData")
 	proto.RegisterType((*StreamTrailer)(nil), "cockroach.sql.distsql.StreamTrailer")
 	proto.RegisterType((*StreamMessage)(nil), "cockroach.sql.distsql.StreamMessage")
+	proto.RegisterEnum("cockroach.sql.distsql.Ordering_Column_Direction", Ordering_Column_Direction_name, Ordering_Column_Direction_value)
+	proto.RegisterEnum("cockroach.sql.distsql.InputSyncSpec_Type", InputSyncSpec_Type_name, InputSyncSpec_Type_value)
 	proto.RegisterEnum("cockroach.sql.distsql.OutputRouterSpec_Type", OutputRouterSpec_Type_name, OutputRouterSpec_Type_value)
 }
 func (m *Expression) Marshal() (data []byte, err error) {
@@ -286,7 +338,7 @@ func (m *Expression) MarshalTo(data []byte) (int, error) {
 	return i, nil
 }
 
-func (m *TableReaderSpan) Marshal() (data []byte, err error) {
+func (m *Ordering) Marshal() (data []byte, err error) {
 	size := m.Size()
 	data = make([]byte, size)
 	n, err := m.MarshalTo(data)
@@ -296,59 +348,14 @@ func (m *TableReaderSpan) Marshal() (data []byte, err error) {
 	return data[:n], nil
 }
 
-func (m *TableReaderSpan) MarshalTo(data []byte) (int, error) {
+func (m *Ordering) MarshalTo(data []byte) (int, error) {
 	var i int
 	_ = i
 	var l int
 	_ = l
-	data[i] = 0xa
-	i++
-	i = encodeVarintData(data, i, uint64(m.Span.Size()))
-	n1, err := m.Span.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n1
-	return i, nil
-}
-
-func (m *TableReaderSpec) Marshal() (data []byte, err error) {
-	size := m.Size()
-	data = make([]byte, size)
-	n, err := m.MarshalTo(data)
-	if err != nil {
-		return nil, err
-	}
-	return data[:n], nil
-}
-
-func (m *TableReaderSpec) MarshalTo(data []byte) (int, error) {
-	var i int
-	_ = i
-	var l int
-	_ = l
-	data[i] = 0xa
-	i++
-	i = encodeVarintData(data, i, uint64(m.Table.Size()))
-	n2, err := m.Table.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n2
-	data[i] = 0x10
-	i++
-	i = encodeVarintData(data, i, uint64(m.IndexIdx))
-	data[i] = 0x18
-	i++
-	if m.Reverse {
-		data[i] = 1
-	} else {
-		data[i] = 0
-	}
-	i++
-	if len(m.Spans) > 0 {
-		for _, msg := range m.Spans {
-			data[i] = 0x22
+	if len(m.Columns) > 0 {
+		for _, msg := range m.Columns {
+			data[i] = 0xa
 			i++
 			i = encodeVarintData(data, i, uint64(msg.Size()))
 			n, err := msg.MarshalTo(data[i:])
@@ -358,31 +365,30 @@ func (m *TableReaderSpec) MarshalTo(data []byte) (int, error) {
 			i += n
 		}
 	}
-	data[i] = 0x2a
-	i++
-	i = encodeVarintData(data, i, uint64(m.Filter.Size()))
-	n3, err := m.Filter.MarshalTo(data[i:])
+	return i, nil
+}
+
+func (m *Ordering_Column) Marshal() (data []byte, err error) {
+	size := m.Size()
+	data = make([]byte, size)
+	n, err := m.MarshalTo(data)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	i += n3
-	if len(m.OutputColumns) > 0 {
-		data5 := make([]byte, len(m.OutputColumns)*10)
-		var j4 int
-		for _, num := range m.OutputColumns {
-			for num >= 1<<7 {
-				data5[j4] = uint8(uint64(num)&0x7f | 0x80)
-				num >>= 7
-				j4++
-			}
-			data5[j4] = uint8(num)
-			j4++
-		}
-		data[i] = 0x32
-		i++
-		i = encodeVarintData(data, i, uint64(j4))
-		i += copy(data[i:], data5[:j4])
-	}
+	return data[:n], nil
+}
+
+func (m *Ordering_Column) MarshalTo(data []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	data[i] = 0x8
+	i++
+	i = encodeVarintData(data, i, uint64(m.ColIdx))
+	data[i] = 0x10
+	i++
+	i = encodeVarintData(data, i, uint64(m.Direction))
 	return i, nil
 }
 
@@ -409,6 +415,13 @@ func (m *MailboxSpec) MarshalTo(data []byte) (int, error) {
 		data[i] = 0
 	}
 	i++
+	data[i] = 0x10
+	i++
+	i = encodeVarintData(data, i, uint64(m.StreamID))
+	data[i] = 0x1a
+	i++
+	i = encodeVarintData(data, i, uint64(len(m.TargetAddr)))
+	i += copy(data[i:], m.TargetAddr)
 	return i, nil
 }
 
@@ -427,20 +440,59 @@ func (m *StreamEndpointSpec) MarshalTo(data []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	if m.LocalStreamID != nil {
-		data[i] = 0x8
-		i++
-		i = encodeVarintData(data, i, uint64(*m.LocalStreamID))
-	}
+	data[i] = 0x8
+	i++
+	i = encodeVarintData(data, i, uint64(m.LocalStreamID))
 	if m.Mailbox != nil {
 		data[i] = 0x12
 		i++
 		i = encodeVarintData(data, i, uint64(m.Mailbox.Size()))
-		n6, err := m.Mailbox.MarshalTo(data[i:])
+		n1, err := m.Mailbox.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n6
+		i += n1
+	}
+	return i, nil
+}
+
+func (m *InputSyncSpec) Marshal() (data []byte, err error) {
+	size := m.Size()
+	data = make([]byte, size)
+	n, err := m.MarshalTo(data)
+	if err != nil {
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+func (m *InputSyncSpec) MarshalTo(data []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	data[i] = 0x8
+	i++
+	i = encodeVarintData(data, i, uint64(m.Type))
+	data[i] = 0x12
+	i++
+	i = encodeVarintData(data, i, uint64(m.Ordering.Size()))
+	n2, err := m.Ordering.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n2
+	if len(m.Streams) > 0 {
+		for _, msg := range m.Streams {
+			data[i] = 0x1a
+			i++
+			i = encodeVarintData(data, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(data[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
 	}
 	return i, nil
 }
@@ -478,102 +530,6 @@ func (m *OutputRouterSpec) MarshalTo(data []byte) (int, error) {
 	return i, nil
 }
 
-func (m *ProcessorCoreUnion) Marshal() (data []byte, err error) {
-	size := m.Size()
-	data = make([]byte, size)
-	n, err := m.MarshalTo(data)
-	if err != nil {
-		return nil, err
-	}
-	return data[:n], nil
-}
-
-func (m *ProcessorCoreUnion) MarshalTo(data []byte) (int, error) {
-	var i int
-	_ = i
-	var l int
-	_ = l
-	if m.TableReader != nil {
-		data[i] = 0xa
-		i++
-		i = encodeVarintData(data, i, uint64(m.TableReader.Size()))
-		n7, err := m.TableReader.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n7
-	}
-	return i, nil
-}
-
-func (m *ProcessorSpec) Marshal() (data []byte, err error) {
-	size := m.Size()
-	data = make([]byte, size)
-	n, err := m.MarshalTo(data)
-	if err != nil {
-		return nil, err
-	}
-	return data[:n], nil
-}
-
-func (m *ProcessorSpec) MarshalTo(data []byte) (int, error) {
-	var i int
-	_ = i
-	var l int
-	_ = l
-	data[i] = 0xa
-	i++
-	i = encodeVarintData(data, i, uint64(m.Core.Size()))
-	n8, err := m.Core.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n8
-	if len(m.Output) > 0 {
-		for _, msg := range m.Output {
-			data[i] = 0x12
-			i++
-			i = encodeVarintData(data, i, uint64(msg.Size()))
-			n, err := msg.MarshalTo(data[i:])
-			if err != nil {
-				return 0, err
-			}
-			i += n
-		}
-	}
-	return i, nil
-}
-
-func (m *FlowSpec) Marshal() (data []byte, err error) {
-	size := m.Size()
-	data = make([]byte, size)
-	n, err := m.MarshalTo(data)
-	if err != nil {
-		return nil, err
-	}
-	return data[:n], nil
-}
-
-func (m *FlowSpec) MarshalTo(data []byte) (int, error) {
-	var i int
-	_ = i
-	var l int
-	_ = l
-	if len(m.Processors) > 0 {
-		for _, msg := range m.Processors {
-			data[i] = 0xa
-			i++
-			i = encodeVarintData(data, i, uint64(msg.Size()))
-			n, err := msg.MarshalTo(data[i:])
-			if err != nil {
-				return 0, err
-			}
-			i += n
-		}
-	}
-	return i, nil
-}
-
 func (m *DatumInfo) Marshal() (data []byte, err error) {
 	size := m.Size()
 	data = make([]byte, size)
@@ -592,6 +548,9 @@ func (m *DatumInfo) MarshalTo(data []byte) (int, error) {
 	data[i] = 0x8
 	i++
 	i = encodeVarintData(data, i, uint64(m.Encoding))
+	data[i] = 0x10
+	i++
+	i = encodeVarintData(data, i, uint64(m.Type))
 	return i, nil
 }
 
@@ -610,9 +569,20 @@ func (m *StreamHeader) MarshalTo(data []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
+	data[i] = 0xa
+	i++
+	i = encodeVarintData(data, i, uint64(m.FlowID.Size()))
+	n3, err := m.FlowID.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n3
+	data[i] = 0x10
+	i++
+	i = encodeVarintData(data, i, uint64(m.StreamID))
 	if len(m.Info) > 0 {
 		for _, msg := range m.Info {
-			data[i] = 0xa
+			data[i] = 0x1a
 			i++
 			i = encodeVarintData(data, i, uint64(msg.Size()))
 			n, err := msg.MarshalTo(data[i:])
@@ -668,11 +638,11 @@ func (m *StreamTrailer) MarshalTo(data []byte) (int, error) {
 		data[i] = 0xa
 		i++
 		i = encodeVarintData(data, i, uint64(m.Error.Size()))
-		n9, err := m.Error.MarshalTo(data[i:])
+		n4, err := m.Error.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n9
+		i += n4
 	}
 	return i, nil
 }
@@ -696,29 +666,29 @@ func (m *StreamMessage) MarshalTo(data []byte) (int, error) {
 		data[i] = 0xa
 		i++
 		i = encodeVarintData(data, i, uint64(m.Header.Size()))
-		n10, err := m.Header.MarshalTo(data[i:])
+		n5, err := m.Header.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n10
+		i += n5
 	}
 	data[i] = 0x12
 	i++
 	i = encodeVarintData(data, i, uint64(m.Data.Size()))
-	n11, err := m.Data.MarshalTo(data[i:])
+	n6, err := m.Data.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n11
+	i += n6
 	if m.Trailer != nil {
 		data[i] = 0x1a
 		i++
 		i = encodeVarintData(data, i, uint64(m.Trailer.Size()))
-		n12, err := m.Trailer.MarshalTo(data[i:])
+		n7, err := m.Trailer.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n12
+		i += n7
 	}
 	return i, nil
 }
@@ -760,36 +730,23 @@ func (m *Expression) Size() (n int) {
 	return n
 }
 
-func (m *TableReaderSpan) Size() (n int) {
+func (m *Ordering) Size() (n int) {
 	var l int
 	_ = l
-	l = m.Span.Size()
-	n += 1 + l + sovData(uint64(l))
-	return n
-}
-
-func (m *TableReaderSpec) Size() (n int) {
-	var l int
-	_ = l
-	l = m.Table.Size()
-	n += 1 + l + sovData(uint64(l))
-	n += 1 + sovData(uint64(m.IndexIdx))
-	n += 2
-	if len(m.Spans) > 0 {
-		for _, e := range m.Spans {
+	if len(m.Columns) > 0 {
+		for _, e := range m.Columns {
 			l = e.Size()
 			n += 1 + l + sovData(uint64(l))
 		}
 	}
-	l = m.Filter.Size()
-	n += 1 + l + sovData(uint64(l))
-	if len(m.OutputColumns) > 0 {
-		l = 0
-		for _, e := range m.OutputColumns {
-			l += sovData(uint64(e))
-		}
-		n += 1 + sovData(uint64(l)) + l
-	}
+	return n
+}
+
+func (m *Ordering_Column) Size() (n int) {
+	var l int
+	_ = l
+	n += 1 + sovData(uint64(m.ColIdx))
+	n += 1 + sovData(uint64(m.Direction))
 	return n
 }
 
@@ -797,18 +754,34 @@ func (m *MailboxSpec) Size() (n int) {
 	var l int
 	_ = l
 	n += 2
+	n += 1 + sovData(uint64(m.StreamID))
+	l = len(m.TargetAddr)
+	n += 1 + l + sovData(uint64(l))
 	return n
 }
 
 func (m *StreamEndpointSpec) Size() (n int) {
 	var l int
 	_ = l
-	if m.LocalStreamID != nil {
-		n += 1 + sovData(uint64(*m.LocalStreamID))
-	}
+	n += 1 + sovData(uint64(m.LocalStreamID))
 	if m.Mailbox != nil {
 		l = m.Mailbox.Size()
 		n += 1 + l + sovData(uint64(l))
+	}
+	return n
+}
+
+func (m *InputSyncSpec) Size() (n int) {
+	var l int
+	_ = l
+	n += 1 + sovData(uint64(m.Type))
+	l = m.Ordering.Size()
+	n += 1 + l + sovData(uint64(l))
+	if len(m.Streams) > 0 {
+		for _, e := range m.Streams {
+			l = e.Size()
+			n += 1 + l + sovData(uint64(l))
+		}
 	}
 	return n
 }
@@ -826,52 +799,20 @@ func (m *OutputRouterSpec) Size() (n int) {
 	return n
 }
 
-func (m *ProcessorCoreUnion) Size() (n int) {
-	var l int
-	_ = l
-	if m.TableReader != nil {
-		l = m.TableReader.Size()
-		n += 1 + l + sovData(uint64(l))
-	}
-	return n
-}
-
-func (m *ProcessorSpec) Size() (n int) {
-	var l int
-	_ = l
-	l = m.Core.Size()
-	n += 1 + l + sovData(uint64(l))
-	if len(m.Output) > 0 {
-		for _, e := range m.Output {
-			l = e.Size()
-			n += 1 + l + sovData(uint64(l))
-		}
-	}
-	return n
-}
-
-func (m *FlowSpec) Size() (n int) {
-	var l int
-	_ = l
-	if len(m.Processors) > 0 {
-		for _, e := range m.Processors {
-			l = e.Size()
-			n += 1 + l + sovData(uint64(l))
-		}
-	}
-	return n
-}
-
 func (m *DatumInfo) Size() (n int) {
 	var l int
 	_ = l
 	n += 1 + sovData(uint64(m.Encoding))
+	n += 1 + sovData(uint64(m.Type))
 	return n
 }
 
 func (m *StreamHeader) Size() (n int) {
 	var l int
 	_ = l
+	l = m.FlowID.Size()
+	n += 1 + l + sovData(uint64(l))
+	n += 1 + sovData(uint64(m.StreamID))
 	if len(m.Info) > 0 {
 		for _, e := range m.Info {
 			l = e.Size()
@@ -929,43 +870,6 @@ func sovData(x uint64) (n int) {
 }
 func sozData(x uint64) (n int) {
 	return sovData(uint64((x << 1) ^ uint64((int64(x) >> 63))))
-}
-func (this *StreamEndpointSpec) GetValue() interface{} {
-	if this.LocalStreamID != nil {
-		return this.LocalStreamID
-	}
-	if this.Mailbox != nil {
-		return this.Mailbox
-	}
-	return nil
-}
-
-func (this *StreamEndpointSpec) SetValue(value interface{}) bool {
-	switch vt := value.(type) {
-	case *int32:
-		this.LocalStreamID = vt
-	case *MailboxSpec:
-		this.Mailbox = vt
-	default:
-		return false
-	}
-	return true
-}
-func (this *ProcessorCoreUnion) GetValue() interface{} {
-	if this.TableReader != nil {
-		return this.TableReader
-	}
-	return nil
-}
-
-func (this *ProcessorCoreUnion) SetValue(value interface{}) bool {
-	switch vt := value.(type) {
-	case *TableReaderSpec:
-		this.TableReader = vt
-	default:
-		return false
-	}
-	return true
 }
 func (m *Expression) Unmarshal(data []byte) error {
 	l := len(data)
@@ -1075,7 +979,7 @@ func (m *Expression) Unmarshal(data []byte) error {
 	}
 	return nil
 }
-func (m *TableReaderSpan) Unmarshal(data []byte) error {
+func (m *Ordering) Unmarshal(data []byte) error {
 	l := len(data)
 	iNdEx := 0
 	for iNdEx < l {
@@ -1098,15 +1002,15 @@ func (m *TableReaderSpan) Unmarshal(data []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: TableReaderSpan: wiretype end group for non-group")
+			return fmt.Errorf("proto: Ordering: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: TableReaderSpan: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: Ordering: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Span", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field Columns", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -1130,7 +1034,8 @@ func (m *TableReaderSpan) Unmarshal(data []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if err := m.Span.Unmarshal(data[iNdEx:postIndex]); err != nil {
+			m.Columns = append(m.Columns, Ordering_Column{})
+			if err := m.Columns[len(m.Columns)-1].Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -1155,7 +1060,7 @@ func (m *TableReaderSpan) Unmarshal(data []byte) error {
 	}
 	return nil
 }
-func (m *TableReaderSpec) Unmarshal(data []byte) error {
+func (m *Ordering_Column) Unmarshal(data []byte) error {
 	l := len(data)
 	iNdEx := 0
 	for iNdEx < l {
@@ -1178,17 +1083,17 @@ func (m *TableReaderSpec) Unmarshal(data []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: TableReaderSpec: wiretype end group for non-group")
+			return fmt.Errorf("proto: Column: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: TableReaderSpec: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: Column: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Table", wireType)
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ColIdx", wireType)
 			}
-			var msglen int
+			m.ColIdx = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowData
@@ -1198,27 +1103,16 @@ func (m *TableReaderSpec) Unmarshal(data []byte) error {
 				}
 				b := data[iNdEx]
 				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
+				m.ColIdx |= (uint32(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
-			if msglen < 0 {
-				return ErrInvalidLengthData
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := m.Table.Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
 		case 2:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field IndexIdx", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field Direction", wireType)
 			}
-			m.IndexIdx = 0
+			m.Direction = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowData
@@ -1228,153 +1122,10 @@ func (m *TableReaderSpec) Unmarshal(data []byte) error {
 				}
 				b := data[iNdEx]
 				iNdEx++
-				m.IndexIdx |= (uint32(b) & 0x7F) << shift
+				m.Direction |= (Ordering_Column_Direction(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
-			}
-		case 3:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Reverse", wireType)
-			}
-			var v int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				v |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			m.Reverse = bool(v != 0)
-		case 4:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Spans", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthData
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.Spans = append(m.Spans, TableReaderSpan{})
-			if err := m.Spans[len(m.Spans)-1].Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 5:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Filter", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthData
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := m.Filter.Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 6:
-			if wireType == 2 {
-				var packedLen int
-				for shift := uint(0); ; shift += 7 {
-					if shift >= 64 {
-						return ErrIntOverflowData
-					}
-					if iNdEx >= l {
-						return io.ErrUnexpectedEOF
-					}
-					b := data[iNdEx]
-					iNdEx++
-					packedLen |= (int(b) & 0x7F) << shift
-					if b < 0x80 {
-						break
-					}
-				}
-				if packedLen < 0 {
-					return ErrInvalidLengthData
-				}
-				postIndex := iNdEx + packedLen
-				if postIndex > l {
-					return io.ErrUnexpectedEOF
-				}
-				for iNdEx < postIndex {
-					var v uint32
-					for shift := uint(0); ; shift += 7 {
-						if shift >= 64 {
-							return ErrIntOverflowData
-						}
-						if iNdEx >= l {
-							return io.ErrUnexpectedEOF
-						}
-						b := data[iNdEx]
-						iNdEx++
-						v |= (uint32(b) & 0x7F) << shift
-						if b < 0x80 {
-							break
-						}
-					}
-					m.OutputColumns = append(m.OutputColumns, v)
-				}
-			} else if wireType == 0 {
-				var v uint32
-				for shift := uint(0); ; shift += 7 {
-					if shift >= 64 {
-						return ErrIntOverflowData
-					}
-					if iNdEx >= l {
-						return io.ErrUnexpectedEOF
-					}
-					b := data[iNdEx]
-					iNdEx++
-					v |= (uint32(b) & 0x7F) << shift
-					if b < 0x80 {
-						break
-					}
-				}
-				m.OutputColumns = append(m.OutputColumns, v)
-			} else {
-				return fmt.Errorf("proto: wrong wireType = %d for field OutputColumns", wireType)
 			}
 		default:
 			iNdEx = preIndex
@@ -1446,6 +1197,54 @@ func (m *MailboxSpec) Unmarshal(data []byte) error {
 				}
 			}
 			m.SimpleResponse = bool(v != 0)
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field StreamID", wireType)
+			}
+			m.StreamID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				m.StreamID |= (StreamID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field TargetAddr", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				stringLen |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.TargetAddr = string(data[iNdEx:postIndex])
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipData(data[iNdEx:])
@@ -1500,7 +1299,7 @@ func (m *StreamEndpointSpec) Unmarshal(data []byte) error {
 			if wireType != 0 {
 				return fmt.Errorf("proto: wrong wireType = %d for field LocalStreamID", wireType)
 			}
-			var v int32
+			m.LocalStreamID = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowData
@@ -1510,12 +1309,11 @@ func (m *StreamEndpointSpec) Unmarshal(data []byte) error {
 				}
 				b := data[iNdEx]
 				iNdEx++
-				v |= (int32(b) & 0x7F) << shift
+				m.LocalStreamID |= (LocalStreamID(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
-			m.LocalStreamID = &v
 		case 2:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Mailbox", wireType)
@@ -1546,6 +1344,136 @@ func (m *StreamEndpointSpec) Unmarshal(data []byte) error {
 				m.Mailbox = &MailboxSpec{}
 			}
 			if err := m.Mailbox.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipData(data[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthData
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *InputSyncSpec) Unmarshal(data []byte) error {
+	l := len(data)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowData
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := data[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: InputSyncSpec: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: InputSyncSpec: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Type", wireType)
+			}
+			m.Type = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				m.Type |= (InputSyncSpec_Type(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Ordering", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Ordering.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Streams", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Streams = append(m.Streams, StreamEndpointSpec{})
+			if err := m.Streams[len(m.Streams)-1].Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -1670,281 +1598,6 @@ func (m *OutputRouterSpec) Unmarshal(data []byte) error {
 	}
 	return nil
 }
-func (m *ProcessorCoreUnion) Unmarshal(data []byte) error {
-	l := len(data)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowData
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := data[iNdEx]
-			iNdEx++
-			wire |= (uint64(b) & 0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: ProcessorCoreUnion: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: ProcessorCoreUnion: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field TableReader", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthData
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if m.TableReader == nil {
-				m.TableReader = &TableReaderSpec{}
-			}
-			if err := m.TableReader.Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		default:
-			iNdEx = preIndex
-			skippy, err := skipData(data[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthData
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
-func (m *ProcessorSpec) Unmarshal(data []byte) error {
-	l := len(data)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowData
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := data[iNdEx]
-			iNdEx++
-			wire |= (uint64(b) & 0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: ProcessorSpec: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: ProcessorSpec: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Core", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthData
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := m.Core.Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 2:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Output", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthData
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.Output = append(m.Output, OutputRouterSpec{})
-			if err := m.Output[len(m.Output)-1].Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		default:
-			iNdEx = preIndex
-			skippy, err := skipData(data[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthData
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
-func (m *FlowSpec) Unmarshal(data []byte) error {
-	l := len(data)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowData
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := data[iNdEx]
-			iNdEx++
-			wire |= (uint64(b) & 0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: FlowSpec: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: FlowSpec: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Processors", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthData
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.Processors = append(m.Processors, ProcessorSpec{})
-			if err := m.Processors[len(m.Processors)-1].Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		default:
-			iNdEx = preIndex
-			skippy, err := skipData(data[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthData
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
 func (m *DatumInfo) Unmarshal(data []byte) error {
 	l := len(data)
 	iNdEx := 0
@@ -1989,6 +1642,25 @@ func (m *DatumInfo) Unmarshal(data []byte) error {
 				b := data[iNdEx]
 				iNdEx++
 				m.Encoding |= (cockroach_sql_sqlbase2.DatumEncoding(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Type", wireType)
+			}
+			m.Type = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				m.Type |= (cockroach_sql_sqlbase1.ColumnType_Kind(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
@@ -2044,6 +1716,55 @@ func (m *StreamHeader) Unmarshal(data []byte) error {
 		}
 		switch fieldNum {
 		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field FlowID", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				byteLen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthData
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.FlowID.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field StreamID", wireType)
+			}
+			m.StreamID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowData
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				m.StreamID |= (StreamID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 3:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Info", wireType)
 			}
@@ -2510,61 +2231,65 @@ var (
 	ErrIntOverflowData   = fmt.Errorf("proto: integer overflow")
 )
 
+func init() { proto.RegisterFile("cockroach/sql/distsql/data.proto", fileDescriptorData) }
+
 var fileDescriptorData = []byte{
-	// 876 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x09, 0x6e, 0x88, 0x02, 0xff, 0x8c, 0x55, 0xcf, 0x73, 0xdb, 0x44,
-	0x14, 0x8e, 0x52, 0xc5, 0x76, 0x9e, 0xe3, 0xc4, 0xec, 0xc0, 0xe0, 0x29, 0x8c, 0x93, 0x88, 0x4e,
-	0xc1, 0x33, 0x54, 0x1e, 0x72, 0xa3, 0x74, 0xe8, 0xd4, 0xb1, 0x83, 0xdd, 0x21, 0x94, 0x91, 0x03,
-	0x03, 0x5c, 0x3c, 0xb2, 0xb4, 0x75, 0x35, 0xc8, 0x5a, 0xb1, 0xbb, 0xa6, 0xee, 0x7f, 0xc1, 0x0c,
-	0x47, 0x2e, 0xfc, 0x39, 0xe6, 0xc6, 0x81, 0x03, 0xa7, 0x0e, 0x94, 0x7f, 0x84, 0xfd, 0x19, 0x2b,
-	0x89, 0x55, 0x38, 0xc8, 0x96, 0xf6, 0xbd, 0xef, 0xdb, 0xef, 0x7b, 0xef, 0x69, 0x05, 0x47, 0x11,
-	0x89, 0xbe, 0xa7, 0x24, 0x8c, 0x9e, 0x75, 0xd9, 0x0f, 0x69, 0x37, 0x4e, 0x18, 0x57, 0xff, 0x21,
-	0x0f, 0xfd, 0x9c, 0x12, 0x4e, 0xd0, 0x5b, 0x97, 0x19, 0xbe, 0x88, 0xf8, 0x26, 0xe3, 0xf6, 0xbb,
-	0x6b, 0xa0, 0xfa, 0xcd, 0xa7, 0x05, 0xd0, 0xed, 0xf6, 0xcd, 0x28, 0xa6, 0x94, 0x50, 0x66, 0xe2,
-	0x77, 0xaf, 0x6e, 0x2b, 0xae, 0x69, 0xc8, 0x70, 0x97, 0x71, 0xba, 0x88, 0xf8, 0x82, 0xe2, 0xd8,
-	0xe4, 0x75, 0x36, 0xe7, 0xe1, 0x2c, 0x22, 0x31, 0x8e, 0x27, 0x62, 0xc7, 0xc5, 0xdc, 0xa4, 0xbe,
-	0x39, 0x23, 0x33, 0xa2, 0x6e, 0xbb, 0xf2, 0x4e, 0xaf, 0x7a, 0x67, 0x00, 0x83, 0x65, 0x4e, 0x31,
-	0x63, 0x09, 0xc9, 0x50, 0x1b, 0xaa, 0x3f, 0x62, 0x2a, 0x6f, 0x5b, 0xce, 0x91, 0xf3, 0xc1, 0x6e,
-	0xcf, 0x5d, 0xbd, 0x3c, 0xdc, 0x0a, 0xec, 0x22, 0x6a, 0x81, 0x8b, 0x45, 0x76, 0x6b, 0xbb, 0x10,
-	0x54, 0x2b, 0x5e, 0x1f, 0x0e, 0x2e, 0xc2, 0x69, 0x8a, 0x03, 0x1c, 0xc6, 0x98, 0x8e, 0xf3, 0x30,
-	0x43, 0x1f, 0x81, 0xcb, 0xc4, 0xbf, 0x62, 0xaa, 0x9f, 0xbc, 0xed, 0xaf, 0xeb, 0x64, 0x2c, 0xfb,
-	0x32, 0xcd, 0xb2, 0xc8, 0x54, 0x6f, 0xb5, 0x7d, 0x8d, 0x06, 0x47, 0xa8, 0x07, 0x3b, 0x5c, 0x2e,
-	0x19, 0x9e, 0xbb, 0xfe, 0xd5, 0x7a, 0x1b, 0xcb, 0xbe, 0x82, 0xf5, 0x31, 0x8b, 0x68, 0x92, 0x73,
-	0x42, 0x0d, 0xad, 0x86, 0xa2, 0x63, 0xd8, 0x4d, 0xb2, 0x18, 0x2f, 0x27, 0x49, 0xbc, 0x54, 0xe2,
-	0x1b, 0x26, 0x5e, 0x53, 0xcb, 0xa3, 0x78, 0x29, 0xad, 0x53, 0x2c, 0x7d, 0xe2, 0xd6, 0x2d, 0x91,
-	0x50, 0xb3, 0xd6, 0xcd, 0xa2, 0x94, 0x21, 0x25, 0xb2, 0x96, 0x7b, 0x74, 0x6b, 0x83, 0x0c, 0xd3,
-	0x76, 0xff, 0x5a, 0x11, 0xac, 0x0c, 0x05, 0x45, 0x0f, 0xa1, 0xf2, 0x34, 0x49, 0x39, 0xa6, 0xad,
-	0x1d, 0xe5, 0xe5, 0xb8, 0x84, 0x64, 0xdd, 0x11, 0x83, 0x37, 0x30, 0xd4, 0x81, 0x7d, 0xb2, 0xe0,
-	0xf9, 0x82, 0x4f, 0x22, 0x92, 0x2e, 0xe6, 0x42, 0x4d, 0x45, 0xa8, 0x69, 0xf4, 0xb6, 0x9b, 0x4e,
-	0xd0, 0xd0, 0x91, 0x53, 0x1d, 0xf0, 0x1e, 0x40, 0xfd, 0x3c, 0x4c, 0xd2, 0x29, 0x59, 0xaa, 0x2a,
-	0xde, 0x83, 0x03, 0x96, 0xcc, 0xf3, 0x14, 0x4f, 0x04, 0x73, 0x4e, 0x32, 0xa6, 0xeb, 0x69, 0x6d,
-	0xee, 0xeb, 0x60, 0x60, 0x62, 0xde, 0xcf, 0x0e, 0xa0, 0x31, 0xa7, 0x38, 0x9c, 0x0f, 0xb2, 0x38,
-	0x27, 0x49, 0xc6, 0x15, 0xcb, 0xc7, 0x70, 0x90, 0x92, 0x28, 0x4c, 0x27, 0x4c, 0xc5, 0x44, 0x39,
-	0x15, 0xcb, 0x4e, 0xef, 0x8d, 0x57, 0x2f, 0x0f, 0x1b, 0x9f, 0xcb, 0x90, 0x46, 0x8d, 0xfa, 0x41,
-	0x23, 0x2d, 0x3c, 0xc6, 0xe8, 0x01, 0x54, 0xe7, 0x5a, 0x8f, 0x6a, 0x40, 0xfd, 0xc4, 0x2b, 0x31,
-	0x5f, 0x50, 0x1d, 0x58, 0xc8, 0x7d, 0x77, 0xf5, 0xeb, 0xa1, 0xe3, 0xfd, 0xe1, 0x40, 0xf3, 0x89,
-	0x72, 0x19, 0x08, 0xb3, 0x66, 0x3e, 0xce, 0xc0, 0xe5, 0x2f, 0x72, 0x6d, 0x67, 0xff, 0xe4, 0xc3,
-	0x12, 0xd6, 0xeb, 0x30, 0xff, 0x42, 0x60, 0xec, 0xec, 0x49, 0x3c, 0x1a, 0x41, 0x55, 0xbb, 0x62,
-	0x42, 0xa0, 0x6c, 0x71, 0xa7, 0x84, 0xea, 0x66, 0x5d, 0xec, 0xac, 0x18, 0xbc, 0x77, 0x0f, 0x5c,
-	0x49, 0x8f, 0x00, 0x2a, 0xe7, 0xa3, 0x20, 0x78, 0x12, 0x34, 0xb7, 0x50, 0x1d, 0xaa, 0xbd, 0x6f,
-	0x27, 0xc3, 0x47, 0xe3, 0x61, 0xd3, 0x41, 0x7b, 0x50, 0x13, 0x0f, 0xc1, 0xa3, 0x2f, 0x3e, 0x1b,
-	0x34, 0xb7, 0xbd, 0x18, 0xd0, 0x97, 0x94, 0x44, 0xa2, 0xe3, 0x84, 0x9e, 0x12, 0x8a, 0xbf, 0xca,
-	0xe4, 0xbb, 0x36, 0x84, 0x3a, 0x5f, 0x0f, 0x53, 0xc9, 0xf4, 0x6f, 0x1c, 0x3b, 0x51, 0xb8, 0x22,
-	0xd4, 0x14, 0xef, 0x17, 0x07, 0x1a, 0x97, 0xdb, 0xa8, 0xca, 0x9d, 0x82, 0x1b, 0x89, 0xed, 0x0c,
-	0x75, 0x99, 0xdd, 0x9b, 0xd2, 0x6c, 0xd9, 0x24, 0x18, 0x0d, 0xa0, 0xa2, 0x07, 0xcf, 0x54, 0xed,
-	0xfd, 0xff, 0xd9, 0x00, 0x3b, 0xd9, 0x1a, 0xec, 0x7d, 0x0d, 0xb5, 0xb3, 0x94, 0x3c, 0x57, 0xba,
-	0x1e, 0x03, 0xe4, 0x76, 0x53, 0x26, 0xd4, 0x49, 0xda, 0x3b, 0xff, 0xa5, 0xae, 0xc0, 0x59, 0x40,
-	0x7b, 0x63, 0xd8, 0xed, 0xcb, 0x43, 0x70, 0x94, 0x3d, 0x25, 0x62, 0x54, 0x6a, 0xea, 0x64, 0x4c,
-	0xb2, 0x99, 0x19, 0x97, 0x3b, 0x25, 0xa7, 0x89, 0xc2, 0x0c, 0x4c, 0xae, 0x3d, 0x2b, 0x2c, 0xd6,
-	0x7b, 0x0c, 0x7b, 0x7a, 0x08, 0x86, 0xaa, 0xc0, 0xe8, 0x3e, 0xb8, 0x89, 0xe0, 0x37, 0x52, 0x8f,
-	0x4a, 0xa4, 0x5e, 0xea, 0xb0, 0xf5, 0x93, 0x18, 0xaf, 0x03, 0xa0, 0xb9, 0x44, 0x38, 0x44, 0xef,
-	0xc0, 0x2e, 0x0d, 0x9f, 0x4f, 0xa6, 0x2f, 0x38, 0x66, 0x4a, 0xe2, 0x5e, 0x50, 0x13, 0x0b, 0x3d,
-	0xf9, 0xec, 0x3d, 0x84, 0x86, 0x4e, 0xbd, 0xa0, 0xe2, 0xb5, 0x10, 0xfb, 0xfa, 0xb0, 0xa3, 0xbe,
-	0x1a, 0xa6, 0x83, 0xad, 0x0d, 0x47, 0xec, 0x40, 0xc6, 0x03, 0x9d, 0xe6, 0xfd, 0xe6, 0x58, 0x86,
-	0x73, 0x51, 0x9e, 0x70, 0x86, 0xd1, 0x27, 0x50, 0x79, 0x56, 0x9c, 0xaf, 0xf7, 0x5e, 0x3b, 0xf3,
-	0xda, 0x6e, 0x60, 0x20, 0x02, 0xec, 0xca, 0x4f, 0x9a, 0x79, 0x9f, 0x8f, 0x5f, 0x0b, 0x95, 0xee,
-	0xac, 0x6f, 0x09, 0x42, 0x9f, 0x42, 0x95, 0x6b, 0x1b, 0xea, 0xbc, 0x2d, 0xef, 0xf0, 0x15, 0xcb,
-	0x81, 0x05, 0xf5, 0x8e, 0x57, 0x7f, 0xb7, 0xb7, 0x56, 0xaf, 0xda, 0xce, 0xef, 0xe2, 0xfa, 0x53,
-	0x5c, 0x7f, 0x89, 0xeb, 0xa7, 0x7f, 0xda, 0x5b, 0xdf, 0x55, 0x0d, 0xf2, 0x1b, 0xf7, 0xdf, 0x00,
-	0x00, 0x00, 0xff, 0xff, 0xb0, 0x53, 0x25, 0x21, 0xbe, 0x07, 0x00, 0x00,
+	// 910 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x09, 0x6e, 0x88, 0x02, 0xff, 0xa4, 0x55, 0xcd, 0x6e, 0x23, 0x45,
+	0x10, 0x76, 0x27, 0x5e, 0xff, 0x94, 0xd7, 0x59, 0xab, 0x05, 0x92, 0x15, 0x16, 0x27, 0x3b, 0x40,
+	0xb4, 0x91, 0xd8, 0x09, 0xf8, 0x06, 0x8b, 0x00, 0x3b, 0xb6, 0x89, 0x05, 0x49, 0xa4, 0x71, 0x90,
+	0x58, 0x2e, 0xa3, 0xc9, 0x74, 0xc7, 0x3b, 0x62, 0x3c, 0x3d, 0xe9, 0x6e, 0x13, 0xe7, 0x05, 0x38,
+	0x73, 0xe1, 0x08, 0x07, 0x9e, 0x82, 0x47, 0x08, 0x37, 0x0e, 0x1c, 0x10, 0x87, 0x08, 0xcc, 0x1b,
+	0x70, 0xe4, 0x84, 0xfa, 0x67, 0x9c, 0xf1, 0x66, 0xbd, 0x20, 0xed, 0xc5, 0xee, 0x99, 0xfa, 0xbe,
+	0xaa, 0xaf, 0xbe, 0xae, 0xee, 0x81, 0xed, 0x90, 0x85, 0x5f, 0x71, 0x16, 0x84, 0x4f, 0xf7, 0xc4,
+	0x79, 0xbc, 0x47, 0x22, 0x21, 0xf5, 0x7f, 0x20, 0x03, 0x37, 0xe5, 0x4c, 0x32, 0xfc, 0xea, 0x02,
+	0xe1, 0x8a, 0xf3, 0xd8, 0xb5, 0x88, 0xcd, 0xfb, 0x37, 0x44, 0xfd, 0x9b, 0x9e, 0xe6, 0x48, 0x9b,
+	0xad, 0xdb, 0x51, 0xca, 0x39, 0xe3, 0xc2, 0xc6, 0x77, 0x96, 0xcb, 0x8a, 0xf3, 0xf8, 0x34, 0x10,
+	0x74, 0x4f, 0x48, 0x3e, 0x0d, 0xe5, 0x94, 0x53, 0x62, 0x71, 0xbb, 0xcf, 0xc7, 0xd1, 0x24, 0x64,
+	0x84, 0x12, 0x9f, 0x04, 0x72, 0x3a, 0xb1, 0xd0, 0x57, 0xc6, 0x6c, 0xcc, 0xf4, 0x72, 0x4f, 0xad,
+	0xcc, 0x5b, 0x67, 0x00, 0xd0, 0x9f, 0xa5, 0x9c, 0x0a, 0x11, 0xb1, 0x04, 0xb7, 0xa0, 0xfc, 0x35,
+	0xe5, 0x6a, 0xd9, 0x44, 0xdb, 0xe8, 0x61, 0xb5, 0x5b, 0xbc, 0xba, 0xde, 0x2a, 0x78, 0xd9, 0x4b,
+	0xdc, 0x84, 0x22, 0x9d, 0xa5, 0xbc, 0xb9, 0x96, 0x0b, 0xea, 0x37, 0xce, 0xdf, 0x08, 0x2a, 0xc7,
+	0x9c, 0x50, 0x1e, 0x25, 0x63, 0x3c, 0x80, 0x72, 0xc8, 0xe2, 0xe9, 0x24, 0x11, 0x4d, 0xb4, 0xbd,
+	0xfe, 0xb0, 0xd6, 0xde, 0x71, 0x9f, 0x6b, 0x92, 0x9b, 0x31, 0xdc, 0x7d, 0x0d, 0xcf, 0xca, 0x59,
+	0xf2, 0xe6, 0xf7, 0x08, 0x4a, 0x26, 0x82, 0x5f, 0xd7, 0x29, 0xfd, 0x88, 0xcc, 0xb4, 0xb2, 0xba,
+	0x85, 0x96, 0x42, 0x16, 0x0f, 0xc9, 0x0c, 0x9f, 0x40, 0x95, 0x44, 0x9c, 0x86, 0x52, 0x49, 0x57,
+	0xea, 0x36, 0xda, 0xef, 0xfc, 0xbf, 0x9a, 0x6e, 0x2f, 0xe3, 0xd9, 0x94, 0x37, 0x89, 0x9c, 0x16,
+	0x54, 0x17, 0x51, 0x5c, 0x86, 0xf5, 0xce, 0x68, 0xbf, 0x51, 0xc0, 0x15, 0x28, 0xf6, 0xfa, 0xa3,
+	0xfd, 0x06, 0x72, 0x7e, 0x40, 0x50, 0x3b, 0x0c, 0xa2, 0xf8, 0x94, 0xcd, 0x46, 0x29, 0x0d, 0xf1,
+	0x23, 0xb8, 0x27, 0xa2, 0x49, 0x1a, 0x53, 0x9f, 0x53, 0x91, 0xb2, 0x44, 0x50, 0x2d, 0xb6, 0x62,
+	0x33, 0x6f, 0x98, 0xa0, 0x67, 0x63, 0xf8, 0x3d, 0xa8, 0x0a, 0xc9, 0x69, 0x30, 0xf1, 0x23, 0xa2,
+	0x45, 0xdf, 0xe9, 0xde, 0x57, 0xc0, 0xf9, 0xf5, 0x56, 0x65, 0xa4, 0x03, 0xc3, 0xde, 0x3f, 0xb9,
+	0xb5, 0x57, 0x31, 0xf0, 0x21, 0xc1, 0x6f, 0x41, 0x4d, 0x06, 0x7c, 0x4c, 0xa5, 0x1f, 0x10, 0xc2,
+	0x9b, 0xeb, 0xb9, 0xfd, 0x00, 0x13, 0xe8, 0x10, 0xc2, 0x9d, 0x1f, 0x11, 0x60, 0xc3, 0xee, 0x27,
+	0x24, 0x65, 0x51, 0x22, 0xb5, 0xce, 0x23, 0xb8, 0x17, 0xb3, 0x30, 0x88, 0xfd, 0x9b, 0xf2, 0x48,
+	0x97, 0xdf, 0xb1, 0xe5, 0xeb, 0x9f, 0xa9, 0x70, 0x4e, 0xc3, 0xf2, 0x0b, 0xaf, 0x1e, 0xe7, 0x1e,
+	0x09, 0xfe, 0x00, 0xca, 0x13, 0x63, 0x83, 0x6e, 0xa3, 0xd6, 0x76, 0x56, 0x78, 0x9f, 0x33, 0xcb,
+	0xcb, 0x28, 0xce, 0x37, 0x6b, 0x50, 0x1f, 0x26, 0xe9, 0x54, 0x8e, 0x2e, 0x93, 0x50, 0xeb, 0xdb,
+	0x87, 0xa2, 0xbc, 0x4c, 0x8d, 0x79, 0x1b, 0xed, 0xdd, 0x15, 0xc9, 0x96, 0x38, 0xee, 0xc9, 0x65,
+	0x4a, 0xb3, 0x89, 0x54, 0x64, 0xdc, 0x81, 0x0a, 0xb3, 0x5b, 0x6d, 0x55, 0x6d, 0xfd, 0xc7, 0x44,
+	0x58, 0xfa, 0x82, 0x86, 0x87, 0x50, 0x36, 0x0e, 0x89, 0xe6, 0xba, 0x9e, 0xe3, 0x55, 0x52, 0x6e,
+	0x7b, 0x9c, 0x8d, 0xb2, 0xe5, 0x3b, 0x0e, 0x14, 0x95, 0x42, 0x5c, 0x87, 0xea, 0xe7, 0x47, 0xc7,
+	0x5e, 0xaf, 0xef, 0xf5, 0x7b, 0x8d, 0x02, 0xae, 0x41, 0x39, 0x7b, 0x40, 0xce, 0xaf, 0x08, 0x1a,
+	0xc7, 0x53, 0x99, 0x4e, 0xa5, 0xc7, 0xa6, 0x92, 0x72, 0xed, 0xc5, 0x60, 0xc9, 0x8b, 0xb7, 0x57,
+	0xb5, 0xf0, 0x0c, 0xed, 0xb6, 0x1d, 0xb9, 0x5e, 0xd6, 0x5e, 0xb2, 0x97, 0x47, 0xb6, 0x17, 0x80,
+	0xd2, 0xe1, 0xd0, 0xf3, 0x8e, 0x3d, 0xd3, 0x48, 0xf7, 0x89, 0x7f, 0xd0, 0x19, 0x1d, 0x34, 0x10,
+	0xbe, 0x0b, 0x95, 0xee, 0x13, 0xdf, 0xeb, 0x1c, 0x7d, 0xd2, 0x6f, 0xac, 0x39, 0xdf, 0x21, 0xa8,
+	0xf6, 0xd4, 0x45, 0x34, 0x4c, 0xce, 0x18, 0x1e, 0x40, 0x45, 0xdf, 0x4e, 0x6a, 0x5b, 0x4c, 0x4f,
+	0x6f, 0x3e, 0x23, 0xc4, 0x5e, 0x62, 0xae, 0xe6, 0xf4, 0x2d, 0x36, 0xdb, 0x9b, 0x8c, 0x8b, 0x3f,
+	0xb6, 0xbe, 0x98, 0xc3, 0xbe, 0xb3, 0x22, 0x87, 0x39, 0xe3, 0x4a, 0xad, 0xfb, 0x69, 0x94, 0x90,
+	0xbc, 0x23, 0xce, 0x4f, 0x08, 0xee, 0x9a, 0x66, 0x0f, 0x68, 0x40, 0x28, 0xc7, 0xef, 0x42, 0xf9,
+	0x2c, 0x66, 0x17, 0xd9, 0x71, 0xb8, 0xdb, 0x6d, 0x2a, 0xf4, 0xef, 0xd7, 0x5b, 0xa5, 0x41, 0xcc,
+	0x2e, 0x86, 0xbd, 0xf9, 0x62, 0xe5, 0x95, 0x14, 0x70, 0x48, 0x5e, 0xe6, 0x08, 0xbf, 0x0f, 0xc5,
+	0x28, 0x39, 0x63, 0x76, 0xb2, 0xb6, 0x57, 0xec, 0xc6, 0xc2, 0xb8, 0x4c, 0xba, 0xe2, 0x38, 0xbb,
+	0x00, 0x26, 0x63, 0x2f, 0x90, 0x01, 0x7e, 0x0d, 0xaa, 0x3c, 0xb8, 0xf0, 0x4f, 0x2f, 0x25, 0x15,
+	0x46, 0xb9, 0x57, 0xe1, 0xc1, 0x45, 0x57, 0x3d, 0x3b, 0x1f, 0x41, 0xdd, 0x40, 0x4f, 0x78, 0x10,
+	0xc5, 0x94, 0x63, 0x17, 0xee, 0xe8, 0x4f, 0x8d, 0x46, 0xd6, 0xda, 0xcd, 0x5c, 0x61, 0xfb, 0x29,
+	0x72, 0xfb, 0x2a, 0xee, 0x19, 0x98, 0xf3, 0x33, 0xca, 0x32, 0x1c, 0x52, 0x21, 0x82, 0x31, 0xc5,
+	0x8f, 0xa1, 0xf4, 0x54, 0x3b, 0x66, 0x53, 0xbc, 0xf1, 0xc2, 0x49, 0x32, 0xe6, 0x7a, 0x96, 0x82,
+	0x1f, 0x43, 0x51, 0x7d, 0x07, 0xed, 0x91, 0x7c, 0xf0, 0x42, 0xaa, 0xea, 0x2e, 0xeb, 0x5b, 0x91,
+	0xf0, 0x87, 0x50, 0x96, 0xa6, 0x0d, 0x7d, 0xe5, 0xd5, 0x6e, 0xcd, 0xce, 0x32, 0xdf, 0xb6, 0xec,
+	0x65, 0xa4, 0xee, 0x83, 0xab, 0x3f, 0x5b, 0x85, 0xab, 0x79, 0x0b, 0xfd, 0x32, 0x6f, 0xa1, 0xdf,
+	0xe6, 0x2d, 0xf4, 0xc7, 0xbc, 0x85, 0xbe, 0xfd, 0xab, 0x55, 0xf8, 0xb2, 0x6c, 0x99, 0x5f, 0x14,
+	0xff, 0x0d, 0x00, 0x00, 0xff, 0xff, 0x6f, 0xc7, 0xdc, 0x58, 0xf3, 0x07, 0x00, 0x00,
 }

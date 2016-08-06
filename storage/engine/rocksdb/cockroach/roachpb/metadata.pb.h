@@ -22,13 +22,10 @@
 #include <google/protobuf/arena.h>
 #include <google/protobuf/arenastring.h>
 #include <google/protobuf/generated_message_util.h>
-#include <google/protobuf/metadata.h>
-#include <google/protobuf/message.h>
+#include <google/protobuf/message_lite.h>
 #include <google/protobuf/repeated_field.h>
 #include <google/protobuf/extension_set.h>
-#include <google/protobuf/unknown_field_set.h>
 #include "cockroach/util/unresolved_addr.pb.h"
-#include "gogoproto/gogo.pb.h"
 // @@protoc_insertion_point(includes)
 
 namespace cockroach {
@@ -43,12 +40,14 @@ class Attributes;
 class NodeDescriptor;
 class RangeDescriptor;
 class ReplicaDescriptor;
+class ReplicaIdent;
 class StoreCapacity;
+class StoreDeadReplicas;
 class StoreDescriptor;
 
 // ===================================================================
 
-class Attributes : public ::google::protobuf::Message {
+class Attributes : public ::google::protobuf::MessageLite /* @@protoc_insertion_point(class_definition:cockroach.roachpb.Attributes) */ {
  public:
   Attributes();
   virtual ~Attributes();
@@ -60,16 +59,27 @@ class Attributes : public ::google::protobuf::Message {
     return *this;
   }
 
-  inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const {
-    return _internal_metadata_.unknown_fields();
+  inline const ::std::string& unknown_fields() const {
+    return _unknown_fields_.GetNoArena(
+        &::google::protobuf::internal::GetEmptyStringAlreadyInited());
   }
 
-  inline ::google::protobuf::UnknownFieldSet* mutable_unknown_fields() {
-    return _internal_metadata_.mutable_unknown_fields();
+  inline ::std::string* mutable_unknown_fields() {
+    return _unknown_fields_.MutableNoArena(
+        &::google::protobuf::internal::GetEmptyStringAlreadyInited());
   }
 
-  static const ::google::protobuf::Descriptor* descriptor();
   static const Attributes& default_instance();
+
+  #ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  // Returns the internal default instance pointer. This function can
+  // return NULL thus should not be used by the user. This is intended
+  // for Protobuf internal code. Please use default_instance() declared
+  // above instead.
+  static inline const Attributes* internal_default_instance() {
+    return default_instance_;
+  }
+  #endif
 
   void Swap(Attributes* other);
 
@@ -78,8 +88,7 @@ class Attributes : public ::google::protobuf::Message {
   inline Attributes* New() const { return New(NULL); }
 
   Attributes* New(::google::protobuf::Arena* arena) const;
-  void CopyFrom(const ::google::protobuf::Message& from);
-  void MergeFrom(const ::google::protobuf::Message& from);
+  void CheckTypeAndMergeFrom(const ::google::protobuf::MessageLite& from);
   void CopyFrom(const Attributes& from);
   void MergeFrom(const Attributes& from);
   void Clear();
@@ -90,7 +99,7 @@ class Attributes : public ::google::protobuf::Message {
       ::google::protobuf::io::CodedInputStream* input);
   void SerializeWithCachedSizes(
       ::google::protobuf::io::CodedOutputStream* output) const;
-  ::google::protobuf::uint8* SerializeWithCachedSizesToArray(::google::protobuf::uint8* output) const;
+  void DiscardUnknownFields();
   int GetCachedSize() const { return _cached_size_; }
   private:
   void SharedCtor();
@@ -99,14 +108,14 @@ class Attributes : public ::google::protobuf::Message {
   void InternalSwap(Attributes* other);
   private:
   inline ::google::protobuf::Arena* GetArenaNoVirtual() const {
-    return _internal_metadata_.arena();
+    return _arena_ptr_;
   }
-  inline void* MaybeArenaPtr() const {
-    return _internal_metadata_.raw_arena_ptr();
+  inline ::google::protobuf::Arena* MaybeArenaPtr() const {
+    return _arena_ptr_;
   }
   public:
 
-  ::google::protobuf::Metadata GetMetadata() const;
+  ::std::string GetTypeName() const;
 
   // nested types ----------------------------------------------------
 
@@ -131,11 +140,17 @@ class Attributes : public ::google::protobuf::Message {
   // @@protoc_insertion_point(class_scope:cockroach.roachpb.Attributes)
  private:
 
-  ::google::protobuf::internal::InternalMetadataWithArena _internal_metadata_;
+  ::google::protobuf::internal::ArenaStringPtr _unknown_fields_;
+  ::google::protobuf::Arena* _arena_ptr_;
+
   ::google::protobuf::uint32 _has_bits_[1];
   mutable int _cached_size_;
   ::google::protobuf::RepeatedPtrField< ::std::string> attrs_;
+  #ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  friend void  protobuf_AddDesc_cockroach_2froachpb_2fmetadata_2eproto_impl();
+  #else
   friend void  protobuf_AddDesc_cockroach_2froachpb_2fmetadata_2eproto();
+  #endif
   friend void protobuf_AssignDesc_cockroach_2froachpb_2fmetadata_2eproto();
   friend void protobuf_ShutdownFile_cockroach_2froachpb_2fmetadata_2eproto();
 
@@ -144,7 +159,7 @@ class Attributes : public ::google::protobuf::Message {
 };
 // -------------------------------------------------------------------
 
-class ReplicaDescriptor : public ::google::protobuf::Message {
+class ReplicaDescriptor : public ::google::protobuf::MessageLite /* @@protoc_insertion_point(class_definition:cockroach.roachpb.ReplicaDescriptor) */ {
  public:
   ReplicaDescriptor();
   virtual ~ReplicaDescriptor();
@@ -156,16 +171,27 @@ class ReplicaDescriptor : public ::google::protobuf::Message {
     return *this;
   }
 
-  inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const {
-    return _internal_metadata_.unknown_fields();
+  inline const ::std::string& unknown_fields() const {
+    return _unknown_fields_.GetNoArena(
+        &::google::protobuf::internal::GetEmptyStringAlreadyInited());
   }
 
-  inline ::google::protobuf::UnknownFieldSet* mutable_unknown_fields() {
-    return _internal_metadata_.mutable_unknown_fields();
+  inline ::std::string* mutable_unknown_fields() {
+    return _unknown_fields_.MutableNoArena(
+        &::google::protobuf::internal::GetEmptyStringAlreadyInited());
   }
 
-  static const ::google::protobuf::Descriptor* descriptor();
   static const ReplicaDescriptor& default_instance();
+
+  #ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  // Returns the internal default instance pointer. This function can
+  // return NULL thus should not be used by the user. This is intended
+  // for Protobuf internal code. Please use default_instance() declared
+  // above instead.
+  static inline const ReplicaDescriptor* internal_default_instance() {
+    return default_instance_;
+  }
+  #endif
 
   void Swap(ReplicaDescriptor* other);
 
@@ -174,8 +200,7 @@ class ReplicaDescriptor : public ::google::protobuf::Message {
   inline ReplicaDescriptor* New() const { return New(NULL); }
 
   ReplicaDescriptor* New(::google::protobuf::Arena* arena) const;
-  void CopyFrom(const ::google::protobuf::Message& from);
-  void MergeFrom(const ::google::protobuf::Message& from);
+  void CheckTypeAndMergeFrom(const ::google::protobuf::MessageLite& from);
   void CopyFrom(const ReplicaDescriptor& from);
   void MergeFrom(const ReplicaDescriptor& from);
   void Clear();
@@ -186,7 +211,7 @@ class ReplicaDescriptor : public ::google::protobuf::Message {
       ::google::protobuf::io::CodedInputStream* input);
   void SerializeWithCachedSizes(
       ::google::protobuf::io::CodedOutputStream* output) const;
-  ::google::protobuf::uint8* SerializeWithCachedSizesToArray(::google::protobuf::uint8* output) const;
+  void DiscardUnknownFields();
   int GetCachedSize() const { return _cached_size_; }
   private:
   void SharedCtor();
@@ -195,14 +220,14 @@ class ReplicaDescriptor : public ::google::protobuf::Message {
   void InternalSwap(ReplicaDescriptor* other);
   private:
   inline ::google::protobuf::Arena* GetArenaNoVirtual() const {
-    return _internal_metadata_.arena();
+    return _arena_ptr_;
   }
-  inline void* MaybeArenaPtr() const {
-    return _internal_metadata_.raw_arena_ptr();
+  inline ::google::protobuf::Arena* MaybeArenaPtr() const {
+    return _arena_ptr_;
   }
   public:
 
-  ::google::protobuf::Metadata GetMetadata() const;
+  ::std::string GetTypeName() const;
 
   // nested types ----------------------------------------------------
 
@@ -238,13 +263,19 @@ class ReplicaDescriptor : public ::google::protobuf::Message {
   inline void set_has_replica_id();
   inline void clear_has_replica_id();
 
-  ::google::protobuf::internal::InternalMetadataWithArena _internal_metadata_;
+  ::google::protobuf::internal::ArenaStringPtr _unknown_fields_;
+  ::google::protobuf::Arena* _arena_ptr_;
+
   ::google::protobuf::uint32 _has_bits_[1];
   mutable int _cached_size_;
   ::google::protobuf::int32 node_id_;
   ::google::protobuf::int32 store_id_;
   ::google::protobuf::int32 replica_id_;
+  #ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  friend void  protobuf_AddDesc_cockroach_2froachpb_2fmetadata_2eproto_impl();
+  #else
   friend void  protobuf_AddDesc_cockroach_2froachpb_2fmetadata_2eproto();
+  #endif
   friend void protobuf_AssignDesc_cockroach_2froachpb_2fmetadata_2eproto();
   friend void protobuf_ShutdownFile_cockroach_2froachpb_2fmetadata_2eproto();
 
@@ -253,7 +284,124 @@ class ReplicaDescriptor : public ::google::protobuf::Message {
 };
 // -------------------------------------------------------------------
 
-class RangeDescriptor : public ::google::protobuf::Message {
+class ReplicaIdent : public ::google::protobuf::MessageLite /* @@protoc_insertion_point(class_definition:cockroach.roachpb.ReplicaIdent) */ {
+ public:
+  ReplicaIdent();
+  virtual ~ReplicaIdent();
+
+  ReplicaIdent(const ReplicaIdent& from);
+
+  inline ReplicaIdent& operator=(const ReplicaIdent& from) {
+    CopyFrom(from);
+    return *this;
+  }
+
+  inline const ::std::string& unknown_fields() const {
+    return _unknown_fields_.GetNoArena(
+        &::google::protobuf::internal::GetEmptyStringAlreadyInited());
+  }
+
+  inline ::std::string* mutable_unknown_fields() {
+    return _unknown_fields_.MutableNoArena(
+        &::google::protobuf::internal::GetEmptyStringAlreadyInited());
+  }
+
+  static const ReplicaIdent& default_instance();
+
+  #ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  // Returns the internal default instance pointer. This function can
+  // return NULL thus should not be used by the user. This is intended
+  // for Protobuf internal code. Please use default_instance() declared
+  // above instead.
+  static inline const ReplicaIdent* internal_default_instance() {
+    return default_instance_;
+  }
+  #endif
+
+  void Swap(ReplicaIdent* other);
+
+  // implements Message ----------------------------------------------
+
+  inline ReplicaIdent* New() const { return New(NULL); }
+
+  ReplicaIdent* New(::google::protobuf::Arena* arena) const;
+  void CheckTypeAndMergeFrom(const ::google::protobuf::MessageLite& from);
+  void CopyFrom(const ReplicaIdent& from);
+  void MergeFrom(const ReplicaIdent& from);
+  void Clear();
+  bool IsInitialized() const;
+
+  int ByteSize() const;
+  bool MergePartialFromCodedStream(
+      ::google::protobuf::io::CodedInputStream* input);
+  void SerializeWithCachedSizes(
+      ::google::protobuf::io::CodedOutputStream* output) const;
+  void DiscardUnknownFields();
+  int GetCachedSize() const { return _cached_size_; }
+  private:
+  void SharedCtor();
+  void SharedDtor();
+  void SetCachedSize(int size) const;
+  void InternalSwap(ReplicaIdent* other);
+  private:
+  inline ::google::protobuf::Arena* GetArenaNoVirtual() const {
+    return _arena_ptr_;
+  }
+  inline ::google::protobuf::Arena* MaybeArenaPtr() const {
+    return _arena_ptr_;
+  }
+  public:
+
+  ::std::string GetTypeName() const;
+
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+
+  // optional int64 range_id = 1;
+  bool has_range_id() const;
+  void clear_range_id();
+  static const int kRangeIdFieldNumber = 1;
+  ::google::protobuf::int64 range_id() const;
+  void set_range_id(::google::protobuf::int64 value);
+
+  // optional .cockroach.roachpb.ReplicaDescriptor replica = 2;
+  bool has_replica() const;
+  void clear_replica();
+  static const int kReplicaFieldNumber = 2;
+  const ::cockroach::roachpb::ReplicaDescriptor& replica() const;
+  ::cockroach::roachpb::ReplicaDescriptor* mutable_replica();
+  ::cockroach::roachpb::ReplicaDescriptor* release_replica();
+  void set_allocated_replica(::cockroach::roachpb::ReplicaDescriptor* replica);
+
+  // @@protoc_insertion_point(class_scope:cockroach.roachpb.ReplicaIdent)
+ private:
+  inline void set_has_range_id();
+  inline void clear_has_range_id();
+  inline void set_has_replica();
+  inline void clear_has_replica();
+
+  ::google::protobuf::internal::ArenaStringPtr _unknown_fields_;
+  ::google::protobuf::Arena* _arena_ptr_;
+
+  ::google::protobuf::uint32 _has_bits_[1];
+  mutable int _cached_size_;
+  ::google::protobuf::int64 range_id_;
+  ::cockroach::roachpb::ReplicaDescriptor* replica_;
+  #ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  friend void  protobuf_AddDesc_cockroach_2froachpb_2fmetadata_2eproto_impl();
+  #else
+  friend void  protobuf_AddDesc_cockroach_2froachpb_2fmetadata_2eproto();
+  #endif
+  friend void protobuf_AssignDesc_cockroach_2froachpb_2fmetadata_2eproto();
+  friend void protobuf_ShutdownFile_cockroach_2froachpb_2fmetadata_2eproto();
+
+  void InitAsDefaultInstance();
+  static ReplicaIdent* default_instance_;
+};
+// -------------------------------------------------------------------
+
+class RangeDescriptor : public ::google::protobuf::MessageLite /* @@protoc_insertion_point(class_definition:cockroach.roachpb.RangeDescriptor) */ {
  public:
   RangeDescriptor();
   virtual ~RangeDescriptor();
@@ -265,16 +413,27 @@ class RangeDescriptor : public ::google::protobuf::Message {
     return *this;
   }
 
-  inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const {
-    return _internal_metadata_.unknown_fields();
+  inline const ::std::string& unknown_fields() const {
+    return _unknown_fields_.GetNoArena(
+        &::google::protobuf::internal::GetEmptyStringAlreadyInited());
   }
 
-  inline ::google::protobuf::UnknownFieldSet* mutable_unknown_fields() {
-    return _internal_metadata_.mutable_unknown_fields();
+  inline ::std::string* mutable_unknown_fields() {
+    return _unknown_fields_.MutableNoArena(
+        &::google::protobuf::internal::GetEmptyStringAlreadyInited());
   }
 
-  static const ::google::protobuf::Descriptor* descriptor();
   static const RangeDescriptor& default_instance();
+
+  #ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  // Returns the internal default instance pointer. This function can
+  // return NULL thus should not be used by the user. This is intended
+  // for Protobuf internal code. Please use default_instance() declared
+  // above instead.
+  static inline const RangeDescriptor* internal_default_instance() {
+    return default_instance_;
+  }
+  #endif
 
   void Swap(RangeDescriptor* other);
 
@@ -283,8 +442,7 @@ class RangeDescriptor : public ::google::protobuf::Message {
   inline RangeDescriptor* New() const { return New(NULL); }
 
   RangeDescriptor* New(::google::protobuf::Arena* arena) const;
-  void CopyFrom(const ::google::protobuf::Message& from);
-  void MergeFrom(const ::google::protobuf::Message& from);
+  void CheckTypeAndMergeFrom(const ::google::protobuf::MessageLite& from);
   void CopyFrom(const RangeDescriptor& from);
   void MergeFrom(const RangeDescriptor& from);
   void Clear();
@@ -295,7 +453,7 @@ class RangeDescriptor : public ::google::protobuf::Message {
       ::google::protobuf::io::CodedInputStream* input);
   void SerializeWithCachedSizes(
       ::google::protobuf::io::CodedOutputStream* output) const;
-  ::google::protobuf::uint8* SerializeWithCachedSizesToArray(::google::protobuf::uint8* output) const;
+  void DiscardUnknownFields();
   int GetCachedSize() const { return _cached_size_; }
   private:
   void SharedCtor();
@@ -304,14 +462,14 @@ class RangeDescriptor : public ::google::protobuf::Message {
   void InternalSwap(RangeDescriptor* other);
   private:
   inline ::google::protobuf::Arena* GetArenaNoVirtual() const {
-    return _internal_metadata_.arena();
+    return _arena_ptr_;
   }
-  inline void* MaybeArenaPtr() const {
-    return _internal_metadata_.raw_arena_ptr();
+  inline ::google::protobuf::Arena* MaybeArenaPtr() const {
+    return _arena_ptr_;
   }
   public:
 
-  ::google::protobuf::Metadata GetMetadata() const;
+  ::std::string GetTypeName() const;
 
   // nested types ----------------------------------------------------
 
@@ -378,7 +536,9 @@ class RangeDescriptor : public ::google::protobuf::Message {
   inline void set_has_next_replica_id();
   inline void clear_has_next_replica_id();
 
-  ::google::protobuf::internal::InternalMetadataWithArena _internal_metadata_;
+  ::google::protobuf::internal::ArenaStringPtr _unknown_fields_;
+  ::google::protobuf::Arena* _arena_ptr_;
+
   ::google::protobuf::uint32 _has_bits_[1];
   mutable int _cached_size_;
   ::google::protobuf::int64 range_id_;
@@ -386,7 +546,11 @@ class RangeDescriptor : public ::google::protobuf::Message {
   ::google::protobuf::internal::ArenaStringPtr end_key_;
   ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaDescriptor > replicas_;
   ::google::protobuf::int32 next_replica_id_;
+  #ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  friend void  protobuf_AddDesc_cockroach_2froachpb_2fmetadata_2eproto_impl();
+  #else
   friend void  protobuf_AddDesc_cockroach_2froachpb_2fmetadata_2eproto();
+  #endif
   friend void protobuf_AssignDesc_cockroach_2froachpb_2fmetadata_2eproto();
   friend void protobuf_ShutdownFile_cockroach_2froachpb_2fmetadata_2eproto();
 
@@ -395,7 +559,7 @@ class RangeDescriptor : public ::google::protobuf::Message {
 };
 // -------------------------------------------------------------------
 
-class StoreCapacity : public ::google::protobuf::Message {
+class StoreCapacity : public ::google::protobuf::MessageLite /* @@protoc_insertion_point(class_definition:cockroach.roachpb.StoreCapacity) */ {
  public:
   StoreCapacity();
   virtual ~StoreCapacity();
@@ -407,16 +571,27 @@ class StoreCapacity : public ::google::protobuf::Message {
     return *this;
   }
 
-  inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const {
-    return _internal_metadata_.unknown_fields();
+  inline const ::std::string& unknown_fields() const {
+    return _unknown_fields_.GetNoArena(
+        &::google::protobuf::internal::GetEmptyStringAlreadyInited());
   }
 
-  inline ::google::protobuf::UnknownFieldSet* mutable_unknown_fields() {
-    return _internal_metadata_.mutable_unknown_fields();
+  inline ::std::string* mutable_unknown_fields() {
+    return _unknown_fields_.MutableNoArena(
+        &::google::protobuf::internal::GetEmptyStringAlreadyInited());
   }
 
-  static const ::google::protobuf::Descriptor* descriptor();
   static const StoreCapacity& default_instance();
+
+  #ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  // Returns the internal default instance pointer. This function can
+  // return NULL thus should not be used by the user. This is intended
+  // for Protobuf internal code. Please use default_instance() declared
+  // above instead.
+  static inline const StoreCapacity* internal_default_instance() {
+    return default_instance_;
+  }
+  #endif
 
   void Swap(StoreCapacity* other);
 
@@ -425,8 +600,7 @@ class StoreCapacity : public ::google::protobuf::Message {
   inline StoreCapacity* New() const { return New(NULL); }
 
   StoreCapacity* New(::google::protobuf::Arena* arena) const;
-  void CopyFrom(const ::google::protobuf::Message& from);
-  void MergeFrom(const ::google::protobuf::Message& from);
+  void CheckTypeAndMergeFrom(const ::google::protobuf::MessageLite& from);
   void CopyFrom(const StoreCapacity& from);
   void MergeFrom(const StoreCapacity& from);
   void Clear();
@@ -437,7 +611,7 @@ class StoreCapacity : public ::google::protobuf::Message {
       ::google::protobuf::io::CodedInputStream* input);
   void SerializeWithCachedSizes(
       ::google::protobuf::io::CodedOutputStream* output) const;
-  ::google::protobuf::uint8* SerializeWithCachedSizesToArray(::google::protobuf::uint8* output) const;
+  void DiscardUnknownFields();
   int GetCachedSize() const { return _cached_size_; }
   private:
   void SharedCtor();
@@ -446,14 +620,14 @@ class StoreCapacity : public ::google::protobuf::Message {
   void InternalSwap(StoreCapacity* other);
   private:
   inline ::google::protobuf::Arena* GetArenaNoVirtual() const {
-    return _internal_metadata_.arena();
+    return _arena_ptr_;
   }
-  inline void* MaybeArenaPtr() const {
-    return _internal_metadata_.raw_arena_ptr();
+  inline ::google::protobuf::Arena* MaybeArenaPtr() const {
+    return _arena_ptr_;
   }
   public:
 
-  ::google::protobuf::Metadata GetMetadata() const;
+  ::std::string GetTypeName() const;
 
   // nested types ----------------------------------------------------
 
@@ -489,13 +663,19 @@ class StoreCapacity : public ::google::protobuf::Message {
   inline void set_has_range_count();
   inline void clear_has_range_count();
 
-  ::google::protobuf::internal::InternalMetadataWithArena _internal_metadata_;
+  ::google::protobuf::internal::ArenaStringPtr _unknown_fields_;
+  ::google::protobuf::Arena* _arena_ptr_;
+
   ::google::protobuf::uint32 _has_bits_[1];
   mutable int _cached_size_;
   ::google::protobuf::int64 capacity_;
   ::google::protobuf::int64 available_;
   ::google::protobuf::int32 range_count_;
+  #ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  friend void  protobuf_AddDesc_cockroach_2froachpb_2fmetadata_2eproto_impl();
+  #else
   friend void  protobuf_AddDesc_cockroach_2froachpb_2fmetadata_2eproto();
+  #endif
   friend void protobuf_AssignDesc_cockroach_2froachpb_2fmetadata_2eproto();
   friend void protobuf_ShutdownFile_cockroach_2froachpb_2fmetadata_2eproto();
 
@@ -504,7 +684,7 @@ class StoreCapacity : public ::google::protobuf::Message {
 };
 // -------------------------------------------------------------------
 
-class NodeDescriptor : public ::google::protobuf::Message {
+class NodeDescriptor : public ::google::protobuf::MessageLite /* @@protoc_insertion_point(class_definition:cockroach.roachpb.NodeDescriptor) */ {
  public:
   NodeDescriptor();
   virtual ~NodeDescriptor();
@@ -516,16 +696,27 @@ class NodeDescriptor : public ::google::protobuf::Message {
     return *this;
   }
 
-  inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const {
-    return _internal_metadata_.unknown_fields();
+  inline const ::std::string& unknown_fields() const {
+    return _unknown_fields_.GetNoArena(
+        &::google::protobuf::internal::GetEmptyStringAlreadyInited());
   }
 
-  inline ::google::protobuf::UnknownFieldSet* mutable_unknown_fields() {
-    return _internal_metadata_.mutable_unknown_fields();
+  inline ::std::string* mutable_unknown_fields() {
+    return _unknown_fields_.MutableNoArena(
+        &::google::protobuf::internal::GetEmptyStringAlreadyInited());
   }
 
-  static const ::google::protobuf::Descriptor* descriptor();
   static const NodeDescriptor& default_instance();
+
+  #ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  // Returns the internal default instance pointer. This function can
+  // return NULL thus should not be used by the user. This is intended
+  // for Protobuf internal code. Please use default_instance() declared
+  // above instead.
+  static inline const NodeDescriptor* internal_default_instance() {
+    return default_instance_;
+  }
+  #endif
 
   void Swap(NodeDescriptor* other);
 
@@ -534,8 +725,7 @@ class NodeDescriptor : public ::google::protobuf::Message {
   inline NodeDescriptor* New() const { return New(NULL); }
 
   NodeDescriptor* New(::google::protobuf::Arena* arena) const;
-  void CopyFrom(const ::google::protobuf::Message& from);
-  void MergeFrom(const ::google::protobuf::Message& from);
+  void CheckTypeAndMergeFrom(const ::google::protobuf::MessageLite& from);
   void CopyFrom(const NodeDescriptor& from);
   void MergeFrom(const NodeDescriptor& from);
   void Clear();
@@ -546,7 +736,7 @@ class NodeDescriptor : public ::google::protobuf::Message {
       ::google::protobuf::io::CodedInputStream* input);
   void SerializeWithCachedSizes(
       ::google::protobuf::io::CodedOutputStream* output) const;
-  ::google::protobuf::uint8* SerializeWithCachedSizesToArray(::google::protobuf::uint8* output) const;
+  void DiscardUnknownFields();
   int GetCachedSize() const { return _cached_size_; }
   private:
   void SharedCtor();
@@ -555,14 +745,14 @@ class NodeDescriptor : public ::google::protobuf::Message {
   void InternalSwap(NodeDescriptor* other);
   private:
   inline ::google::protobuf::Arena* GetArenaNoVirtual() const {
-    return _internal_metadata_.arena();
+    return _arena_ptr_;
   }
-  inline void* MaybeArenaPtr() const {
-    return _internal_metadata_.raw_arena_ptr();
+  inline ::google::protobuf::Arena* MaybeArenaPtr() const {
+    return _arena_ptr_;
   }
   public:
 
-  ::google::protobuf::Metadata GetMetadata() const;
+  ::std::string GetTypeName() const;
 
   // nested types ----------------------------------------------------
 
@@ -602,13 +792,19 @@ class NodeDescriptor : public ::google::protobuf::Message {
   inline void set_has_attrs();
   inline void clear_has_attrs();
 
-  ::google::protobuf::internal::InternalMetadataWithArena _internal_metadata_;
+  ::google::protobuf::internal::ArenaStringPtr _unknown_fields_;
+  ::google::protobuf::Arena* _arena_ptr_;
+
   ::google::protobuf::uint32 _has_bits_[1];
   mutable int _cached_size_;
   ::cockroach::util::UnresolvedAddr* address_;
   ::cockroach::roachpb::Attributes* attrs_;
   ::google::protobuf::int32 node_id_;
+  #ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  friend void  protobuf_AddDesc_cockroach_2froachpb_2fmetadata_2eproto_impl();
+  #else
   friend void  protobuf_AddDesc_cockroach_2froachpb_2fmetadata_2eproto();
+  #endif
   friend void protobuf_AssignDesc_cockroach_2froachpb_2fmetadata_2eproto();
   friend void protobuf_ShutdownFile_cockroach_2froachpb_2fmetadata_2eproto();
 
@@ -617,7 +813,7 @@ class NodeDescriptor : public ::google::protobuf::Message {
 };
 // -------------------------------------------------------------------
 
-class StoreDescriptor : public ::google::protobuf::Message {
+class StoreDescriptor : public ::google::protobuf::MessageLite /* @@protoc_insertion_point(class_definition:cockroach.roachpb.StoreDescriptor) */ {
  public:
   StoreDescriptor();
   virtual ~StoreDescriptor();
@@ -629,16 +825,27 @@ class StoreDescriptor : public ::google::protobuf::Message {
     return *this;
   }
 
-  inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const {
-    return _internal_metadata_.unknown_fields();
+  inline const ::std::string& unknown_fields() const {
+    return _unknown_fields_.GetNoArena(
+        &::google::protobuf::internal::GetEmptyStringAlreadyInited());
   }
 
-  inline ::google::protobuf::UnknownFieldSet* mutable_unknown_fields() {
-    return _internal_metadata_.mutable_unknown_fields();
+  inline ::std::string* mutable_unknown_fields() {
+    return _unknown_fields_.MutableNoArena(
+        &::google::protobuf::internal::GetEmptyStringAlreadyInited());
   }
 
-  static const ::google::protobuf::Descriptor* descriptor();
   static const StoreDescriptor& default_instance();
+
+  #ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  // Returns the internal default instance pointer. This function can
+  // return NULL thus should not be used by the user. This is intended
+  // for Protobuf internal code. Please use default_instance() declared
+  // above instead.
+  static inline const StoreDescriptor* internal_default_instance() {
+    return default_instance_;
+  }
+  #endif
 
   void Swap(StoreDescriptor* other);
 
@@ -647,8 +854,7 @@ class StoreDescriptor : public ::google::protobuf::Message {
   inline StoreDescriptor* New() const { return New(NULL); }
 
   StoreDescriptor* New(::google::protobuf::Arena* arena) const;
-  void CopyFrom(const ::google::protobuf::Message& from);
-  void MergeFrom(const ::google::protobuf::Message& from);
+  void CheckTypeAndMergeFrom(const ::google::protobuf::MessageLite& from);
   void CopyFrom(const StoreDescriptor& from);
   void MergeFrom(const StoreDescriptor& from);
   void Clear();
@@ -659,7 +865,7 @@ class StoreDescriptor : public ::google::protobuf::Message {
       ::google::protobuf::io::CodedInputStream* input);
   void SerializeWithCachedSizes(
       ::google::protobuf::io::CodedOutputStream* output) const;
-  ::google::protobuf::uint8* SerializeWithCachedSizesToArray(::google::protobuf::uint8* output) const;
+  void DiscardUnknownFields();
   int GetCachedSize() const { return _cached_size_; }
   private:
   void SharedCtor();
@@ -668,14 +874,14 @@ class StoreDescriptor : public ::google::protobuf::Message {
   void InternalSwap(StoreDescriptor* other);
   private:
   inline ::google::protobuf::Arena* GetArenaNoVirtual() const {
-    return _internal_metadata_.arena();
+    return _arena_ptr_;
   }
-  inline void* MaybeArenaPtr() const {
-    return _internal_metadata_.raw_arena_ptr();
+  inline ::google::protobuf::Arena* MaybeArenaPtr() const {
+    return _arena_ptr_;
   }
   public:
 
-  ::google::protobuf::Metadata GetMetadata() const;
+  ::std::string GetTypeName() const;
 
   // nested types ----------------------------------------------------
 
@@ -726,19 +932,143 @@ class StoreDescriptor : public ::google::protobuf::Message {
   inline void set_has_capacity();
   inline void clear_has_capacity();
 
-  ::google::protobuf::internal::InternalMetadataWithArena _internal_metadata_;
+  ::google::protobuf::internal::ArenaStringPtr _unknown_fields_;
+  ::google::protobuf::Arena* _arena_ptr_;
+
   ::google::protobuf::uint32 _has_bits_[1];
   mutable int _cached_size_;
   ::cockroach::roachpb::Attributes* attrs_;
   ::cockroach::roachpb::NodeDescriptor* node_;
   ::cockroach::roachpb::StoreCapacity* capacity_;
   ::google::protobuf::int32 store_id_;
+  #ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  friend void  protobuf_AddDesc_cockroach_2froachpb_2fmetadata_2eproto_impl();
+  #else
   friend void  protobuf_AddDesc_cockroach_2froachpb_2fmetadata_2eproto();
+  #endif
   friend void protobuf_AssignDesc_cockroach_2froachpb_2fmetadata_2eproto();
   friend void protobuf_ShutdownFile_cockroach_2froachpb_2fmetadata_2eproto();
 
   void InitAsDefaultInstance();
   static StoreDescriptor* default_instance_;
+};
+// -------------------------------------------------------------------
+
+class StoreDeadReplicas : public ::google::protobuf::MessageLite /* @@protoc_insertion_point(class_definition:cockroach.roachpb.StoreDeadReplicas) */ {
+ public:
+  StoreDeadReplicas();
+  virtual ~StoreDeadReplicas();
+
+  StoreDeadReplicas(const StoreDeadReplicas& from);
+
+  inline StoreDeadReplicas& operator=(const StoreDeadReplicas& from) {
+    CopyFrom(from);
+    return *this;
+  }
+
+  inline const ::std::string& unknown_fields() const {
+    return _unknown_fields_.GetNoArena(
+        &::google::protobuf::internal::GetEmptyStringAlreadyInited());
+  }
+
+  inline ::std::string* mutable_unknown_fields() {
+    return _unknown_fields_.MutableNoArena(
+        &::google::protobuf::internal::GetEmptyStringAlreadyInited());
+  }
+
+  static const StoreDeadReplicas& default_instance();
+
+  #ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  // Returns the internal default instance pointer. This function can
+  // return NULL thus should not be used by the user. This is intended
+  // for Protobuf internal code. Please use default_instance() declared
+  // above instead.
+  static inline const StoreDeadReplicas* internal_default_instance() {
+    return default_instance_;
+  }
+  #endif
+
+  void Swap(StoreDeadReplicas* other);
+
+  // implements Message ----------------------------------------------
+
+  inline StoreDeadReplicas* New() const { return New(NULL); }
+
+  StoreDeadReplicas* New(::google::protobuf::Arena* arena) const;
+  void CheckTypeAndMergeFrom(const ::google::protobuf::MessageLite& from);
+  void CopyFrom(const StoreDeadReplicas& from);
+  void MergeFrom(const StoreDeadReplicas& from);
+  void Clear();
+  bool IsInitialized() const;
+
+  int ByteSize() const;
+  bool MergePartialFromCodedStream(
+      ::google::protobuf::io::CodedInputStream* input);
+  void SerializeWithCachedSizes(
+      ::google::protobuf::io::CodedOutputStream* output) const;
+  void DiscardUnknownFields();
+  int GetCachedSize() const { return _cached_size_; }
+  private:
+  void SharedCtor();
+  void SharedDtor();
+  void SetCachedSize(int size) const;
+  void InternalSwap(StoreDeadReplicas* other);
+  private:
+  inline ::google::protobuf::Arena* GetArenaNoVirtual() const {
+    return _arena_ptr_;
+  }
+  inline ::google::protobuf::Arena* MaybeArenaPtr() const {
+    return _arena_ptr_;
+  }
+  public:
+
+  ::std::string GetTypeName() const;
+
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+
+  // optional int32 store_id = 1;
+  bool has_store_id() const;
+  void clear_store_id();
+  static const int kStoreIdFieldNumber = 1;
+  ::google::protobuf::int32 store_id() const;
+  void set_store_id(::google::protobuf::int32 value);
+
+  // repeated .cockroach.roachpb.ReplicaIdent replicas = 2;
+  int replicas_size() const;
+  void clear_replicas();
+  static const int kReplicasFieldNumber = 2;
+  const ::cockroach::roachpb::ReplicaIdent& replicas(int index) const;
+  ::cockroach::roachpb::ReplicaIdent* mutable_replicas(int index);
+  ::cockroach::roachpb::ReplicaIdent* add_replicas();
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaIdent >*
+      mutable_replicas();
+  const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaIdent >&
+      replicas() const;
+
+  // @@protoc_insertion_point(class_scope:cockroach.roachpb.StoreDeadReplicas)
+ private:
+  inline void set_has_store_id();
+  inline void clear_has_store_id();
+
+  ::google::protobuf::internal::ArenaStringPtr _unknown_fields_;
+  ::google::protobuf::Arena* _arena_ptr_;
+
+  ::google::protobuf::uint32 _has_bits_[1];
+  mutable int _cached_size_;
+  ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaIdent > replicas_;
+  ::google::protobuf::int32 store_id_;
+  #ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  friend void  protobuf_AddDesc_cockroach_2froachpb_2fmetadata_2eproto_impl();
+  #else
+  friend void  protobuf_AddDesc_cockroach_2froachpb_2fmetadata_2eproto();
+  #endif
+  friend void protobuf_AssignDesc_cockroach_2froachpb_2fmetadata_2eproto();
+  friend void protobuf_ShutdownFile_cockroach_2froachpb_2fmetadata_2eproto();
+
+  void InitAsDefaultInstance();
+  static StoreDeadReplicas* default_instance_;
 };
 // ===================================================================
 
@@ -777,6 +1107,7 @@ inline void Attributes::set_attrs(int index, const char* value, size_t size) {
   // @@protoc_insertion_point(field_set_pointer:cockroach.roachpb.Attributes.attrs)
 }
 inline ::std::string* Attributes::add_attrs() {
+  // @@protoc_insertion_point(field_add_mutable:cockroach.roachpb.Attributes.attrs)
   return attrs_.Add();
 }
 inline void Attributes::add_attrs(const ::std::string& value) {
@@ -880,6 +1211,82 @@ inline void ReplicaDescriptor::set_replica_id(::google::protobuf::int32 value) {
 
 // -------------------------------------------------------------------
 
+// ReplicaIdent
+
+// optional int64 range_id = 1;
+inline bool ReplicaIdent::has_range_id() const {
+  return (_has_bits_[0] & 0x00000001u) != 0;
+}
+inline void ReplicaIdent::set_has_range_id() {
+  _has_bits_[0] |= 0x00000001u;
+}
+inline void ReplicaIdent::clear_has_range_id() {
+  _has_bits_[0] &= ~0x00000001u;
+}
+inline void ReplicaIdent::clear_range_id() {
+  range_id_ = GOOGLE_LONGLONG(0);
+  clear_has_range_id();
+}
+inline ::google::protobuf::int64 ReplicaIdent::range_id() const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.ReplicaIdent.range_id)
+  return range_id_;
+}
+inline void ReplicaIdent::set_range_id(::google::protobuf::int64 value) {
+  set_has_range_id();
+  range_id_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.roachpb.ReplicaIdent.range_id)
+}
+
+// optional .cockroach.roachpb.ReplicaDescriptor replica = 2;
+inline bool ReplicaIdent::has_replica() const {
+  return (_has_bits_[0] & 0x00000002u) != 0;
+}
+inline void ReplicaIdent::set_has_replica() {
+  _has_bits_[0] |= 0x00000002u;
+}
+inline void ReplicaIdent::clear_has_replica() {
+  _has_bits_[0] &= ~0x00000002u;
+}
+inline void ReplicaIdent::clear_replica() {
+  if (replica_ != NULL) replica_->::cockroach::roachpb::ReplicaDescriptor::Clear();
+  clear_has_replica();
+}
+inline const ::cockroach::roachpb::ReplicaDescriptor& ReplicaIdent::replica() const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.ReplicaIdent.replica)
+#ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  return replica_ != NULL ? *replica_ : *default_instance().replica_;
+#else
+  return replica_ != NULL ? *replica_ : *default_instance_->replica_;
+#endif
+}
+inline ::cockroach::roachpb::ReplicaDescriptor* ReplicaIdent::mutable_replica() {
+  set_has_replica();
+  if (replica_ == NULL) {
+    replica_ = new ::cockroach::roachpb::ReplicaDescriptor;
+  }
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.ReplicaIdent.replica)
+  return replica_;
+}
+inline ::cockroach::roachpb::ReplicaDescriptor* ReplicaIdent::release_replica() {
+  // @@protoc_insertion_point(field_release:cockroach.roachpb.ReplicaIdent.replica)
+  clear_has_replica();
+  ::cockroach::roachpb::ReplicaDescriptor* temp = replica_;
+  replica_ = NULL;
+  return temp;
+}
+inline void ReplicaIdent::set_allocated_replica(::cockroach::roachpb::ReplicaDescriptor* replica) {
+  delete replica_;
+  replica_ = replica;
+  if (replica) {
+    set_has_replica();
+  } else {
+    clear_has_replica();
+  }
+  // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.ReplicaIdent.replica)
+}
+
+// -------------------------------------------------------------------
+
 // RangeDescriptor
 
 // optional int64 range_id = 1;
@@ -946,6 +1353,7 @@ inline ::std::string* RangeDescriptor::mutable_start_key() {
   return start_key_.MutableNoArena(&::google::protobuf::internal::GetEmptyStringAlreadyInited());
 }
 inline ::std::string* RangeDescriptor::release_start_key() {
+  // @@protoc_insertion_point(field_release:cockroach.roachpb.RangeDescriptor.start_key)
   clear_has_start_key();
   return start_key_.ReleaseNoArena(&::google::protobuf::internal::GetEmptyStringAlreadyInited());
 }
@@ -999,6 +1407,7 @@ inline ::std::string* RangeDescriptor::mutable_end_key() {
   return end_key_.MutableNoArena(&::google::protobuf::internal::GetEmptyStringAlreadyInited());
 }
 inline ::std::string* RangeDescriptor::release_end_key() {
+  // @@protoc_insertion_point(field_release:cockroach.roachpb.RangeDescriptor.end_key)
   clear_has_end_key();
   return end_key_.ReleaseNoArena(&::google::protobuf::internal::GetEmptyStringAlreadyInited());
 }
@@ -1186,7 +1595,11 @@ inline void NodeDescriptor::clear_address() {
 }
 inline const ::cockroach::util::UnresolvedAddr& NodeDescriptor::address() const {
   // @@protoc_insertion_point(field_get:cockroach.roachpb.NodeDescriptor.address)
+#ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  return address_ != NULL ? *address_ : *default_instance().address_;
+#else
   return address_ != NULL ? *address_ : *default_instance_->address_;
+#endif
 }
 inline ::cockroach::util::UnresolvedAddr* NodeDescriptor::mutable_address() {
   set_has_address();
@@ -1197,6 +1610,7 @@ inline ::cockroach::util::UnresolvedAddr* NodeDescriptor::mutable_address() {
   return address_;
 }
 inline ::cockroach::util::UnresolvedAddr* NodeDescriptor::release_address() {
+  // @@protoc_insertion_point(field_release:cockroach.roachpb.NodeDescriptor.address)
   clear_has_address();
   ::cockroach::util::UnresolvedAddr* temp = address_;
   address_ = NULL;
@@ -1229,7 +1643,11 @@ inline void NodeDescriptor::clear_attrs() {
 }
 inline const ::cockroach::roachpb::Attributes& NodeDescriptor::attrs() const {
   // @@protoc_insertion_point(field_get:cockroach.roachpb.NodeDescriptor.attrs)
+#ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  return attrs_ != NULL ? *attrs_ : *default_instance().attrs_;
+#else
   return attrs_ != NULL ? *attrs_ : *default_instance_->attrs_;
+#endif
 }
 inline ::cockroach::roachpb::Attributes* NodeDescriptor::mutable_attrs() {
   set_has_attrs();
@@ -1240,6 +1658,7 @@ inline ::cockroach::roachpb::Attributes* NodeDescriptor::mutable_attrs() {
   return attrs_;
 }
 inline ::cockroach::roachpb::Attributes* NodeDescriptor::release_attrs() {
+  // @@protoc_insertion_point(field_release:cockroach.roachpb.NodeDescriptor.attrs)
   clear_has_attrs();
   ::cockroach::roachpb::Attributes* temp = attrs_;
   attrs_ = NULL;
@@ -1300,7 +1719,11 @@ inline void StoreDescriptor::clear_attrs() {
 }
 inline const ::cockroach::roachpb::Attributes& StoreDescriptor::attrs() const {
   // @@protoc_insertion_point(field_get:cockroach.roachpb.StoreDescriptor.attrs)
+#ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  return attrs_ != NULL ? *attrs_ : *default_instance().attrs_;
+#else
   return attrs_ != NULL ? *attrs_ : *default_instance_->attrs_;
+#endif
 }
 inline ::cockroach::roachpb::Attributes* StoreDescriptor::mutable_attrs() {
   set_has_attrs();
@@ -1311,6 +1734,7 @@ inline ::cockroach::roachpb::Attributes* StoreDescriptor::mutable_attrs() {
   return attrs_;
 }
 inline ::cockroach::roachpb::Attributes* StoreDescriptor::release_attrs() {
+  // @@protoc_insertion_point(field_release:cockroach.roachpb.StoreDescriptor.attrs)
   clear_has_attrs();
   ::cockroach::roachpb::Attributes* temp = attrs_;
   attrs_ = NULL;
@@ -1343,7 +1767,11 @@ inline void StoreDescriptor::clear_node() {
 }
 inline const ::cockroach::roachpb::NodeDescriptor& StoreDescriptor::node() const {
   // @@protoc_insertion_point(field_get:cockroach.roachpb.StoreDescriptor.node)
+#ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  return node_ != NULL ? *node_ : *default_instance().node_;
+#else
   return node_ != NULL ? *node_ : *default_instance_->node_;
+#endif
 }
 inline ::cockroach::roachpb::NodeDescriptor* StoreDescriptor::mutable_node() {
   set_has_node();
@@ -1354,6 +1782,7 @@ inline ::cockroach::roachpb::NodeDescriptor* StoreDescriptor::mutable_node() {
   return node_;
 }
 inline ::cockroach::roachpb::NodeDescriptor* StoreDescriptor::release_node() {
+  // @@protoc_insertion_point(field_release:cockroach.roachpb.StoreDescriptor.node)
   clear_has_node();
   ::cockroach::roachpb::NodeDescriptor* temp = node_;
   node_ = NULL;
@@ -1386,7 +1815,11 @@ inline void StoreDescriptor::clear_capacity() {
 }
 inline const ::cockroach::roachpb::StoreCapacity& StoreDescriptor::capacity() const {
   // @@protoc_insertion_point(field_get:cockroach.roachpb.StoreDescriptor.capacity)
+#ifdef GOOGLE_PROTOBUF_NO_STATIC_INITIALIZER
+  return capacity_ != NULL ? *capacity_ : *default_instance().capacity_;
+#else
   return capacity_ != NULL ? *capacity_ : *default_instance_->capacity_;
+#endif
 }
 inline ::cockroach::roachpb::StoreCapacity* StoreDescriptor::mutable_capacity() {
   set_has_capacity();
@@ -1397,6 +1830,7 @@ inline ::cockroach::roachpb::StoreCapacity* StoreDescriptor::mutable_capacity() 
   return capacity_;
 }
 inline ::cockroach::roachpb::StoreCapacity* StoreDescriptor::release_capacity() {
+  // @@protoc_insertion_point(field_release:cockroach.roachpb.StoreDescriptor.capacity)
   clear_has_capacity();
   ::cockroach::roachpb::StoreCapacity* temp = capacity_;
   capacity_ = NULL;
@@ -1413,7 +1847,69 @@ inline void StoreDescriptor::set_allocated_capacity(::cockroach::roachpb::StoreC
   // @@protoc_insertion_point(field_set_allocated:cockroach.roachpb.StoreDescriptor.capacity)
 }
 
+// -------------------------------------------------------------------
+
+// StoreDeadReplicas
+
+// optional int32 store_id = 1;
+inline bool StoreDeadReplicas::has_store_id() const {
+  return (_has_bits_[0] & 0x00000001u) != 0;
+}
+inline void StoreDeadReplicas::set_has_store_id() {
+  _has_bits_[0] |= 0x00000001u;
+}
+inline void StoreDeadReplicas::clear_has_store_id() {
+  _has_bits_[0] &= ~0x00000001u;
+}
+inline void StoreDeadReplicas::clear_store_id() {
+  store_id_ = 0;
+  clear_has_store_id();
+}
+inline ::google::protobuf::int32 StoreDeadReplicas::store_id() const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.StoreDeadReplicas.store_id)
+  return store_id_;
+}
+inline void StoreDeadReplicas::set_store_id(::google::protobuf::int32 value) {
+  set_has_store_id();
+  store_id_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.roachpb.StoreDeadReplicas.store_id)
+}
+
+// repeated .cockroach.roachpb.ReplicaIdent replicas = 2;
+inline int StoreDeadReplicas::replicas_size() const {
+  return replicas_.size();
+}
+inline void StoreDeadReplicas::clear_replicas() {
+  replicas_.Clear();
+}
+inline const ::cockroach::roachpb::ReplicaIdent& StoreDeadReplicas::replicas(int index) const {
+  // @@protoc_insertion_point(field_get:cockroach.roachpb.StoreDeadReplicas.replicas)
+  return replicas_.Get(index);
+}
+inline ::cockroach::roachpb::ReplicaIdent* StoreDeadReplicas::mutable_replicas(int index) {
+  // @@protoc_insertion_point(field_mutable:cockroach.roachpb.StoreDeadReplicas.replicas)
+  return replicas_.Mutable(index);
+}
+inline ::cockroach::roachpb::ReplicaIdent* StoreDeadReplicas::add_replicas() {
+  // @@protoc_insertion_point(field_add:cockroach.roachpb.StoreDeadReplicas.replicas)
+  return replicas_.Add();
+}
+inline ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaIdent >*
+StoreDeadReplicas::mutable_replicas() {
+  // @@protoc_insertion_point(field_mutable_list:cockroach.roachpb.StoreDeadReplicas.replicas)
+  return &replicas_;
+}
+inline const ::google::protobuf::RepeatedPtrField< ::cockroach::roachpb::ReplicaIdent >&
+StoreDeadReplicas::replicas() const {
+  // @@protoc_insertion_point(field_list:cockroach.roachpb.StoreDeadReplicas.replicas)
+  return replicas_;
+}
+
 #endif  // !PROTOBUF_INLINE_NOT_IN_HEADERS
+// -------------------------------------------------------------------
+
+// -------------------------------------------------------------------
+
 // -------------------------------------------------------------------
 
 // -------------------------------------------------------------------

@@ -21,11 +21,15 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"runtime/pprof"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -38,15 +42,25 @@ import (
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/server"
+	"github.com/cockroachdb/cockroach/server/serverpb"
+	"github.com/cockroachdb/cockroach/storage/engine"
+	"github.com/cockroachdb/cockroach/util/envutil"
+	"github.com/cockroachdb/cockroach/util/grpcutil"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/sdnotify"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 
 	"github.com/spf13/cobra"
 )
 
 var errMissingParams = errors.New("missing or invalid parameters")
+
+// jemallocHeapDump is an optional function to be called at heap dump time.
+// This will be non-nil when jemalloc is linked in with profiling enabled.
+// The function takes a filename to write the profile to.
+var jemallocHeapDump func(string) error
 
 // panicGuard wraps an errorless command into one wrapping panics into errors.
 // This simplifies error handling for many commands for which more elaborate
@@ -101,7 +115,7 @@ func setDefaultCacheSize(ctx *server.Context) {
 }
 
 func initInsecure() error {
-	if !cliContext.Insecure || insecure.isSet {
+	if !serverCtx.Insecure || insecure.isSet {
 		return nil
 	}
 	// The --insecure flag was not specified on the command line, verify that the
@@ -115,17 +129,172 @@ func initInsecure() error {
 			return fmt.Errorf("specify --insecure to listen on external address %s", connHost)
 		}
 	} else {
-		cliContext.Addr = net.JoinHostPort("localhost", connPort)
-		cliContext.HTTPAddr = net.JoinHostPort("localhost", httpPort)
+		serverCtx.Addr = net.JoinHostPort("localhost", connPort)
+		serverCtx.HTTPAddr = net.JoinHostPort("localhost", httpPort)
 	}
 	return nil
+}
+
+func initMemProfile(dir string) {
+	memProfileInterval := envutil.EnvOrDefaultDuration("memprof_interval", -1)
+	if memProfileInterval < 0 {
+		return
+	}
+	if min := time.Second; memProfileInterval < min {
+		log.Infof(context.TODO(), "fixing excessively short memory profiling interval: %s -> %s",
+			memProfileInterval, min)
+		memProfileInterval = min
+	}
+
+	if jemallocHeapDump != nil {
+		log.Infof(context.TODO(), "writing go and jemalloc memory profiles to %s every %s", dir, memProfileInterval)
+	} else {
+		log.Infof(context.TODO(), "writing go only memory profiles to %s every %s", dir, memProfileInterval)
+		log.Infof(context.TODO(), `to enable jmalloc profiling: "export MALLOC_CONF=prof:true" or "ln -s prof:true /etc/malloc.conf"`)
+	}
+
+	go func() {
+		t := time.NewTicker(memProfileInterval)
+		defer t.Stop()
+
+		for {
+			<-t.C
+
+			func() {
+				const format = "2006-01-02T15_04_05.999"
+				suffix := timeutil.Now().Format(format)
+
+				// Try jemalloc heap profile first, we only log errors.
+				if jemallocHeapDump != nil {
+					jepath := filepath.Join(dir, "jeprof."+suffix)
+					if err := jemallocHeapDump(jepath); err != nil {
+						log.Warningf(context.TODO(), "error writing jemalloc heap %s: %s", jepath, err)
+					}
+				}
+
+				path := filepath.Join(dir, "memprof."+suffix)
+				// Try writing a go heap profile.
+				f, err := os.Create(path)
+				if err != nil {
+					log.Warningf(context.TODO(), "error creating go heap file %s", err)
+					return
+				}
+				defer f.Close()
+				if err = pprof.WriteHeapProfile(f); err != nil {
+					log.Warningf(context.TODO(), "error writing go heap %s: %s", path, err)
+					return
+				}
+			}()
+		}
+	}()
+}
+
+func initCPUProfile(dir string) {
+	cpuProfileInterval := envutil.EnvOrDefaultDuration("cpuprof_interval", -1)
+	if cpuProfileInterval < 0 {
+		return
+	}
+	if min := time.Second; cpuProfileInterval < min {
+		log.Infof(context.TODO(), "fixing excessively short cpu profiling interval: %s -> %s",
+			cpuProfileInterval, min)
+		cpuProfileInterval = min
+	}
+
+	go func() {
+		t := time.NewTicker(cpuProfileInterval)
+		defer t.Stop()
+
+		var currentProfile *os.File
+		defer func() {
+			if currentProfile != nil {
+				pprof.StopCPUProfile()
+				currentProfile.Close()
+			}
+		}()
+
+		for {
+			func() {
+				const format = "2006-01-02T15_04_05.999"
+				suffix := timeutil.Now().Add(cpuProfileInterval).Format(format)
+				f, err := os.Create(filepath.Join(dir, "cpuprof."+suffix))
+				if err != nil {
+					log.Warningf(context.TODO(), "error creating go cpu file %s", err)
+					return
+				}
+
+				// Stop the current profile if it exists.
+				if currentProfile != nil {
+					pprof.StopCPUProfile()
+					currentProfile.Close()
+					currentProfile = nil
+				}
+
+				// Start the new profile.
+				if err := pprof.StartCPUProfile(f); err != nil {
+					log.Warningf(context.TODO(), "unable to start cpu profile: %v", err)
+					f.Close()
+					return
+				}
+				currentProfile = f
+			}()
+
+			<-t.C
+		}
+	}()
+}
+
+func initBlockProfile() {
+	// Enable the block profile for a sample of mutex and channel operations.
+	// Smaller values provide more accurate profiles but are more
+	// expensive. 0 and 1 are special: 0 disables the block profile and
+	// 1 captures 100% of block events. For other values, the profiler
+	// will sample one event per X nanoseconds spent blocking.
+	//
+	// The block profile can be viewed with `go tool pprof
+	// http://HOST:PORT/debug/pprof/block`
+	d := envutil.EnvOrDefaultInt64("block_profile_rate",
+		1000000 /* 1 sample per millisecond spent blocking */)
+	runtime.SetBlockProfileRate(int(d))
+}
+
+func initCheckpointing(engines []engine.Engine) {
+	checkpointInterval := envutil.EnvOrDefaultDuration("checkpoint_interval", -1)
+	if checkpointInterval < 0 {
+		return
+	}
+	if min := 10 * time.Second; checkpointInterval < min {
+		log.Infof(context.TODO(), "fixing excessively short checkpointing interval: %s -> %s",
+			checkpointInterval, min)
+		checkpointInterval = min
+	}
+
+	go func() {
+		t := time.NewTicker(checkpointInterval)
+		defer t.Stop()
+
+		for {
+			<-t.C
+
+			const format = "2006-01-02T15_04_05"
+			dir := timeutil.Now().Format(format)
+			start := timeutil.Now()
+			for _, e := range engines {
+				// Note that when dir is relative (as it is here) it is appended to the
+				// engine's data directory.
+				if err := e.Checkpoint(dir); err != nil {
+					log.Warning(context.TODO(), err)
+				}
+			}
+			log.Infof(context.TODO(), "created checkpoint %s: %.1fms", dir, timeutil.Since(start).Seconds()*1000)
+		}
+	}()
 }
 
 // runStart starts the cockroach node using --store as the list of
 // storage devices ("stores") on this machine and --join as the list
 // of other active nodes used to join this node to the cockroach
 // cluster, if this is its first time connecting.
-func runStart(_ *cobra.Command, _ []string) error {
+func runStart(_ *cobra.Command, args []string) error {
 	if startBackground {
 		return rerunBackground()
 	}
@@ -134,7 +303,7 @@ func runStart(_ *cobra.Command, _ []string) error {
 		return err
 	}
 
-	// Default the log directory to the the "logs" subdirectory of the first
+	// Default the log directory to the "logs" subdirectory of the first
 	// non-memory store. We only do this for the "start" command which is why
 	// this work occurs here and not in an OnInitialize function.
 	//
@@ -142,7 +311,7 @@ func runStart(_ *cobra.Command, _ []string) error {
 	// will be created in $TMPDIR instead of their expected location.
 	f := flag.Lookup("log-dir")
 	if !log.DirSet() {
-		for _, spec := range cliContext.Stores.Specs {
+		for _, spec := range serverCtx.Stores.Specs {
 			if spec.InMemory {
 				continue
 			}
@@ -154,57 +323,68 @@ func runStart(_ *cobra.Command, _ []string) error {
 	}
 
 	// Make sure the path exists.
-	if err := os.MkdirAll(f.Value.String(), 0755); err != nil {
+	logDir := f.Value.String()
+	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return err
 	}
 
 	// We log build information to stdout (for the short summary), but also
 	// to stderr to coincide with the full logs.
 	info := build.GetInfo()
-	log.Infof(info.Short())
+	log.Infof(context.TODO(), info.Short())
+
+	initMemProfile(f.Value.String())
+	initCPUProfile(f.Value.String())
+	initBlockProfile()
 
 	// Default user for servers.
-	cliContext.User = security.NodeUser
+	serverCtx.User = security.NodeUser
 
-	stopper := stop.NewStopper()
-	if err := cliContext.InitStores(stopper); err != nil {
+	stopper := initBacktrace(logDir)
+	if err := serverCtx.InitStores(stopper); err != nil {
 		return fmt.Errorf("failed to initialize stores: %s", err)
 	}
 
-	if err := cliContext.InitNode(); err != nil {
+	if err := serverCtx.InitNode(); err != nil {
 		return fmt.Errorf("failed to initialize node: %s", err)
 	}
 
-	log.Info("starting cockroach node")
-	s, err := server.NewServer(&cliContext.Context, stopper)
+	log.Info(context.TODO(), "starting cockroach node")
+	s, err := server.NewServer(serverCtx, stopper)
 	if err != nil {
 		return fmt.Errorf("failed to start Cockroach server: %s", err)
-	}
-
-	// We don't do this in NewServer since we don't want it in tests.
-	if err := s.SetupReportingURLs(); err != nil {
-		return err
 	}
 
 	if err := s.Start(); err != nil {
 		return fmt.Errorf("cockroach server exited with error: %s", err)
 	}
 
-	pgURL, err := cliContext.PGURL(connUser)
+	// We don't do this in (*server.Server).Start() because we don't want it
+	// in tests.
+	if !envutil.EnvOrDefaultBool("skip_update_check", false) {
+		s.PeriodicallyCheckForUpdates()
+	}
+
+	initCheckpointing(serverCtx.Engines)
+
+	pgURL, err := serverCtx.PGURL(connUser)
 	if err != nil {
 		return err
 	}
 
 	tw := tabwriter.NewWriter(os.Stdout, 2, 1, 2, ' ', 0)
 	fmt.Fprintf(tw, "build:\t%s @ %s (%s)\n", info.Tag, info.Time, info.GoVersion)
-	fmt.Fprintf(tw, "admin:\t%s\n", cliContext.AdminURL())
+	fmt.Fprintf(tw, "admin:\t%s\n", serverCtx.AdminURL())
 	fmt.Fprintf(tw, "sql:\t%s\n", pgURL)
-	if len(cliContext.SocketFile) != 0 {
-		fmt.Fprintf(tw, "socket:\t%s\n", cliContext.SocketFile)
+	if len(serverCtx.SocketFile) != 0 {
+		fmt.Fprintf(tw, "socket:\t%s\n", serverCtx.SocketFile)
 	}
 	fmt.Fprintf(tw, "logs:\t%s\n", flag.Lookup("log-dir").Value)
-	for i, spec := range cliContext.Stores.Specs {
+	for i, spec := range serverCtx.Stores.Specs {
 		fmt.Fprintf(tw, "store[%d]:\t%s\n", i, spec)
+	}
+	for i, address := range serverCtx.JoinList {
+		fmt.Fprintf(tw, "join[%d]:\t%s\n", i, address)
 	}
 	if err := tw.Flush(); err != nil {
 		return err
@@ -222,14 +402,14 @@ func runStart(_ *cobra.Command, _ []string) error {
 	case <-signalCh:
 		go func() {
 			if _, err := s.Drain(server.GracefulDrainModes); err != nil {
-				log.Warning(err)
+				log.Warning(context.TODO(), err)
 			}
 			s.Stop()
 		}()
 	}
 
 	const msgDrain = "initiating graceful shutdown of server"
-	log.Info(msgDrain)
+	log.Info(context.TODO(), msgDrain)
 	fmt.Fprintln(os.Stdout, msgDrain)
 
 	go func() {
@@ -239,9 +419,9 @@ func runStart(_ *cobra.Command, _ []string) error {
 			select {
 			case <-ticker.C:
 				if log.V(1) {
-					log.Infof("running tasks:\n%s", stopper.RunningTasks())
+					log.Infof(context.TODO(), "running tasks:\n%s", stopper.RunningTasks())
 				}
-				log.Infof("%d running tasks", stopper.NumTasks())
+				log.Infof(context.TODO(), "%d running tasks", stopper.NumTasks())
 			case <-stopper.ShouldStop():
 				return
 			}
@@ -250,12 +430,12 @@ func runStart(_ *cobra.Command, _ []string) error {
 
 	select {
 	case <-signalCh:
-		log.Errorf("second signal received, initiating hard shutdown")
+		log.Errorf(context.TODO(), "second signal received, initiating hard shutdown")
 	case <-time.After(time.Minute):
-		log.Errorf("time limit reached, initiating hard shutdown")
+		log.Errorf(context.TODO(), "time limit reached, initiating hard shutdown")
 	case <-stopper.IsStopped():
 		const msgDone = "server drained and shutdown completed"
-		log.Infof(msgDone)
+		log.Infof(context.TODO(), msgDone)
 		fmt.Fprintln(os.Stdout, msgDone)
 	}
 	log.Flush()
@@ -264,11 +444,18 @@ func runStart(_ *cobra.Command, _ []string) error {
 
 // rerunBackground restarts the current process in the background.
 func rerunBackground() error {
-	args := append([]string(nil), os.Args...)
-	// TODO(bdarnell): this looks silly in ps. Try to remove the
-	// `--background` flag instead of adding a second flag to reverse
-	// it.
-	args = append(args, "--background=false")
+	args := make([]string, 0, len(os.Args))
+	foundBackground := false
+	for _, arg := range os.Args {
+		if arg == "--background" || strings.HasPrefix(arg, "--background=") {
+			foundBackground = true
+			continue
+		}
+		args = append(args, arg)
+	}
+	if !foundBackground {
+		args = append(args, "--background=false")
+	}
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -277,21 +464,21 @@ func rerunBackground() error {
 
 func getGRPCConn() (*grpc.ClientConn, *stop.Stopper, error) {
 	stopper := stop.NewStopper()
-	rpcContext := rpc.NewContext(&cliContext.Context.Context, hlc.NewClock(hlc.UnixNano),
+	rpcContext := rpc.NewContext(serverCtx.Context, hlc.NewClock(hlc.UnixNano),
 		stopper)
-	conn, err := rpcContext.GRPCDial(cliContext.Addr)
+	conn, err := rpcContext.GRPCDial(serverCtx.Addr)
 	if err != nil {
 		return nil, nil, err
 	}
 	return conn, stopper, nil
 }
 
-func getAdminClient() (server.AdminClient, *stop.Stopper, error) {
+func getAdminClient() (serverpb.AdminClient, *stop.Stopper, error) {
 	conn, stopper, err := getGRPCConn()
 	if err != nil {
 		return nil, nil, err
 	}
-	return server.NewAdminClient(conn), stopper, nil
+	return serverpb.NewAdminClient(conn), stopper, nil
 }
 
 func stopperContext(stopper *stop.Stopper) context.Context {
@@ -313,6 +500,31 @@ completed, the server exits.
 	RunE:         runQuit,
 }
 
+// doShutdown attempts to trigger server shutdown. The string return
+// value, if non-empty, indicates a reason why the state may be
+// uncertain and thus that it may make sense to retry the shutdown.
+func doShutdown(c serverpb.AdminClient, ctx context.Context, onModes []int32) (string, error) {
+	stream, err := c.Drain(ctx, &serverpb.DrainRequest{
+		On:       onModes,
+		Shutdown: true,
+	})
+	if err != nil {
+		return "", err
+	}
+	_, err = stream.Recv()
+	if err == nil {
+		for {
+			if _, err := stream.Recv(); !grpcutil.IsClosedConnection(err) {
+				return "", err
+			}
+			break
+		}
+		fmt.Println("ok")
+		return "", nil
+	}
+	return fmt.Sprintf("%v", err), nil
+}
+
 // runQuit accesses the quit shutdown path.
 func runQuit(_ *cobra.Command, _ []string) error {
 	onModes := make([]int32, len(server.GracefulDrainModes))
@@ -325,14 +537,23 @@ func runQuit(_ *cobra.Command, _ []string) error {
 		return err
 	}
 	defer stopper.Stop()
-	if _, err := c.Drain(stopperContext(stopper),
-		&server.DrainRequest{
-			On:       onModes,
-			Shutdown: true,
-		}); err != nil {
+
+	ctx := stopperContext(stopper)
+
+	retry, err := doShutdown(c, ctx, onModes)
+	if err != nil {
 		return err
 	}
-	fmt.Println("ok")
+	if retry != "" {
+		fmt.Fprintf(os.Stderr, "graceful shutdown failed, proceeding with hard shutdown: %s\n", retry)
+
+		// Not passing drain modes tells the server to not bother and go
+		// straight to shutdown.
+		_, err := doShutdown(c, ctx, nil)
+		if err != nil {
+			return fmt.Errorf("hard shutdown failed: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -357,9 +578,20 @@ func runFreezeCluster(_ *cobra.Command, _ []string) error {
 		return err
 	}
 	defer stopper.Stop()
-	if _, err := c.ClusterFreeze(stopperContext(stopper),
-		&server.ClusterFreezeRequest{Freeze: !undoFreezeCluster}); err != nil {
+	stream, err := c.ClusterFreeze(stopperContext(stopper),
+		&serverpb.ClusterFreezeRequest{Freeze: !undoFreezeCluster})
+	if err != nil {
 		return err
+	}
+	for {
+		resp, err := stream.Recv()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+		fmt.Println(resp.Message)
 	}
 	fmt.Println("ok")
 	return nil

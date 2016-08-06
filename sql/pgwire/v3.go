@@ -29,10 +29,11 @@ import (
 	"github.com/cockroachdb/cockroach/sql"
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/tracing"
 	"github.com/cockroachdb/pq/oid"
+	"github.com/pkg/errors"
 )
 
 //go:generate stringer -type=clientMessageType
@@ -43,28 +44,29 @@ type serverMessageType byte
 
 // http://www.postgresql.org/docs/9.4/static/protocol-message-formats.html
 const (
-	clientMsgSimpleQuery clientMessageType = 'Q'
-	clientMsgParse       clientMessageType = 'P'
-	clientMsgTerminate   clientMessageType = 'X'
-	clientMsgDescribe    clientMessageType = 'D'
-	clientMsgSync        clientMessageType = 'S'
-	clientMsgClose       clientMessageType = 'C'
 	clientMsgBind        clientMessageType = 'B'
+	clientMsgClose       clientMessageType = 'C'
+	clientMsgDescribe    clientMessageType = 'D'
 	clientMsgExecute     clientMessageType = 'E'
 	clientMsgFlush       clientMessageType = 'H'
+	clientMsgParse       clientMessageType = 'P'
+	clientMsgSimpleQuery clientMessageType = 'Q'
+	clientMsgSync        clientMessageType = 'S'
+	clientMsgTerminate   clientMessageType = 'X'
 
 	serverMsgAuth                 serverMessageType = 'R'
+	serverMsgBindComplete         serverMessageType = '2'
 	serverMsgCommandComplete      serverMessageType = 'C'
+	serverMsgCloseComplete        serverMessageType = '3'
 	serverMsgDataRow              serverMessageType = 'D'
+	serverMsgEmptyQuery           serverMessageType = 'I'
 	serverMsgErrorResponse        serverMessageType = 'E'
+	serverMsgNoData               serverMessageType = 'n'
+	serverMsgParameterDescription serverMessageType = 't'
+	serverMsgParameterStatus      serverMessageType = 'S'
 	serverMsgParseComplete        serverMessageType = '1'
 	serverMsgReady                serverMessageType = 'Z'
 	serverMsgRowDescription       serverMessageType = 'T'
-	serverMsgEmptyQuery           serverMessageType = 'I'
-	serverMsgParameterDescription serverMessageType = 't'
-	serverMsgBindComplete         serverMessageType = '2'
-	serverMsgParameterStatus      serverMessageType = 'S'
-	serverMsgNoData               serverMessageType = 'n'
 )
 
 //go:generate stringer -type=serverErrFieldType
@@ -92,20 +94,15 @@ const (
 	authOK int32 = 0
 )
 
-// preparedStatement is a SQL statement that has been parsed and the types
-// of arguments and results have been determined.
-type preparedStatement struct {
-	query       string
-	inTypes     []oid.Oid
-	columns     []sql.ResultColumn
-	portalNames map[string]struct{}
+// preparedStatementMeta is pgwire-specific metadata which is attached to each
+// sql.PreparedStatement on a v3Conn's sql.Session.
+type preparedStatementMeta struct {
+	inTypes []oid.Oid
 }
 
-// preparedPortal is a preparedStatement that has been bound with parameters.
-type preparedPortal struct {
-	stmt       preparedStatement
-	stmtName   string
-	params     []parser.Datum
+// preparedPortalMeta is pgwire-specific metadata which is attached to each
+// sql.PreparedPortal on a v3Conn's sql.Session.
+type preparedPortalMeta struct {
 	outFormats []formatCode
 }
 
@@ -119,9 +116,6 @@ type v3Conn struct {
 	tagBuf   [64]byte
 	session  *sql.Session
 
-	preparedStatements map[string]preparedStatement
-	preparedPortals    map[string]preparedPortal
-
 	// The logic governing these guys is hairy, and is not sufficiently
 	// specified in documentation. Consult the sources before you modify:
 	// https://github.com/postgres/postgres/blob/master/src/backend/tcop/postgres.c
@@ -131,25 +125,23 @@ type v3Conn struct {
 }
 
 func makeV3Conn(
-	conn net.Conn, executor *sql.Executor,
-	metrics *serverMetrics, sessionArgs sql.SessionArgs) v3Conn {
+	conn net.Conn, executor *sql.Executor, metrics *serverMetrics, sessionArgs sql.SessionArgs,
+) v3Conn {
 	return v3Conn{
-		conn:               conn,
-		rd:                 bufio.NewReader(conn),
-		wr:                 bufio.NewWriter(conn),
-		executor:           executor,
-		writeBuf:           writeBuffer{bytecount: metrics.bytesOutCount},
-		preparedStatements: make(map[string]preparedStatement),
-		preparedPortals:    make(map[string]preparedPortal),
-		metrics:            metrics,
-		session:            sql.NewSession(sessionArgs, executor, conn.RemoteAddr()),
+		conn:     conn,
+		rd:       bufio.NewReader(conn),
+		wr:       bufio.NewWriter(conn),
+		executor: executor,
+		writeBuf: writeBuffer{bytecount: metrics.bytesOutCount},
+		metrics:  metrics,
+		session:  sql.NewSession(executor.Ctx(), sessionArgs, executor, conn.RemoteAddr()),
 	}
 }
 
 func (c *v3Conn) finish() {
 	// This is better than always flushing on error.
 	if err := c.wr.Flush(); err != nil {
-		log.Error(err)
+		log.Error(context.TODO(), err)
 	}
 	_ = c.conn.Close()
 	c.session.Finish()
@@ -161,14 +153,14 @@ func parseOptions(data []byte) (sql.SessionArgs, error) {
 	for {
 		key, err := buf.getString()
 		if err != nil {
-			return sql.SessionArgs{}, util.Errorf("error reading option key: %s", err)
+			return sql.SessionArgs{}, errors.Errorf("error reading option key: %s", err)
 		}
 		if len(key) == 0 {
 			break
 		}
 		value, err := buf.getString()
 		if err != nil {
-			return sql.SessionArgs{}, util.Errorf("error reading option value: %s", err)
+			return sql.SessionArgs{}, errors.Errorf("error reading option value: %s", err)
 		}
 		switch key {
 		case "database":
@@ -177,16 +169,28 @@ func parseOptions(data []byte) (sql.SessionArgs, error) {
 			args.User = value
 		default:
 			if log.V(1) {
-				log.Warningf("unrecognized configuration parameter %q", key)
+				log.Warningf(context.TODO(), "unrecognized configuration parameter %q", key)
 			}
 		}
 	}
 	return args, nil
 }
 
+// statusReportParams is a static mapping from run-time parameters to their respective
+// hard-coded values, each of which is to be returned as part of the status report
+// during connection initialization.
+var statusReportParams = map[string]string{
+	"client_encoding": "UTF8",
+	"DateStyle":       "ISO",
+	// The latest version of the docs that was consulted during the development
+	// of this package. We specify this version to avoid having to support old
+	// code paths which various client tools fall back to if they can't
+	// determine that the server is new enough.
+	"server_version": "9.5.0",
+}
+
 func (c *v3Conn) serve(authenticationHook func(string, bool) error) error {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := c.session.Ctx()
 
 	if authenticationHook != nil {
 		if err := authenticationHook(c.session.User, true /* public */); err != nil {
@@ -198,19 +202,10 @@ func (c *v3Conn) serve(authenticationHook func(string, bool) error) error {
 	if err := c.writeBuf.finishMsg(c.wr); err != nil {
 		return err
 	}
-	for key, value := range map[string]string{
-		"client_encoding": "UTF8",
-		"DateStyle":       "ISO",
-		// The latest version of the docs that was consulted during the development
-		// of this package. We specify this version to avoid having to support old
-		// code paths which various client tools fall back to if they can't
-		// determine that the server is new enough.
-		"server_version": "9.5.0",
-	} {
+	for key, value := range statusReportParams {
 		c.writeBuf.initMsg(serverMsgParameterStatus)
-		for _, str := range [...]string{key, value} {
-			c.writeBuf.writeTerminatedString(str)
-		}
+		c.writeBuf.writeTerminatedString(key)
+		c.writeBuf.writeTerminatedString(value)
 		if err := c.writeBuf.finishMsg(c.wr); err != nil {
 			return err
 		}
@@ -241,7 +236,7 @@ func (c *v3Conn) serve(authenticationHook func(string, bool) error) error {
 			}
 
 			if log.V(2) {
-				log.Infof("pgwire: %s: %q", serverMsgReady, txnStatus)
+				log.Infof(context.TODO(), "pgwire: %s: %q", serverMsgReady, txnStatus)
 			}
 			c.writeBuf.writeByte(txnStatus)
 			if err := c.writeBuf.finishMsg(c.wr); err != nil {
@@ -263,12 +258,12 @@ func (c *v3Conn) serve(authenticationHook func(string, bool) error) error {
 		// any messages until we get a sync.
 		if c.ignoreTillSync && typ != clientMsgSync {
 			if log.V(2) {
-				log.Infof("pgwire: ignoring %s till sync", typ)
+				log.Infof(context.TODO(), "pgwire: ignoring %s till sync", typ)
 			}
 			continue
 		}
 		if log.V(2) {
-			log.Infof("pgwire: processing %s", typ)
+			log.Infof(context.TODO(), "pgwire: processing %s", typ)
 		}
 		switch typ {
 		case clientMsgSync:
@@ -307,7 +302,8 @@ func (c *v3Conn) serve(authenticationHook func(string, bool) error) error {
 			err = c.wr.Flush()
 
 		default:
-			err = c.sendInternalError(fmt.Sprintf("unrecognized client message type %s", typ))
+			err = c.sendErrorWithCode(pgerror.CodeProtocolViolationError, sqlbase.MakeSrcCtx(0),
+				fmt.Sprintf("unrecognized client message type %s", typ))
 		}
 		if err != nil {
 			return err
@@ -331,7 +327,7 @@ func (c *v3Conn) handleParse(ctx context.Context, buf *readBuffer) error {
 	}
 	// The unnamed prepared statement can be freely overwritten.
 	if name != "" {
-		if _, ok := c.preparedStatements[name]; ok {
+		if c.session.PreparedStatements.Exists(name) {
 			return c.sendInternalError(fmt.Sprintf("prepared statement %q already exists", name))
 		}
 	}
@@ -339,20 +335,24 @@ func (c *v3Conn) handleParse(ctx context.Context, buf *readBuffer) error {
 	if err != nil {
 		return err
 	}
-	numParamTypes, err := buf.getInt16()
+	// The client may provide type information for (some of) the
+	// placeholders. Read this first.
+	numQArgTypes, err := buf.getUint16()
 	if err != nil {
 		return err
 	}
-
-	inTypeHints := make([]oid.Oid, numParamTypes)
+	inTypeHints := make([]oid.Oid, numQArgTypes)
 	for i := range inTypeHints {
-		typ, err := buf.getInt32()
+		typ, err := buf.getUint32()
 		if err != nil {
 			return err
 		}
 		inTypeHints[i] = oid.Oid(typ)
 	}
-	args := make(parser.MapArgs)
+	// Prepare the mapping of SQL placeholder names to
+	// types. Pre-populate it with the type hints received from the
+	// client, if any.
+	sqlTypeHints := make(parser.PlaceholderTypes)
 	for i, t := range inTypeHints {
 		if t == 0 {
 			continue
@@ -361,53 +361,51 @@ func (c *v3Conn) handleParse(ctx context.Context, buf *readBuffer) error {
 		if !ok {
 			return c.sendInternalError(fmt.Sprintf("unknown oid type: %v", t))
 		}
-		args[fmt.Sprint(i+1)] = v
+		sqlTypeHints[fmt.Sprint(i+1)] = v
 	}
-	cols, err := c.executor.Prepare(ctx, query, c.session, args)
+	// Create the new PreparedStatement in the connection's Session.
+	stmt, err := c.session.PreparedStatements.New(ctx, c.executor, name, query, sqlTypeHints)
 	if err != nil {
 		return c.sendError(err)
 	}
-	pq := preparedStatement{
-		query:       query,
-		inTypes:     make([]oid.Oid, 0, len(args)),
-		portalNames: make(map[string]struct{}),
-		columns:     cols,
-	}
-	for k, v := range args {
+	// Convert the inferred SQL types back to an array of pgwire Oids.
+	inTypes := make([]oid.Oid, 0, len(stmt.SQLTypes))
+	for k, t := range stmt.SQLTypes {
 		i, err := strconv.Atoi(k)
-		if err != nil {
-			return c.sendInternalError(fmt.Sprintf("non-integer parameter: %s", k))
+		if err != nil || i < 1 {
+			return c.sendInternalError(fmt.Sprintf("invalid placeholder name: $%s", k))
 		}
-		// ValArgs are 1-indexed, pq.inTypes are 0-indexed.
+		// Placeholder names are 1-indexed; the arrays in the protocol are
+		// 0-indexed.
 		i--
-		if i < 0 {
-			return c.sendInternalError(fmt.Sprintf("there is no parameter $%s", k))
-		}
-		// Grow pq.inTypes to be at least as large as i.
-		for j := len(pq.inTypes); j <= i; j++ {
-			pq.inTypes = append(pq.inTypes, 0)
+		// Grow inTypes to be at least as large as i. Prepopulate all
+		// slots with the hints provided, if any.
+		for j := len(inTypes); j <= i; j++ {
+			inTypes = append(inTypes, 0)
 			if j < len(inTypeHints) {
-				pq.inTypes[j] = inTypeHints[j]
+				inTypes[j] = inTypeHints[j]
 			}
 		}
-		// OID to Datum is not a 1-1 mapping (for example, int4 and int8 both map
-		// to DummyInt), so we need to maintain the types sent by the client.
-		if pq.inTypes[i] != 0 {
+		// OID to Datum is not a 1-1 mapping (for example, int4 and int8
+		// both map to TypeInt), so we need to maintain the types sent by
+		// the client.
+		if inTypes[i] != 0 {
 			continue
 		}
-		id, ok := datumToOid[reflect.TypeOf(v)]
+		id, ok := datumToOid[reflect.TypeOf(t)]
 		if !ok {
-			return c.sendInternalError(fmt.Sprintf("unknown datum type: %s", v.Type()))
+			return c.sendInternalError(fmt.Sprintf("unknown datum type: %s", t.Type()))
 		}
-		pq.inTypes[i] = id
+		inTypes[i] = id
 	}
-	for i := range pq.inTypes {
-		if pq.inTypes[i] == 0 {
+	for i, t := range inTypes {
+		if t == 0 {
 			return c.sendInternalError(
-				fmt.Sprintf("could not determine data type of parameter $%d", i+1))
+				fmt.Sprintf("could not determine data type of placeholder $%d", i+1))
 		}
 	}
-	c.preparedStatements[name] = pq
+	// Attach pgwire-specific metadata to the PreparedStatement.
+	stmt.ProtocolMeta = preparedStatementMeta{inTypes: inTypes}
 	c.writeBuf.initMsg(serverMsgParseComplete)
 	return c.writeBuf.finishMsg(c.wr)
 }
@@ -423,33 +421,32 @@ func (c *v3Conn) handleDescribe(buf *readBuffer) error {
 	}
 	switch typ {
 	case prepareStatement:
-		stmt, ok := c.preparedStatements[name]
+		stmt, ok := c.session.PreparedStatements.Get(name)
 		if !ok {
 			return c.sendInternalError(fmt.Sprintf("unknown prepared statement %q", name))
 		}
+
+		stmtMeta := stmt.ProtocolMeta.(preparedStatementMeta)
 		c.writeBuf.initMsg(serverMsgParameterDescription)
-		c.writeBuf.putInt16(int16(len(stmt.inTypes)))
-		for _, t := range stmt.inTypes {
+		c.writeBuf.putInt16(int16(len(stmtMeta.inTypes)))
+		for _, t := range stmtMeta.inTypes {
 			c.writeBuf.putInt32(int32(t))
 		}
 		if err := c.writeBuf.finishMsg(c.wr); err != nil {
 			return err
 		}
 
-		return c.sendRowDescription(stmt.columns, nil)
+		return c.sendRowDescription(stmt.Columns, nil)
 	case preparePortal:
-		prtl, ok := c.preparedPortals[name]
+		portal, ok := c.session.PreparedPortals.Get(name)
 		if !ok {
 			return c.sendInternalError(fmt.Sprintf("unknown portal %q", name))
 		}
-		stmt, ok := c.preparedStatements[prtl.stmtName]
-		if !ok {
-			return c.sendInternalError(fmt.Sprintf("unknown prepared statement %q", name))
-		}
 
-		return c.sendRowDescription(stmt.columns, prtl.outFormats)
+		portalMeta := portal.ProtocolMeta.(preparedPortalMeta)
+		return c.sendRowDescription(portal.Stmt.Columns, portalMeta.outFormats)
 	default:
-		return util.Errorf("unknown describe type: %s", typ)
+		return errors.Errorf("unknown describe type: %s", typ)
 	}
 }
 
@@ -464,23 +461,14 @@ func (c *v3Conn) handleClose(buf *readBuffer) error {
 	}
 	switch typ {
 	case prepareStatement:
-		if stmt, ok := c.preparedStatements[name]; ok {
-			for portalName := range stmt.portalNames {
-				delete(c.preparedPortals, portalName)
-			}
-		}
-		delete(c.preparedStatements, name)
+		c.session.PreparedStatements.Delete(name)
 	case preparePortal:
-		if prtl, ok := c.preparedPortals[name]; ok {
-			if stmt, ok := c.preparedStatements[prtl.stmtName]; ok {
-				delete(stmt.portalNames, name)
-			}
-		}
-		delete(c.preparedPortals, name)
+		c.session.PreparedPortals.Delete(name)
 	default:
-		return util.Errorf("unknown close type: %s", typ)
+		return errors.Errorf("unknown close type: %s", typ)
 	}
-	return nil
+	c.writeBuf.initMsg(serverMsgCloseComplete)
+	return c.writeBuf.finishMsg(c.wr)
 }
 
 func (c *v3Conn) handleBind(buf *readBuffer) error {
@@ -490,7 +478,7 @@ func (c *v3Conn) handleBind(buf *readBuffer) error {
 	}
 	// The unnamed portal can be freely overwritten.
 	if portalName != "" {
-		if _, ok := c.preparedPortals[portalName]; ok {
+		if c.session.PreparedPortals.Exists(portalName) {
 			return c.sendInternalError(fmt.Sprintf("portal %q already exists", portalName))
 		}
 	}
@@ -498,78 +486,80 @@ func (c *v3Conn) handleBind(buf *readBuffer) error {
 	if err != nil {
 		return err
 	}
-	stmt, ok := c.preparedStatements[statementName]
+	stmt, ok := c.session.PreparedStatements.Get(statementName)
 	if !ok {
 		return c.sendInternalError(fmt.Sprintf("unknown prepared statement %q", statementName))
 	}
 
-	numParams := int16(len(stmt.inTypes))
-	paramFormatCodes := make([]formatCode, numParams)
-
-	// From the docs on number of parameter format codes to bind:
-	// This can be zero to indicate that there are no parameters or that the
-	// parameters all use the default format (text); or one, in which case the
-	// specified format code is applied to all parameters; or it can equal the
-	// actual number of parameters.
+	stmtMeta := stmt.ProtocolMeta.(preparedStatementMeta)
+	numQArgs := uint16(len(stmtMeta.inTypes))
+	qArgFormatCodes := make([]formatCode, numQArgs)
+	// From the docs on number of argument format codes to bind:
+	// This can be zero to indicate that there are no arguments or that the
+	// arguments all use the default format (text); or one, in which case the
+	// specified format code is applied to all arguments; or it can equal the
+	// actual number of arguments.
 	// http://www.postgresql.org/docs/current/static/protocol-message-formats.html
-	numParamFormatCodes, err := buf.getInt16()
+	numQArgFormatCodes, err := buf.getUint16()
 	if err != nil {
 		return err
 	}
-	switch numParamFormatCodes {
+	switch numQArgFormatCodes {
 	case 0:
 	case 1:
-		// `1` means read one code and apply it to every param.
-		c, err := buf.getInt16()
+		// `1` means read one code and apply it to every argument.
+		c, err := buf.getUint16()
 		if err != nil {
 			return err
 		}
 		fmtCode := formatCode(c)
-		for i := range paramFormatCodes {
-			paramFormatCodes[i] = fmtCode
+		for i := range qArgFormatCodes {
+			qArgFormatCodes[i] = fmtCode
 		}
-	case numParams:
-		// Read one format code for each param and apply it to that param.
-		for i := range paramFormatCodes {
-			c, err := buf.getInt16()
+	case numQArgs:
+		// Read one format code for each argument and apply it to that argument.
+		for i := range qArgFormatCodes {
+			c, err := buf.getUint16()
 			if err != nil {
 				return err
 			}
-			paramFormatCodes[i] = formatCode(c)
+			qArgFormatCodes[i] = formatCode(c)
 		}
 	default:
-		return c.sendInternalError(fmt.Sprintf("wrong number of format codes specified: %d for %d paramaters", numParamFormatCodes, numParams))
+		return c.sendInternalError(fmt.Sprintf("wrong number of format codes specified: %d for %d arguments", numQArgFormatCodes, numQArgs))
 	}
 
-	numValues, err := buf.getInt16()
+	numValues, err := buf.getUint16()
 	if err != nil {
 		return err
 	}
-	if numValues != numParams {
-		return c.sendInternalError(fmt.Sprintf("expected %d parameters, got %d", numParams, numValues))
+	if numValues != numQArgs {
+		return c.sendInternalError(fmt.Sprintf("expected %d arguments, got %d", numQArgs, numValues))
 	}
-	params := make([]parser.Datum, numParams)
-	for i, t := range stmt.inTypes {
-		plen, err := buf.getInt32()
+	qargs := parser.QueryArguments{}
+	for i, t := range stmtMeta.inTypes {
+		plen, err := buf.getUint32()
 		if err != nil {
 			return err
 		}
-		if plen == -1 {
-			// TODO(mjibson): a NULL parameter, figure out what this should do
+		k := fmt.Sprint(i + 1)
+		if int32(plen) == -1 {
+			// The argument is a NULL value.
+			qargs[k] = parser.DNull
 			continue
 		}
 		b, err := buf.getBytes(int(plen))
 		if err != nil {
 			return err
 		}
-		d, err := decodeOidDatum(t, paramFormatCodes[i], b)
+		d, err := decodeOidDatum(t, qArgFormatCodes[i], b)
 		if err != nil {
-			return c.sendInternalError(fmt.Sprintf("param $%d: %s", i+1, err))
+			return c.sendInternalError(fmt.Sprintf("error in argument for $%d: %s", i+1, err))
 		}
-		params[i] = d
+		qargs[k] = d
 	}
 
-	numColumns := int16(len(stmt.columns))
+	numColumns := uint16(len(stmt.Columns))
 	columnFormatCodes := make([]formatCode, numColumns)
 
 	// From the docs on number of result-column format codes to bind:
@@ -579,7 +569,7 @@ func (c *v3Conn) handleBind(buf *readBuffer) error {
 	// (if any); or it can equal the actual number of result columns of the
 	// query.
 	// http://www.postgresql.org/docs/current/static/protocol-message-formats.html
-	numColumnFormatCodes, err := buf.getInt16()
+	numColumnFormatCodes, err := buf.getUint16()
 	if err != nil {
 		return err
 	}
@@ -587,18 +577,18 @@ func (c *v3Conn) handleBind(buf *readBuffer) error {
 	case 0:
 	case 1:
 		// Read one code and apply it to every column.
-		c, err := buf.getInt16()
+		c, err := buf.getUint16()
 		if err != nil {
 			return err
 		}
 		fmtCode := formatCode(c)
 		for i := range columnFormatCodes {
-			columnFormatCodes[i] = formatCode(fmtCode)
+			columnFormatCodes[i] = fmtCode
 		}
 	case numColumns:
 		// Read one format code for each column and apply it to that column.
 		for i := range columnFormatCodes {
-			c, err := buf.getInt16()
+			c, err := buf.getUint16()
 			if err != nil {
 				return err
 			}
@@ -607,13 +597,10 @@ func (c *v3Conn) handleBind(buf *readBuffer) error {
 	default:
 		return c.sendInternalError(fmt.Sprintf("expected 0, 1, or %d for number of format codes, got %d", numColumns, numColumnFormatCodes))
 	}
-	stmt.portalNames[portalName] = struct{}{}
-	c.preparedPortals[portalName] = preparedPortal{
-		stmt:       stmt,
-		stmtName:   statementName,
-		params:     params,
-		outFormats: columnFormatCodes,
-	}
+	// Create the new PreparedPortal in the connection's Session.
+	portal := c.session.PreparedPortals.New(portalName, stmt, qargs)
+	// Attach pgwire-specific metadata to the PreparedPortal.
+	portal.ProtocolMeta = preparedPortalMeta{outFormats: columnFormatCodes}
 	c.writeBuf.initMsg(serverMsgBindComplete)
 	return c.writeBuf.finishMsg(c.wr)
 }
@@ -623,28 +610,35 @@ func (c *v3Conn) handleExecute(ctx context.Context, buf *readBuffer) error {
 	if err != nil {
 		return err
 	}
-	portal, ok := c.preparedPortals[portalName]
+	portal, ok := c.session.PreparedPortals.Get(portalName)
 	if !ok {
 		return c.sendInternalError(fmt.Sprintf("unknown portal %q", portalName))
 	}
-	limit, err := buf.getInt32()
+	limit, err := buf.getUint32()
 	if err != nil {
 		return err
 	}
 
-	return c.executeStatements(ctx, portal.stmt.query, portal.params, portal.outFormats, false, limit)
+	stmt := portal.Stmt
+	portalMeta := portal.ProtocolMeta.(preparedPortalMeta)
+	pinfo := parser.PlaceholderInfo{
+		Types:  stmt.SQLTypes,
+		Values: portal.Qargs,
+	}
+
+	return c.executeStatements(ctx, stmt.Query, &pinfo, portalMeta.outFormats, false, int(limit))
 }
 
 func (c *v3Conn) executeStatements(
 	ctx context.Context,
 	stmts string,
-	params []parser.Datum,
+	pinfo *parser.PlaceholderInfo,
 	formatCodes []formatCode,
 	sendDescription bool,
-	limit int32,
+	limit int,
 ) error {
 	tracing.AnnotateTrace()
-	results := c.executor.ExecuteStatements(ctx, c.session, stmts, params)
+	results := c.executor.ExecuteStatements(c.session, stmts, pinfo)
 
 	tracing.AnnotateTrace()
 	if results.Empty {
@@ -663,7 +657,7 @@ func (c *v3Conn) sendCommandComplete(tag []byte) error {
 }
 
 func (c *v3Conn) sendError(err error) error {
-	if sqlErr, ok := err.(sql.ErrorWithPGCode); ok {
+	if sqlErr, ok := err.(sqlbase.ErrorWithPGCode); ok {
 		return c.sendErrorWithCode(sqlErr.Code(), sqlErr.SrcContext(), err.Error())
 	}
 	return c.sendInternalError(err.Error())
@@ -672,12 +666,12 @@ func (c *v3Conn) sendError(err error) error {
 // TODO(andrei): Figure out the correct codes to send for all the errors
 // in this file and remove this function.
 func (c *v3Conn) sendInternalError(errToSend string) error {
-	return c.sendErrorWithCode(pgerror.CodeInternalError, sql.SrcCtx{}, errToSend)
+	return c.sendErrorWithCode(pgerror.CodeInternalError, sqlbase.MakeSrcCtx(1), errToSend)
 }
 
 // errCode is a postgres error code, plus our extensions.
 // See http://www.postgresql.org/docs/9.5/static/errcodes-appendix.html
-func (c *v3Conn) sendErrorWithCode(errCode string, errCtx sql.SrcCtx, errToSend string) error {
+func (c *v3Conn) sendErrorWithCode(errCode string, errCtx sqlbase.SrcCtx, errToSend string) error {
 	if c.doingExtendedQueryMessage {
 		c.ignoreTillSync = true
 	}
@@ -715,7 +709,7 @@ func (c *v3Conn) sendErrorWithCode(errCode string, errCtx sql.SrcCtx, errToSend 
 	return c.wr.Flush()
 }
 
-func (c *v3Conn) sendResponse(results sql.ResultList, formatCodes []formatCode, sendDescription bool, limit int32) error {
+func (c *v3Conn) sendResponse(results sql.ResultList, formatCodes []formatCode, sendDescription bool, limit int) error {
 	if len(results) == 0 {
 		return c.sendCommandComplete(nil)
 	}
@@ -726,7 +720,7 @@ func (c *v3Conn) sendResponse(results sql.ResultList, formatCodes []formatCode, 
 			}
 			break
 		}
-		if limit != 0 && len(result.Rows) > int(limit) {
+		if limit != 0 && len(result.Rows) > limit {
 			if err := c.sendInternalError(fmt.Sprintf("execute row count limits not supported: %d of %d", limit, len(result.Rows))); err != nil {
 				return err
 			}
@@ -772,7 +766,7 @@ func (c *v3Conn) sendResponse(results sql.ResultList, formatCodes []formatCode, 
 					case formatBinary:
 						c.writeBuf.writeBinaryDatum(col)
 					default:
-						c.writeBuf.setError(util.Errorf("unsupported format code %s", fmtCode))
+						c.writeBuf.setError(errors.Errorf("unsupported format code %s", fmtCode))
 					}
 				}
 				if err := c.writeBuf.finishMsg(c.wr); err != nil {
@@ -782,18 +776,18 @@ func (c *v3Conn) sendResponse(results sql.ResultList, formatCodes []formatCode, 
 
 			// Send CommandComplete.
 			tag = append(tag, ' ')
-			tag = appendUint(tag, uint(len(result.Rows)))
+			tag = strconv.AppendUint(tag, uint64(len(result.Rows)), 10)
 			if err := c.sendCommandComplete(tag); err != nil {
 				return err
 			}
 
-		// Ack messages do not have a corresponding protobuf field, so handle those
-		// with a default.
-		// This also includes DDLs which want CommandComplete as well.
-		default:
+		case parser.Ack, parser.DDL:
 			if err := c.sendCommandComplete(tag); err != nil {
 				return err
 			}
+
+		default:
+			panic(fmt.Sprintf("unexpected result type %v", result.Type))
 		}
 	}
 
@@ -810,7 +804,7 @@ func (c *v3Conn) sendRowDescription(columns []sql.ResultColumn, formatCodes []fo
 	c.writeBuf.putInt16(int16(len(columns)))
 	for i, column := range columns {
 		if log.V(2) {
-			log.Infof("pgwire writing column %s of type: %T", column.Name, column.Typ)
+			log.Infof(context.TODO(), "pgwire writing column %s of type: %T", column.Name, column.Typ)
 		}
 		c.writeBuf.writeTerminatedString(column.Name)
 
@@ -827,26 +821,4 @@ func (c *v3Conn) sendRowDescription(columns []sql.ResultColumn, formatCodes []fo
 		}
 	}
 	return c.writeBuf.finishMsg(c.wr)
-}
-
-func appendUint(in []byte, u uint) []byte {
-	var buf []byte
-	if cap(in)-len(in) >= 10 {
-		buf = in[len(in) : len(in)+10]
-	} else {
-		buf = make([]byte, 10)
-	}
-	i := len(buf)
-
-	for u >= 10 {
-		i--
-		q := u / 10
-		buf[i] = byte(u - q*10 + '0')
-		u = q
-	}
-	// u < 10
-	i--
-	buf[i] = byte(u + '0')
-
-	return append(in, buf[i:]...)
 }

@@ -1,7 +1,7 @@
 ![logo](/resource/doc/cockroach_db.png?raw=true "Cockroach Labs logo")
 
 
-[![Circle CI](https://circleci.com/gh/cockroachdb/cockroach.svg?style=svg)](https://circleci.com/gh/cockroachdb/cockroach) [![GoDoc](https://godoc.org/github.com/cockroachdb/cockroach?status.png)](https://godoc.org/github.com/cockroachdb/cockroach) ![Project Status](https://img.shields.io/badge/status-beta-yellow.svg) [![Gitter](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/cockroachdb/cockroach?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)
+[![Circle CI](https://circleci.com/gh/cockroachdb/cockroach.svg?style=svg)](https://circleci.com/gh/cockroachdb/cockroach) [![GoDoc](https://godoc.org/github.com/cockroachdb/cockroach?status.svg)](https://godoc.org/github.com/cockroachdb/cockroach) ![Project Status](https://img.shields.io/badge/status-beta-yellow.svg) [![Gitter](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/cockroachdb/cockroach?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)
 
 ## A Scalable, Survivable, Strongly-Consistent SQL Database
 
@@ -65,7 +65,7 @@ For guidance on installation, development, deployment, and administration, see o
     root@:26257> CREATE TABLE accounts (id INT PRIMARY KEY, balance DECIMAL);
     CREATE TABLE
 
-    root@26257> INSERT INTO accounts VALUES (1234, DECIMAL '10000.50');
+    root@26257> INSERT INTO accounts VALUES (1234, 10000.50);
     INSERT 1
 
     root@26257> SELECT * FROM accounts;
@@ -92,13 +92,15 @@ CockroachDB supports the PostgreSQL wire protocol, so you can use any available 
 
 ## Get In Touch
 
-When you see a bug or have improvements to suggest, please open an [issue](https://github.com/cockroachdb/cockroach/issues).
+### Report a Bug
 
-For development-related questions and anything else, there are two easy ways to get in touch:
+For filing bugs, suggesting improvements, or requesting new features, help us out by [opening an issue](https://github.com/cockroachdb/cockroach/issues/new).
 
--   [Join us on Gitter](https://gitter.im/cockroachdb/cockroach) - This is the best, most immediate way to connect with CockroachDB engineers.
+### Need Help?
 
--   [Post to our Developer mailing list](https://groups.google.com/forum/#!forum/cockroach-db) - Please join first or you messages may be held back for moderation.
+-   [CockroachDB Forum](https://forum.cockroachlabs.com/) - Ask questions, find answers, and help other users.
+
+-   [Join us on Gitter](https://gitter.im/cockroachdb/cockroach) - This is the most immediate way to connect with CockroachDB engineers.
 
 ## Contributing
 

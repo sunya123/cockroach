@@ -20,12 +20,13 @@ EXPLAIN SELECT * FROM t
 Level  Type  Description
 0      scan  t@primary
 
-query ITT colnames
+query ITTTT colnames
 EXPLAIN (VERBOSE) SELECT * FROM t
 ----
-Level  Type   Description
-0      select (k, v)@t 
-1      scan   t@primary
+Level  Type          Description      Columns Ordering
+0      select                         (k, v)  +k,unique
+1      render/filter from (t.k, t.v)  (k, v)  +k,unique
+2      scan          t@primary        (k, v)  +k,unique
 
 query ITT colnames
 EXPLAIN SELECT * FROM t WHERE k = 1 OR k = 3
@@ -50,7 +51,7 @@ EXPLAIN SELECT * FROM t LIMIT 1 OFFSET 1
 ----
 Level  Type    Description
 0      limit   count: 1, offset:  1
-1      scan    t@primary
+1      scan    t@primary (max 2 rows)
 
 query ITT colnames
 EXPLAIN SELECT DISTINCT * FROM t
@@ -66,3 +67,17 @@ Level  Type     Description
 0      limit    count: 1, offset:  1
 1      distinct k
 2      scan     t@primary
+
+statement ok
+CREATE TABLE tc (a INT, b INT, INDEX c(a))
+
+query ITTTT colnames
+EXPLAIN(VERBOSE) SELECT * FROM tc WHERE a = 10 ORDER BY b
+----
+Level Type          Description                   Columns               Ordering
+0     select                                      (a, b)                +b
+1     sort          +b                            (a, b)                +b
+2     render/filter from (tc.a, tc.b, *tc.rowid)  (a, b)                =a
+3     index-join                                  (a, b, rowid[hidden]) =a,+rowid,unique
+4     scan          tc@c /10-/11                  (a, b, rowid[hidden]) =a,+rowid,unique
+4     scan          tc@primary                    (a, b, rowid[hidden]) +rowid,unique

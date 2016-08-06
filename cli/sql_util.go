@@ -21,9 +21,16 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"io"
+	"strings"
+	"text/tabwriter"
+	"unicode"
+	"unicode/utf8"
+
+	"golang.org/x/net/context"
 
 	"github.com/olekukonko/tablewriter"
 
+	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/pq"
 )
@@ -87,11 +94,22 @@ func (c *sqlConn) Next() (*sqlRows, error) {
 	return &sqlRows{rows: rows.(sqlRowsI), conn: c}, nil
 }
 
+func (c *sqlConn) QueryRow(query string, args []driver.Value) ([]driver.Value, error) {
+	rows, err := makeQuery(query, args...)(c)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	vals := make([]driver.Value, len(rows.Columns()))
+	err = rows.Next(vals)
+	return vals, err
+}
+
 func (c *sqlConn) Close() {
 	if c.conn != nil {
 		err := c.conn.Close()
 		if err != nil && err != driver.ErrBadConn {
-			log.Info(err)
+			log.Info(context.TODO(), err)
 		}
 		c.conn = nil
 	}
@@ -128,10 +146,19 @@ func (r *sqlRows) Close() error {
 	return err
 }
 
+// Next populates values with the next row of results. []byte values are copied
+// so that subsequent calls to Next and Close do not mutate values. This
+// makes it slower than theoretically possible but the safety concerns
+// (since this is unobvious and unexpected behavior) outweigh.
 func (r *sqlRows) Next(values []driver.Value) error {
 	err := r.rows.Next(values)
 	if err == driver.ErrBadConn {
 		r.conn.Close()
+	}
+	for i, v := range values {
+		if b, ok := v.([]byte); ok {
+			values[i] = append([]byte{}, b...)
+		}
 	}
 	return err
 }
@@ -145,7 +172,7 @@ func makeSQLConn(url string) *sqlConn {
 func makeSQLClient() (*sqlConn, error) {
 	sqlURL := connURL
 	if len(connURL) == 0 {
-		u, err := cliContext.PGURL(connUser)
+		u, err := sqlCtx.PGURL(connUser)
 		if err != nil {
 			return nil, err
 		}
@@ -182,28 +209,30 @@ func makeQuery(query string, parameters ...driver.Value) queryFunc {
 
 // runQuery takes a 'query' with optional 'parameters'.
 // It runs the sql query and returns a list of columns names and a list of rows.
-func runQuery(conn *sqlConn, fn queryFunc) ([]string, [][]string, string, error) {
+func runQuery(conn *sqlConn, fn queryFunc, pretty bool) ([]string, [][]string, string, error) {
 	rows, err := fn(conn)
 	if err != nil {
 		return nil, nil, "", err
 	}
 
 	defer func() { _ = rows.Close() }()
-	return sqlRowsToStrings(rows)
+	return sqlRowsToStrings(rows, pretty)
 }
 
-// runPrettyQuery takes a 'query' with optional 'parameters'.
-// It runs the sql query and writes pretty output to 'w'.
-func runPrettyQuery(conn *sqlConn, w io.Writer, fn queryFunc) error {
+// runQueryAndFormatResults takes a 'query' with optional 'parameters'.
+// It runs the sql query and writes output to 'w'.
+func runQueryAndFormatResults(
+	conn *sqlConn, w io.Writer, fn queryFunc, pretty bool,
+) error {
 	for {
-		cols, allRows, result, err := runQuery(conn, fn)
+		cols, allRows, result, err := runQuery(conn, fn, pretty)
 		if err != nil {
 			if err == pq.ErrNoMoreResults {
 				return nil
 			}
 			return err
 		}
-		printQueryOutput(w, cols, allRows, result)
+		printQueryOutput(w, cols, allRows, result, pretty)
 		fn = nextResult
 	}
 }
@@ -214,8 +243,13 @@ func runPrettyQuery(conn *sqlConn, w io.Writer, fn queryFunc) error {
 // It returns the header row followed by all data rows.
 // If both the header row and list of rows are empty, it means no row
 // information was returned (eg: statement was not a query).
-func sqlRowsToStrings(rows *sqlRows) ([]string, [][]string, string, error) {
-	cols := rows.Columns()
+// If pretty is true, then more characters are not escaped.
+func sqlRowsToStrings(rows *sqlRows, pretty bool) ([]string, [][]string, string, error) {
+	srcCols := rows.Columns()
+	cols := make([]string, len(srcCols))
+	for i, c := range srcCols {
+		cols[i] = formatVal(c, pretty, false)
+	}
 
 	var allRows [][]string
 	var vals []driver.Value
@@ -233,7 +267,7 @@ func sqlRowsToStrings(rows *sqlRows) ([]string, [][]string, string, error) {
 		}
 		rowStrings := make([]string, len(cols))
 		for i, v := range vals {
-			rowStrings[i] = formatVal(v)
+			rowStrings[i] = formatVal(v, pretty, pretty)
 		}
 		allRows = append(allRows, rowStrings)
 	}
@@ -252,38 +286,107 @@ func sqlRowsToStrings(rows *sqlRows) ([]string, [][]string, string, error) {
 	return cols, allRows, tag, nil
 }
 
+// expandTabsAndNewLines ensures that multi-line row strings that may
+// contain tabs are properly formatted: tabs are expanded to spaces,
+// and newline characters are marked visually. Marking newline
+// characters is especially important in single-column results where
+// the underlying TableWriter would not otherwise show the difference
+// between one multi-line row and two one-line rows.
+func expandTabsAndNewLines(s string) string {
+	var buf bytes.Buffer
+	// 4-wide columns, 1 character minimum width.
+	w := tabwriter.NewWriter(&buf, 4, 0, 1, ' ', 0)
+	fmt.Fprint(w, strings.Replace(s, "\n", "␤\n", -1))
+	_ = w.Flush()
+	return buf.String()
+}
+
 // printQueryOutput takes a list of column names and a list of row contents
 // writes a pretty table to 'w', or "OK" if empty.
-func printQueryOutput(w io.Writer, cols []string, allRows [][]string, tag string) {
+func printQueryOutput(
+	w io.Writer, cols []string, allRows [][]string, tag string, pretty bool,
+) {
 	if len(cols) == 0 {
 		// This operation did not return rows, just show the tag.
 		fmt.Fprintln(w, tag)
 		return
 	}
 
-	// Initialize tablewriter and set column names as the header row.
-	table := tablewriter.NewWriter(w)
-	table.SetAutoFormatHeaders(false)
-	table.SetAutoWrapText(false)
-	table.SetHeader(cols)
+	if pretty {
+		// Initialize tablewriter and set column names as the header row.
+		table := tablewriter.NewWriter(w)
+		table.SetAutoFormatHeaders(false)
+		table.SetAutoWrapText(false)
+		table.SetHeader(cols)
+		for _, row := range allRows {
+			for i, r := range row {
+				row[i] = expandTabsAndNewLines(r)
+			}
+			table.Append(row)
+		}
+		table.Render()
+		nRows := len(allRows)
+		fmt.Fprintf(w, "(%d row%s)\n", nRows, util.Pluralize(int64(nRows)))
+	} else {
+		if len(cols) == 0 {
+			// No result selected, inform the user.
+			fmt.Fprintln(w, tag)
+		} else {
+			// Some results selected, inform the user about how much data to expect.
+			fmt.Fprintf(w, "%d row%s\n", len(allRows),
+				util.Pluralize(int64(len(allRows))))
 
-	for _, row := range allRows {
-		table.Append(row)
+			// Then print the results themselves.
+			fmt.Fprintln(w, strings.Join(cols, "\t"))
+			for _, row := range allRows {
+				fmt.Fprintln(w, strings.Join(row, "\t"))
+			}
+		}
 	}
-
-	table.Render()
 }
 
-func formatVal(val driver.Value) string {
+func isNotPrintableASCII(r rune) bool { return r < 0x20 || r > 0x7e || r == '"' || r == '\\' }
+func isNotGraphicUnicode(r rune) bool { return !unicode.IsGraphic(r) }
+func isNotGraphicUnicodeOrTabOrNewline(r rune) bool {
+	return r != '\t' && r != '\n' && !unicode.IsGraphic(r)
+}
+
+func formatVal(
+	val driver.Value, showPrintableUnicode bool, showNewLinesAndTabs bool,
+) string {
 	switch t := val.(type) {
 	case nil:
 		return "NULL"
-	case []byte:
-		// We don't escape strings that contain only printable ASCII characters.
-		if len(bytes.TrimLeftFunc(t, func(r rune) bool { return r >= 0x20 && r < 0x80 })) == 0 {
-			return string(t)
+	case string:
+		if showPrintableUnicode {
+			pred := isNotGraphicUnicode
+			if showNewLinesAndTabs {
+				pred = isNotGraphicUnicodeOrTabOrNewline
+			}
+			if utf8.ValidString(t) && strings.IndexFunc(t, pred) == -1 {
+				return t
+			}
+		} else {
+			if strings.IndexFunc(t, isNotPrintableASCII) == -1 {
+				return t
+			}
 		}
-		// We use %+q to ensure the output contains only ASCII (see issue #4315).
+		return fmt.Sprintf("%+q", t)
+
+	case []byte:
+		if showPrintableUnicode {
+			pred := isNotGraphicUnicode
+			if showNewLinesAndTabs {
+				pred = isNotGraphicUnicodeOrTabOrNewline
+			}
+			if utf8.Valid(t) && bytes.IndexFunc(t, pred) == -1 {
+				return string(t)
+			}
+		} else {
+			if bytes.IndexFunc(t, isNotPrintableASCII) == -1 {
+				return string(t)
+			}
+		}
 		return fmt.Sprintf("%+q", t)
 	}
 	return fmt.Sprint(val)

@@ -25,7 +25,11 @@ import (
 	"strconv"
 	"testing"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/stop"
 	"github.com/gogo/protobuf/proto"
@@ -84,7 +88,7 @@ func TestEngineBatchCommit(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					if val != nil && bytes.Compare(val, finalVal) != 0 {
+					if val != nil && !bytes.Equal(val, finalVal) {
 						close(readsDone)
 						t.Fatalf("key value should be empty or %q; got %q", string(finalVal), string(val))
 					}
@@ -110,6 +114,77 @@ func TestEngineBatchCommit(t *testing.T) {
 		}
 		close(writesDone)
 		<-readsDone
+	}, t)
+}
+
+func TestEngineBatchStaleCachedIterator(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	// Prevent regression of a bug which caused spurious MVCC errors due to an
+	// invalid optimization which let an iterator return key-value pairs which
+	// had since been deleted from the underlying engine.
+	// Discovered in #6878.
+	runWithAllEngines(func(eng Engine, t *testing.T) {
+		// Focused failure mode: highlights the actual bug.
+		{
+			batch := eng.NewBatch()
+			defer batch.Close()
+			iter := batch.NewIterator(false)
+			key := MVCCKey{Key: roachpb.Key("b")}
+
+			if err := batch.Put(key, []byte("foo")); err != nil {
+				t.Fatal(err)
+			}
+
+			iter.Seek(key)
+
+			if err := batch.Clear(key); err != nil {
+				t.Fatal(err)
+			}
+
+			// Iterator should not reuse its cached result.
+			iter.Seek(key)
+
+			if iter.Valid() {
+				t.Fatalf("iterator unexpectedly valid: %v -> %v",
+					iter.unsafeKey(), iter.unsafeValue())
+			}
+		}
+
+		// Higher-level failure mode. Mostly for documentation.
+		{
+			batch := eng.NewBatch().(*rocksDBBatch)
+			defer batch.Close()
+
+			key := roachpb.Key("z")
+
+			// Put a value so that the deletion below finds a value to seek
+			// to.
+			if err := MVCCPut(context.Background(), batch, nil, key, hlc.ZeroTimestamp,
+				roachpb.MakeValueFromString("x"), nil); err != nil {
+				t.Fatal(err)
+			}
+
+			// Seek the iterator to `key` and clear the value (but without
+			// telling the iterator about that).
+			if err := MVCCDelete(context.Background(), batch, nil, key,
+				hlc.ZeroTimestamp, nil); err != nil {
+				t.Fatal(err)
+			}
+
+			// Trigger a seek on the cached iterator by seeking to the (now
+			// absent) key.
+			// The underlying iterator will already be in the right position
+			// due to a seek in MVCCDelete (followed by a Clear, which does not
+			// invalidate the iterator's cache), and if it reports its cached
+			// result back, we'll see the (newly deleted) value (due to the
+			// failure mode above).
+			if v, _, err := MVCCGet(context.Background(), batch, key,
+				hlc.ZeroTimestamp, true, nil); err != nil {
+				t.Fatal(err)
+			} else if v != nil {
+				t.Fatalf("expected no value, got %+v", v)
+			}
+		}
 	}, t)
 }
 
@@ -150,7 +225,7 @@ func TestEngineBatch(t *testing.T) {
 			{key, appender("  B"), true},
 		}
 
-		apply := func(eng Engine, d data) error {
+		apply := func(eng ReadWriter, d data) error {
 			if d.value == nil {
 				return eng.Clear(d.key)
 			} else if d.merge {
@@ -159,19 +234,19 @@ func TestEngineBatch(t *testing.T) {
 			return eng.Put(d.key, d.value)
 		}
 
-		get := func(eng Engine, key MVCCKey) []byte {
+		get := func(eng ReadWriter, key MVCCKey) []byte {
 			b, err := eng.Get(key)
 			if err != nil {
 				t.Fatal(err)
 			}
-			m := &MVCCMetadata{}
-			if err := proto.Unmarshal(b, m); err != nil {
+			var m enginepb.MVCCMetadata
+			if err := proto.Unmarshal(b, &m); err != nil {
 				t.Fatal(err)
 			}
 			if !m.IsInline() {
 				return nil
 			}
-			valueBytes, err := m.Value().GetBytes()
+			valueBytes, err := MakeValue(m).GetBytes()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -222,11 +297,11 @@ func TestEngineBatch(t *testing.T) {
 			} else if !iter.Key().Equal(key) {
 				t.Errorf("%d: batch seek expected key %s, but got %s", i, key, iter.Key())
 			} else {
-				m := &MVCCMetadata{}
-				if err := iter.ValueProto(m); err != nil {
+				var m enginepb.MVCCMetadata
+				if err := iter.ValueProto(&m); err != nil {
 					t.Fatal(err)
 				}
-				valueBytes, err := m.Value().GetBytes()
+				valueBytes, err := MakeValue(m).GetBytes()
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -369,7 +444,7 @@ func TestEngineMerge(t *testing.T) {
 				}
 			}
 			result, _ := engine.Get(tc.testKey)
-			var resultV, expectedV MVCCMetadata
+			var resultV, expectedV enginepb.MVCCMetadata
 			if err := proto.Unmarshal(result, &resultV); err != nil {
 				t.Fatal(err)
 			}
@@ -605,11 +680,6 @@ func TestSnapshotMethods(t *testing.T) {
 			t.Errorf("attrs mismatch; expected %+v, got %+v", attrs, engine.Attrs())
 		}
 
-		// Verify Put is error.
-		if err := snap.Put(mvccKey("c"), []byte("3")); err == nil {
-			t.Error("expected error on Put to snapshot")
-		}
-
 		// Verify Get.
 		for i := range keys {
 			valSnapshot, err := snap.Get(keys[i])
@@ -646,31 +716,6 @@ func TestSnapshotMethods(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Verify Clear is error.
-		if err := snap.Clear(keys[0]); err == nil {
-			t.Error("expected error on Clear to snapshot")
-		}
-
-		// Verify Merge is error.
-		if err := snap.Merge(mvccKey("merge-key"), appender("x")); err == nil {
-			t.Error("expected error on Merge to snapshot")
-		}
-
-		// Verify Capacity.
-		capacity, err := engine.Capacity()
-		if err != nil {
-			t.Fatal(err)
-		}
-		capacitySnapshot, err := snap.Capacity()
-		if err != nil {
-			t.Fatal(err)
-		}
-		// The Available fields of capacity may differ due to processes beyond our control.
-		if capacity.Capacity != capacitySnapshot.Capacity {
-			t.Errorf("expected capacities to be equal: %v != %v",
-				capacity.Capacity, capacitySnapshot.Capacity)
-		}
-
 		// Write a new key to engine.
 		newKey := mvccKey("c")
 		newVal := []byte("3")
@@ -685,41 +730,6 @@ func TestSnapshotMethods(t *testing.T) {
 			t.Error("expected invalid iterator when seeking to element which shouldn't be visible to snapshot")
 		}
 		iter.Close()
-
-		// Verify Commit is error.
-		if err := snap.Commit(); err == nil {
-			t.Error("expected error on Commit to snapshot")
-		}
-	}, t)
-}
-
-// TestSnapshotNewSnapshot panics.
-func TestSnapshotNewSnapshot(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	runWithAllEngines(func(engine Engine, t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Error("expected panic")
-			}
-		}()
-		snap := engine.NewSnapshot()
-		defer snap.Close()
-		snap.NewSnapshot()
-	}, t)
-}
-
-// TestSnapshotNewBatch panics.
-func TestSnapshotNewBatch(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	runWithAllEngines(func(engine Engine, t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Error("expected panic")
-			}
-		}()
-		snap := engine.NewSnapshot()
-		defer snap.Close()
-		snap.NewBatch()
 	}, t)
 }
 

@@ -18,112 +18,70 @@ package distsql
 
 import (
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/roachpb"
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/log"
 )
 
 const outboxBufRows = 16
-const outboxChanRows = 16
 const outboxFlushPeriod = 100 * time.Microsecond
 
 // preferredEncoding is the encoding used for EncDatums that don't already have
 // an encoding available.
 const preferredEncoding = sqlbase.DatumEncoding_ASCENDING_KEY
 
-// outboxStream is implemented by any protobuf generated type for a stream of
-// StreamMessage, such as DistSQL_RunSimpleFlowServer.
-type outboxStream interface {
-	// Send blocks until it sends the message, the stream is done, or the stream
-	// breaks. Protobuf generated code implements it as a wrapper around
-	// grpc.Steam.SendMsg.
-	Send(*StreamMessage) error
-}
-
-// outbox implements an outgoing mailbox as a rowReceiver that receives rows and
+// outbox implements an outgoing mailbox as a RowReceiver that receives rows and
 // sends them to a gRPC stream. Its core logic runs in a goroutine. We send rows
-// when we accumulate outboxChanRows or every outboxFlushPeriod (whichever comes
+// when we accumulate outboxBufRows or every outboxFlushPeriod (whichever comes
 // first).
 type outbox struct {
-	outStream outboxStream
+	// RowChannel implements the RowReceiver interface.
+	RowChannel
 
-	// dataChan is the channel through which the outbox goroutine receives rows
-	// from the producer.
-	dataChan chan streamMsg
-	// noMoreRows is an atomic that signals we no longer accept rows via
-	// PushRow.
-	noMoreRows  uint32
-	flushTicker *time.Ticker
+	flowCtx *FlowCtx
+	addr    string
+	stream  DistSQL_FlowStreamClient
 
-	// infos is initialized when the first row is received
-	infos []DatumInfo
+	// simpleFlowStream is set if we are outputting to a simple flow stream; in
+	// that case addr and stream will not be set.
+	simpleFlowStream DistSQL_RunSimpleFlowServer
 
-	rowBuf []byte
-	// numRows is the number of rows that have been accumulated in rowBuf.
-	numRows          int
-	sentFirstMessage bool
+	encoder StreamEncoder
+	// numRows is the number of rows that have been accumulated in the encoder.
+	numRows int
 
 	err error
 	wg  *sync.WaitGroup
-
-	alloc sqlbase.DatumAlloc
-	// Placeholders to avoid allocations
-	msg    StreamMessage
-	msgHdr StreamHeader
-	msgTrl StreamTrailer
 }
 
-var _ rowReceiver = &outbox{}
+var _ RowReceiver = &outbox{}
 
-func newOutbox(stream outboxStream) *outbox {
-	return &outbox{outStream: stream}
+func newOutbox(flowCtx *FlowCtx, addr string, flowID FlowID, streamID StreamID) *outbox {
+	m := &outbox{flowCtx: flowCtx, addr: addr}
+	m.encoder.setHeaderFields(flowID, streamID)
+	return m
 }
 
-// PushRow is part of the rowReceiver interface.
-func (m *outbox) PushRow(row row) bool {
-	if atomic.LoadUint32(&m.noMoreRows) == 1 {
-		return false
-	}
-
-	m.dataChan <- streamMsg{row: row, err: nil}
-	return true
+// newOutboxSimpleFlowStream sets up an outbox for the special "sync flow"
+// stream. The flow context should be provided via setFlowCtx when it is
+// available.
+func newOutboxSimpleFlowStream(stream DistSQL_RunSimpleFlowServer) *outbox {
+	return &outbox{simpleFlowStream: stream}
 }
 
-// close is part of the rowReceiver interface.
-func (m *outbox) Close(err error) {
-	if err != nil {
-		m.dataChan <- streamMsg{row: nil, err: err}
-	}
-	close(m.dataChan)
+func (m *outbox) setFlowCtx(flowCtx *FlowCtx) {
+	m.flowCtx = flowCtx
 }
 
 // addRow encodes a row into rowBuf. If enough rows were accumulated
 // calls flush().
-func (m *outbox) addRow(row []sqlbase.EncDatum) error {
-	if m.infos == nil {
-		// First row. Initialize encodings.
-		m.infos = make([]DatumInfo, len(row))
-		for i := range row {
-			enc, ok := row[i].Encoding()
-			if !ok {
-				enc = preferredEncoding
-			}
-			m.infos[i].Encoding = enc
-		}
-	}
-	if len(m.infos) != len(row) {
-		return util.Errorf("inconsistent row length: had %d, now %d",
-			len(m.infos), len(row))
-	}
-	for i := range row {
-		var err error
-		m.rowBuf, err = row[i].Encode(&m.alloc, m.infos[i].Encoding, m.rowBuf)
-		if err != nil {
-			return err
-		}
+func (m *outbox) addRow(row sqlbase.EncDatumRow) error {
+	err := m.encoder.AddRow(row)
+	if err != nil {
+		return err
 	}
 	m.numRows++
 	if m.numRows >= outboxBufRows {
@@ -134,63 +92,103 @@ func (m *outbox) addRow(row []sqlbase.EncDatum) error {
 
 // flush sends the rows accumulated so far in a StreamMessage.
 func (m *outbox) flush(last bool, err error) error {
-	msg := &m.msg
-	msg.Header = nil
-	msg.Data.RawBytes = m.rowBuf
-	msg.Trailer = nil
-	if !m.sentFirstMessage {
-		msg.Header = &m.msgHdr
-		msg.Header.Info = m.infos
+	if !last && m.numRows == 0 {
+		return nil
 	}
-	if last {
-		msg.Trailer = &m.msgTrl
-		msg.Trailer.Error = roachpb.NewError(err)
-	}
+	msg := m.encoder.FormMessage(last, err)
 
-	sendErr := m.outStream.Send(msg)
+	if log.V(3) {
+		log.Infof(m.flowCtx.Context, "flushing outbox")
+	}
+	var sendErr error
+	if m.stream != nil {
+		sendErr = m.stream.Send(msg)
+	} else {
+		sendErr = m.simpleFlowStream.Send(msg)
+	}
+	if sendErr != nil {
+		if log.V(1) {
+			log.Errorf(m.flowCtx.Context, "outbox flush error: %s", sendErr)
+		}
+	} else if log.V(3) {
+		log.Infof(m.flowCtx.Context, "outbox flushed")
+	}
 	if sendErr != nil {
 		return sendErr
 	}
 
 	m.numRows = 0
-	m.rowBuf = m.rowBuf[:0]
-	m.sentFirstMessage = true
 	return nil
 }
 
-func (m *outbox) mainLoop() {
-	var err error
-loop:
+func (m *outbox) mainLoop() error {
+	if m.simpleFlowStream == nil {
+		conn, err := m.flowCtx.rpcCtx.GRPCDial(m.addr)
+		if err != nil {
+			return err
+		}
+		client := NewDistSQLClient(conn)
+		if log.V(2) {
+			log.Infof(m.flowCtx.Context, "outbox: calling FlowStream")
+		}
+		m.stream, err = client.FlowStream(context.TODO())
+		if err != nil {
+			if log.V(1) {
+				log.Infof(m.flowCtx.Context, "FlowStream error: %s", err)
+			}
+			return err
+		}
+		if log.V(2) {
+			log.Infof(m.flowCtx.Context, "outbox: FlowStream returned")
+		}
+	}
+
+	flushTicker := time.NewTicker(outboxFlushPeriod)
+	defer flushTicker.Stop()
+
 	for {
 		select {
-		case d, ok := <-m.dataChan:
+		case d, ok := <-m.RowChannel.C:
 			if !ok {
 				// No more data.
-				err = m.flush(true, nil)
-				break loop
+				return m.flush(true, nil)
 			}
-			err = d.err
+			err := d.Err
 			if err == nil {
-				err = m.addRow(d.row)
+				err = m.addRow(d.Row)
 			}
 			if err != nil {
 				// Try to flush to send out the error, but ignore any
 				// send error.
 				_ = m.flush(true, err)
-				break loop
+				return err
 			}
-		case <-m.flushTicker.C:
-			err = m.flush(false, nil)
+		case <-flushTicker.C:
+			err := m.flush(false, nil)
 			if err != nil {
-				break loop
+				return err
 			}
 		}
 	}
-	atomic.StoreUint32(&m.noMoreRows, 1)
-	m.flushTicker.Stop()
+}
+
+func (m *outbox) run() {
+	err := m.mainLoop()
+
+	m.RowChannel.NoMoreRows()
 	if err != nil {
 		// Drain to allow senders to finish.
 		for range m.dataChan {
+		}
+	}
+	if m.stream != nil {
+		resp, recvErr := m.stream.CloseAndRecv()
+		if err == nil {
+			if recvErr != nil {
+				err = recvErr
+			} else if resp.Error != nil {
+				err = resp.Error.GoError()
+			}
 		}
 	}
 	m.err = err
@@ -200,8 +198,8 @@ loop:
 }
 
 func (m *outbox) start(wg *sync.WaitGroup) {
+	wg.Add(1)
 	m.wg = wg
-	m.dataChan = make(chan streamMsg, outboxChanRows)
-	m.flushTicker = time.NewTicker(outboxFlushPeriod)
-	go m.mainLoop()
+	m.RowChannel.Init()
+	go m.run()
 }

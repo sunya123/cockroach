@@ -20,14 +20,23 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/util/encoding"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/stop"
 )
 
 func setupMVCCRocksDB(b testing.TB, loc string) (Engine, *stop.Stopper) {
-	const cacheSize = 0
 	const memtableBudget = 512 << 20 // 512 MB
 	stopper := stop.NewStopper()
-	rocksdb := NewRocksDB(roachpb.Attributes{}, loc, cacheSize, memtableBudget, 0, stopper)
+	rocksdb := NewRocksDB(
+		roachpb.Attributes{},
+		loc,
+		RocksDBCache{},
+		memtableBudget,
+		0,
+		DefaultMaxOpenFiles,
+		stopper,
+	)
 	if err := rocksdb.Open(); err != nil {
 		b.Fatalf("could not create new rocksdb db instance at %s: %v", loc, err)
 	}
@@ -252,4 +261,32 @@ func BenchmarkMVCCDeleteRange1Version32Bytes_RocksDB(b *testing.B) {
 
 func BenchmarkMVCCDeleteRange1Version256Bytes_RocksDB(b *testing.B) {
 	runMVCCDeleteRange(setupMVCCRocksDB, 256, b)
+}
+
+func BenchmarkBatchBuilderPut(b *testing.B) {
+	value := make([]byte, 10)
+	for i := range value {
+		value[i] = byte(i)
+	}
+	keyBuf := append(make([]byte, 0, 64), []byte("key-")...)
+
+	b.ResetTimer()
+
+	const batchSize = 1000
+	batch := &rocksDBBatchBuilder{}
+	for i := 0; i < b.N; i += batchSize {
+		end := i + batchSize
+		if end > b.N {
+			end = b.N
+		}
+
+		for j := i; j < end; j++ {
+			key := roachpb.Key(encoding.EncodeUvarintAscending(keyBuf[:4], uint64(j)))
+			ts := hlc.Timestamp{WallTime: int64(j)}
+			batch.Put(MVCCKey{key, ts}, value)
+		}
+		batch.Finish()
+	}
+
+	b.StopTimer()
 }

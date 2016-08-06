@@ -26,7 +26,6 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +35,7 @@ import (
 	"github.com/docker/engine-api/types/container"
 	"github.com/docker/engine-api/types/network"
 	"github.com/docker/go-connections/nat"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/util/log"
@@ -45,21 +45,22 @@ const matchNone = "^$"
 
 // Retrieve the IP address of docker itself.
 func dockerIP() net.IP {
-	if host := os.Getenv("DOCKER_HOST"); host != "" {
-		u, err := url.Parse(host)
-		if err != nil {
-			panic(err)
-		}
-		h, _, err := net.SplitHostPort(u.Host)
-		if err != nil {
-			panic(err)
-		}
-		return net.ParseIP(h)
+	host := os.Getenv("DOCKER_HOST")
+	if host == "" {
+		host = client.DefaultDockerHost
 	}
-	if runtime.GOOS == "linux" {
+	u, err := url.Parse(host)
+	if err != nil {
+		panic(err)
+	}
+	if u.Scheme == "unix" {
 		return net.IPv4(127, 0, 0, 1)
 	}
-	panic("unable to determine docker ip address")
+	h, _, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		panic(err)
+	}
+	return net.ParseIP(h)
 }
 
 // Container provides the programmatic interface for a single docker
@@ -79,7 +80,7 @@ func hasImage(l *LocalCluster, ref string) bool {
 	name := strings.Split(ref, ":")[0]
 	images, err := l.client.ImageList(context.Background(), types.ImageListOptions{MatchName: name})
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(context.TODO(), err)
 	}
 	for _, image := range images {
 		for _, repoTag := range image.RepoTags {
@@ -91,23 +92,23 @@ func hasImage(l *LocalCluster, ref string) bool {
 	}
 	for _, image := range images {
 		for _, tag := range image.RepoTags {
-			log.Infof("ImageList %s %s", tag, image.ID)
+			log.Infof(context.TODO(), "ImageList %s %s", tag, image.ID)
 		}
 	}
 	return false
 }
 
 func pullImage(l *LocalCluster, ref string, options types.ImagePullOptions) error {
-	// Hack: on CircleCI, docker pulls the image on the first access from an
+	// HACK: on CircleCI, docker pulls the image on the first access from an
 	// acceptance test even though that image is already present. So we first
 	// check to see if our image is present in order to avoid this slowness.
 	if hasImage(l, ref) {
-		log.Infof("ImagePull %s already exists", ref)
+		log.Infof(context.TODO(), "ImagePull %s already exists", ref)
 		return nil
 	}
 
-	log.Infof("ImagePull %s starting", ref)
-	defer log.Infof("ImagePull %s complete", ref)
+	log.Infof(context.TODO(), "ImagePull %s starting", ref)
+	defer log.Infof(context.TODO(), "ImagePull %s complete", ref)
 
 	rc, err := l.client.ImagePull(context.Background(), ref, options)
 	if err != nil {
@@ -128,7 +129,7 @@ func pullImage(l *LocalCluster, ref string, options types.ImagePullOptions) erro
 		}
 		// The message is a status bar.
 		if log.V(2) {
-			log.Infof("ImagePull response: %s", message)
+			log.Infof(context.TODO(), "ImagePull response: %s", message)
 		} else {
 			_, _ = fmt.Fprintf(os.Stderr, ".")
 		}
@@ -192,7 +193,7 @@ func (c *Container) Kill() error {
 //
 // TODO(pmattis): Generalize the setting of parameters here.
 func (c *Container) Start() error {
-	return c.cluster.client.ContainerStart(context.Background(), c.id)
+	return c.cluster.client.ContainerStart(context.Background(), c.id, types.ContainerStartOptions{})
 }
 
 // Pause pauses a running container.
@@ -211,14 +212,14 @@ func (c *Container) Unpause() error {
 
 // Restart restarts a running container.
 // Container will be killed after 'timeout' seconds if it fails to stop.
-func (c *Container) Restart(timeoutSeconds int) error {
+func (c *Container) Restart(timeout *time.Duration) error {
 	var exp []string
 	if ci, err := c.Inspect(); err != nil {
 		return err
 	} else if ci.State.Running {
 		exp = append(exp, eventDie)
 	}
-	if err := c.cluster.client.ContainerRestart(context.Background(), c.id, timeoutSeconds); err != nil {
+	if err := c.cluster.client.ContainerRestart(context.Background(), c.id, timeout); err != nil {
 		return err
 	}
 	c.cluster.expectEvent(c, append(exp, eventRestart)...)
@@ -226,8 +227,8 @@ func (c *Container) Restart(timeoutSeconds int) error {
 }
 
 // Stop a running container.
-func (c *Container) Stop(timeoutSeconds int) error {
-	if err := c.cluster.client.ContainerStop(context.Background(), c.id, timeoutSeconds); err != nil {
+func (c *Container) Stop(timeout *time.Duration) error {
+	if err := c.cluster.client.ContainerStop(context.Background(), c.id, timeout); err != nil {
 		return err
 	}
 	c.cluster.expectEvent(c, eventDie)
@@ -241,16 +242,15 @@ var _ = (*Container).Stop
 // Wait waits for a running container to exit.
 func (c *Container) Wait() error {
 	exitCode, err := c.cluster.client.ContainerWait(context.Background(), c.id)
+	if err == nil && exitCode != 0 {
+		err = errors.Errorf("non-zero exit code: %d", exitCode)
+	}
 	if err != nil {
-		return err
-	}
-	if exitCode != 0 {
 		if err := c.Logs(os.Stderr); err != nil {
-			log.Warning(err)
+			log.Warning(context.TODO(), err)
 		}
-		return fmt.Errorf("non-zero exit code: %d", exitCode)
 	}
-	return nil
+	return err
 }
 
 // Logs outputs the containers logs to the given io.Writer.
@@ -292,7 +292,7 @@ func (c *Container) Inspect() (types.ContainerJSON, error) {
 func (c *Container) Addr(port nat.Port) *net.TCPAddr {
 	containerInfo, err := c.Inspect()
 	if err != nil {
-		log.Error(err)
+		log.Error(context.TODO(), err)
 		return nil
 	}
 	bindings, ok := containerInfo.NetworkSettings.Ports[port]
@@ -301,7 +301,7 @@ func (c *Container) Addr(port nat.Port) *net.TCPAddr {
 	}
 	portNum, err := strconv.Atoi(bindings[0].HostPort)
 	if err != nil {
-		log.Error(err)
+		log.Error(context.TODO(), err)
 		return nil
 	}
 	return &net.TCPAddr{
@@ -325,10 +325,13 @@ func (cli resilientDockerClient) ContainerCreate(
 ) (types.ContainerCreateResponse, error) {
 	response, err := cli.APIClient.ContainerCreate(ctx, config, hostConfig, networkingConfig, containerName)
 	if err != nil && strings.Contains(err.Error(), "already in use") {
-		log.Infof("unable to create container %s: %v", containerName, err)
-		containers, cerr := cli.ContainerList(ctx, types.ContainerListOptions{All: true})
+		log.Infof(ctx, "unable to create container %s: %v", containerName, err)
+		containers, cerr := cli.ContainerList(ctx, types.ContainerListOptions{
+			All:   true,
+			Limit: -1, // no limit, see docker/engine-api/client/container_list.go
+		})
 		if cerr != nil {
-			log.Infof("unable to list containers: %v", cerr)
+			log.Infof(ctx, "unable to list containers: %v", cerr)
 			return types.ContainerCreateResponse{}, err
 		}
 		for _, c := range containers {
@@ -338,19 +341,19 @@ func (cli resilientDockerClient) ContainerCreate(
 				if n != containerName {
 					continue
 				}
-				log.Infof("trying to remove %s", c.ID)
+				log.Infof(ctx, "trying to remove %s", c.ID)
 				options := types.ContainerRemoveOptions{
 					RemoveVolumes: true,
 					Force:         true,
 				}
 				if rerr := cli.ContainerRemove(ctx, c.ID, options); rerr != nil {
-					log.Infof("unable to remove container: %v", rerr)
+					log.Infof(ctx, "unable to remove container: %v", rerr)
 					return types.ContainerCreateResponse{}, err
 				}
 				return cli.ContainerCreate(ctx, config, hostConfig, networkingConfig, containerName)
 			}
 		}
-		log.Warningf("error indicated existing container %s, "+
+		log.Warningf(ctx, "error indicated existing container %s, "+
 			"but none found:\nerror: %s\ncontainers: %+v",
 			containerName, err, containers)
 		// We likely raced with a previous (late) removal of the container.
@@ -405,16 +408,14 @@ func retry(
 		timeoutCtx, _ := context.WithTimeout(ctx, timeout)
 		err := f(timeoutCtx)
 		if err != nil {
-			// docker-engine/client wraps the context.DeadlineExceeded with its own
-			// error message, forcing us to detect deadline exceeded by string
-			// matching.
-			//
-			// TODO(pmattis): Perhaps use `timeoutCtx.Err()==context.DeadlineExceeded`.
-			if strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+			// TODO(tamird):
+			// s/client.ErrConnectionFailed/context.DeadlineExceeded/ when
+			// https://github.com/docker/engine-api/issues/347 is fixed.
+			if err == client.ErrConnectionFailed {
 				continue
 			} else if i > 0 && retryErrorsRE != matchNone {
 				if regexp.MustCompile(retryErrorsRE).MatchString(err.Error()) {
-					log.Infof("%s: swallowing expected error after retry: %v",
+					log.Infof(ctx, "%s: swallowing expected error after retry: %v",
 						name, err)
 					return nil
 				}
@@ -444,10 +445,10 @@ func (cli retryingDockerClient) ContainerCreate(
 	return ret, err
 }
 
-func (cli retryingDockerClient) ContainerStart(ctx context.Context, containerID string) error {
+func (cli retryingDockerClient) ContainerStart(ctx context.Context, container string, options types.ContainerStartOptions) error {
 	return retry(ctx, cli.attempts, cli.timeout, "ContainerStart", matchNone,
 		func(timeoutCtx context.Context) error {
-			return cli.resilientDockerClient.ContainerStart(timeoutCtx, containerID)
+			return cli.resilientDockerClient.ContainerStart(timeoutCtx, container, options)
 		})
 }
 
@@ -458,20 +459,20 @@ func (cli retryingDockerClient) ContainerRemove(ctx context.Context, container s
 		})
 }
 
-func (cli retryingDockerClient) ContainerKill(ctx context.Context, containerID, signal string) error {
+func (cli retryingDockerClient) ContainerKill(ctx context.Context, container, signal string) error {
 	return retry(ctx, cli.attempts, cli.timeout, "ContainerKill",
 		"Container .* is not running",
 		func(timeoutCtx context.Context) error {
-			return cli.resilientDockerClient.ContainerKill(timeoutCtx, containerID, signal)
+			return cli.resilientDockerClient.ContainerKill(timeoutCtx, container, signal)
 		})
 }
 
-func (cli retryingDockerClient) ContainerWait(ctx context.Context, containerID string) (int, error) {
+func (cli retryingDockerClient) ContainerWait(ctx context.Context, container string) (int, error) {
 	var ret int
 	return ret, retry(ctx, cli.attempts, cli.timeout, "ContainerWait", matchNone,
 		func(timeoutCtx context.Context) error {
 			var err error
-			ret, err = cli.resilientDockerClient.ContainerWait(timeoutCtx, containerID)
+			ret, err = cli.resilientDockerClient.ContainerWait(timeoutCtx, container)
 			_ = ret // silence incorrect unused warning
 			return err
 		})

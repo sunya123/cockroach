@@ -22,23 +22,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/util"
 )
-
-// tableInfo contains the information for table used by a select statement. It can be an actual
-// table, or a "virtual table" which is the result of a subquery.
-type tableInfo struct {
-	// node which can be used to retrieve the data (normally a scanNode). For performance purposes,
-	// this node can be aware of the filters, grouping etc.
-	node planNode
-
-	// alias (if no alias is given and the source is a table, this is the table name)
-	alias string
-
-	// resultColumns which match the node.Columns() 1-to-1. However the column names might be
-	// different if the statement renames them using AS.
-	columns []ResultColumn
-}
 
 // selectNode encapsulates the core logic of a select statement: retrieving filtered results from
 // the sources. Grouping, sorting, distinct and limits are implemented on top of this node (as
@@ -47,32 +31,61 @@ type tableInfo struct {
 type selectNode struct {
 	planner *planner
 
-	table tableInfo
+	// top refers to the surrounding selectTopNode.
+	top *selectTopNode
+
+	// source describes where the data is coming from.
+	// populated initially by initFrom().
+	// potentially modified by index selection.
+	source planDataSource
+
+	// sourceInfo contains the reference to the dataSourceInfo in the
+	// source planDataSource that is needed for qname resolution.
+	// We keep one instance of multiSourceInfo cached here so as to avoid
+	// re-creating it every time analyzeExpr() is called in addRender().
+	sourceInfo multiSourceInfo
 
 	// Map of qvalues encountered in expressions.
+	// populated by addRender() / checkRenderStar()
+	// as invoked initially by initTargets() and initWhere()
+	// then extended by the groupNode and sortNode.
 	qvals qvalMap
 
-	err error
-
 	// Rendering expressions for rows and corresponding output columns.
+	// populated by addRender()
+	// as invoked initially by initTargets() and initWhere().
+	// sortNode peeks into the render array defined by initTargets() as an optimization.
+	// sortNode adds extra selectNode renders for sort columns not requested as select targets.
+	// groupNode copies/extends the render array defined by initTargets()
+	// will add extra selectNode renders for the aggregation sources.
 	render  []parser.TypedExpr
 	columns []ResultColumn
 
-	// The rendered row, with one value for each render expression.
-	row parser.DTuple
-
-	// Filtering expression for rows.
-	filter parser.TypedExpr
-
-	// The number of initial columns - before adding any internal render targets for grouping or
-	// ordering. The original columns are columns[:numOriginalCols], the internally added ones are
+	// The number of initial columns - before adding any internal render
+	// targets for grouping, filtering or ordering. The original columns
+	// are columns[:numOriginalCols], the internally added ones are
 	// columns[numOriginalCols:].
+	// populated by initTargets(), which thus must be obviously vcalled before initWhere()
+	// and the other initializations that may add render columns.
 	numOriginalCols int
 
+	// Filtering expression for rows.
+	// populated initially by initWhere().
+	// modified by index selection (split between scan filter and post-indexjoin filter).
+	filter parser.TypedExpr
+
+	// ordering indicates the order of returned rows.
+	// initially suggested by the GROUP BY and ORDER BY clauses;
+	// modified by index selection.
+	ordering orderingInfo
+
+	// support attributes for EXPLAIN(DEBUG)
 	explain   explainMode
 	debugVals debugValues
 
-	ordering orderingInfo
+	// The rendered row, with one value for each render expression.
+	// populated by Next().
+	row parser.DTuple
 }
 
 func (s *selectNode) Columns() []ResultColumn {
@@ -95,7 +108,7 @@ func (s *selectNode) MarkDebug(mode explainMode) {
 		panic(fmt.Sprintf("unknown debug mode %d", mode))
 	}
 	s.explain = mode
-	s.table.node.MarkDebug(mode)
+	s.source.plan.MarkDebug(mode)
 }
 
 func (s *selectNode) DebugValues() debugValues {
@@ -105,55 +118,50 @@ func (s *selectNode) DebugValues() debugValues {
 	return s.debugVals
 }
 
-func (s *selectNode) expandPlan() error {
-	// TODO(knz) Some code from the constructor in Select() and initSelect() really
-	// belongs here.
-	return s.table.node.expandPlan()
-}
-
 func (s *selectNode) Start() error {
-	return s.table.node.Start()
+	if err := s.source.plan.Start(); err != nil {
+		return err
+	}
+
+	for _, e := range s.render {
+		if err := s.planner.startSubqueryPlans(e); err != nil {
+			return err
+		}
+	}
+	return s.planner.startSubqueryPlans(s.filter)
 }
 
-func (s *selectNode) Next() bool {
+func (s *selectNode) Next() (bool, error) {
 	for {
-		if !s.table.node.Next() {
-			return false
+		if next, err := s.source.plan.Next(); !next {
+			return false, err
 		}
 
 		if s.explain == explainDebug {
-			s.debugVals = s.table.node.DebugValues()
+			s.debugVals = s.source.plan.DebugValues()
 
 			if s.debugVals.output != debugValueRow {
 				// Let the debug values pass through.
-				return true
+				return true, nil
 			}
 		}
-		row := s.table.node.Values()
-		s.qvals.populateQVals(&s.table, row)
-		passesFilter, err := sqlbase.RunFilter(s.filter, s.planner.evalCtx)
+		row := s.source.plan.Values()
+		s.qvals.populateQVals(s.source.info, row)
+		passesFilter, err := sqlbase.RunFilter(s.filter, &s.planner.evalCtx)
 		if err != nil {
-			s.err = err
-			return false
+			return false, err
 		}
 
 		if passesFilter {
-			s.err = s.renderRow()
-			return s.err == nil
+			err := s.renderRow()
+			return err == nil, err
 		} else if s.explain == explainDebug {
 			// Mark the row as filtered out.
 			s.debugVals.output = debugValueFiltered
-			return true
+			return true, nil
 		}
 		// Row was filtered out; grab the next row.
 	}
-}
-
-func (s *selectNode) Err() error {
-	if s.err != nil {
-		return s.err
-	}
-	return s.table.node.Err()
 }
 
 func (s *selectNode) ExplainTypes(regTypes func(string, string)) {
@@ -166,24 +174,44 @@ func (s *selectNode) ExplainTypes(regTypes func(string, string)) {
 }
 
 func (s *selectNode) ExplainPlan(v bool) (name, description string, children []planNode) {
-	if !v {
-		return s.table.node.ExplainPlan(v)
+	subplans := []planNode{s.source.plan}
+
+	subplans = s.planner.collectSubqueryPlans(s.filter, subplans)
+
+	for _, e := range s.render {
+		subplans = s.planner.collectSubqueryPlans(e, subplans)
+	}
+
+	if len(subplans) == 1 && !v {
+		return s.source.plan.ExplainPlan(v)
 	}
 
 	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "(")
-	for i, col := range s.columns {
+
+	buf.WriteString("from (")
+	for i, col := range s.source.info.sourceColumns {
 		if i > 0 {
-			fmt.Fprintf(&buf, ", ")
+			buf.WriteString(", ")
 		}
-		fmt.Fprintf(&buf, "%s", col.Name)
+		if col.hidden {
+			buf.WriteByte('*')
+		}
+		parser.Name(s.source.info.findTableAlias(i)).Format(&buf, parser.FmtSimple)
+		buf.WriteByte('.')
+		parser.Name(col.Name).Format(&buf, parser.FmtSimple)
 	}
-	fmt.Fprintf(&buf, ")@%s", s.table.alias)
-	return "select", buf.String(), []planNode{s.table.node}
+	buf.WriteByte(')')
+
+	name = "render/filter"
+	if s.explain != explainNone {
+		name = fmt.Sprintf("%s(%s)", name, explainStrings[s.explain])
+	}
+
+	return name, buf.String(), subplans
 }
 
 func (s *selectNode) SetLimitHint(numRows int64, soft bool) {
-	s.table.node.SetLimitHint(numRows, soft || s.filter != nil)
+	s.source.plan.SetLimitHint(numRows, soft || s.filter != nil)
 }
 
 // Select selects rows from a SELECT/UNION/VALUES, ordering and/or limiting them.
@@ -212,7 +240,8 @@ func (p *planner) Select(n *parser.Select, desiredTypes []parser.Datum, autoComm
 	case *parser.SelectClause:
 		// Select can potentially optimize index selection if it's being ordered,
 		// so we allow it to do its own sorting.
-		return p.SelectClause(s, orderBy, limit, desiredTypes)
+		return p.SelectClause(s, orderBy, limit, desiredTypes, publicColumns)
+
 	// TODO(dan): Union can also do optimizations when it has an ORDER BY, but
 	// currently expects the ordering to be done externally, so we let it fall
 	// through. Instead of continuing this special casing, it may be worth
@@ -227,11 +256,13 @@ func (p *planner) Select(n *parser.Select, desiredTypes []parser.Datum, autoComm
 		if err != nil {
 			return nil, err
 		}
-		count, offset, err := p.evalLimit(limit)
+		limit, err := p.Limit(limit)
 		if err != nil {
 			return nil, err
 		}
-		return p.limit(count, offset, sort.wrap(plan)), nil
+		result := &selectTopNode{source: plan, sort: sort, limit: limit}
+		limit.setTop(result)
+		return result, nil
 	}
 }
 
@@ -239,7 +270,8 @@ func (p *planner) Select(n *parser.Select, desiredTypes []parser.Datum, autoComm
 // SQL statements. In the slowest and most general case, select must perform
 // full table scans across multiple tables and sort and join the resulting rows
 // on arbitrary columns. Full table scans can be avoided when indexes can be
-// used to satisfy the where-clause.
+// used to satisfy the where-clause. scanVisibility controls which columns are
+// visible to the select.
 //
 // NB: This is passed directly to planNode only when there is no ORDER BY,
 // LIMIT, or parenthesis in the parsed SELECT. See `sql/parser.Select` and
@@ -248,12 +280,18 @@ func (p *planner) Select(n *parser.Select, desiredTypes []parser.Datum, autoComm
 // Privileges: SELECT on table
 //   Notes: postgres requires SELECT. Also requires UPDATE on "FOR UPDATE".
 //          mysql requires SELECT.
-func (p *planner) SelectClause(parsed *parser.SelectClause, orderBy parser.OrderBy, limit *parser.Limit, desiredTypes []parser.Datum) (planNode, error) {
+func (p *planner) SelectClause(
+	parsed *parser.SelectClause,
+	orderBy parser.OrderBy,
+	limit *parser.Limit,
+	desiredTypes []parser.Datum,
+	scanVisibility scanVisibility,
+) (planNode, error) {
 	s := &selectNode{planner: p}
 
 	s.qvals = make(qvalMap)
 
-	if err := s.initFrom(p, parsed); err != nil {
+	if err := s.initFrom(parsed, scanVisibility); err != nil {
 		return nil, err
 	}
 
@@ -280,71 +318,78 @@ func (p *planner) SelectClause(parsed *parser.SelectClause, orderBy parser.Order
 		s.filter = group.isNotNullFilter(s.filter)
 	}
 
-	// Get the ordering for index selection (if any).
-	var ordering columnOrdering
-	var grouping bool
-
-	if group != nil {
-		ordering = group.desiredOrdering
-		grouping = true
-	} else if sort != nil {
-		ordering = sort.Ordering().ordering
-	}
-
-	limitCount, limitOffset, err := p.evalLimit(limit)
+	limitPlan, err := p.Limit(limit)
 	if err != nil {
 		return nil, err
 	}
+	distinctPlan := p.Distinct(parsed)
 
-	if scan, ok := s.table.node.(*scanNode); ok {
+	result := &selectTopNode{
+		source:   s,
+		group:    group,
+		sort:     sort,
+		distinct: distinctPlan,
+		limit:    limitPlan,
+	}
+	s.top = result
+	limitPlan.setTop(result)
+	distinctPlan.setTop(result)
+
+	return result, nil
+}
+
+func (s *selectNode) expandPlan() error {
+	// Get the ordering for index selection (if any).
+	var ordering sqlbase.ColumnOrdering
+	var grouping bool
+
+	if s.top.group != nil {
+		ordering = s.top.group.desiredOrdering
+		grouping = true
+	} else if s.top.sort != nil {
+		ordering = s.top.sort.Ordering().ordering
+	}
+
+	// Estimate the limit parameters. We can't full eval them just yet,
+	// because evaluation requires running potential sub-queries, which
+	// cannot occur during expandPlan.
+	limitCount, limitOffset := s.top.limit.estimateLimit()
+
+	if scan, ok := s.source.plan.(*scanNode); ok {
 		// Find the set of columns that we actually need values for. This is an
 		// optimization to avoid unmarshaling unnecessary values and is also
 		// used for index selection.
-		neededCols := make([]bool, len(s.table.columns))
+		neededCols := make([]bool, len(s.source.info.sourceColumns))
 		for i := range neededCols {
-			_, ok := s.qvals[columnRef{&s.table, i}]
+			_, ok := s.qvals[columnRef{s.source.info, i}]
 			neededCols[i] = ok
 		}
 		scan.setNeededColumns(neededCols)
 
-		// If we are only preparing, the filter expression can contain
-		// unexpanded subqueries which are not supported by splitFilter.
-		if !p.evalCtx.PrepareOnly {
-			// Compute a filter expression for the scan node.
-			convFunc := func(expr parser.VariableExpr) (bool, parser.VariableExpr) {
-				qval := expr.(*qvalue)
-				if qval.colRef.table != &s.table {
-					// TODO(radu): when we will support multiple tables, this
-					// will be a valid case.
-					panic("scan qvalue refers to unknown table")
-				}
-				return true, scan.filterVars.IndexedVar(qval.colRef.colIdx)
+		// Compute a filter expression for the scan node.
+		convFunc := func(expr parser.VariableExpr) (bool, parser.VariableExpr) {
+			qval := expr.(*qvalue)
+			if qval.colRef.source != s.source.info {
+				// TODO(radu): when we will support multiple tables, this
+				// will be a valid case.
+				panic("scan qvalue refers to unknown table")
 			}
+			return true, scan.filterVars.IndexedVar(qval.colRef.colIdx)
+		}
 
-			scan.filter, s.filter = splitFilter(s.filter, convFunc)
-			if s.filter != nil {
-				// Right now we support only one table, so the entire expression
-				// should be converted.
-				panic(fmt.Sprintf("residual filter `%s` (scan filter `%s`)", s.filter, scan.filter))
-			}
+		scan.filter, s.filter = splitFilter(s.filter, convFunc)
+		if s.filter != nil {
+			// Right now we support only one table, so the entire expression
+			// should be converted.
+			panic(fmt.Sprintf("residual filter `%s` (scan filter `%s`)", s.filter, scan.filter))
 		}
 
 		var analyzeOrdering analyzeOrderingFn
-		if grouping && len(ordering) == 1 && s.filter == nil {
-			// If grouping has a desired single-column order and the index
-			// matches that order, we can limit the scan to a single key.
-			analyzeOrdering =
-				func(indexOrdering orderingInfo) (matchingCols, totalCols int, singleKey bool) {
-					selOrder := s.computeOrdering(indexOrdering)
-					matchingCols = computeOrderingMatch(ordering, selOrder, false)
-					return matchingCols, 1, matchingCols == 1
-				}
-		} else if ordering != nil {
-			analyzeOrdering =
-				func(indexOrdering orderingInfo) (matchingCols, totalCols int, singleKey bool) {
-					selOrder := s.computeOrdering(indexOrdering)
-					return computeOrderingMatch(ordering, selOrder, false), len(ordering), false
-				}
+		if ordering != nil {
+			analyzeOrdering = func(indexOrdering orderingInfo) (matchingCols, totalCols int) {
+				selOrder := s.computeOrdering(indexOrdering)
+				return computeOrderingMatch(ordering, selOrder, false), len(ordering)
+			}
 		}
 
 		// If we have a reasonable limit, prefer an order matching index even if
@@ -357,88 +402,44 @@ func (p *planner) SelectClause(parsed *parser.SelectClause, orderBy parser.Order
 
 		plan, err := selectIndex(scan, analyzeOrdering, preferOrderMatchingIndex)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
-		// Update s.table with the new plan.
-		s.table.node = plan
+		// Update s.source.info with the new plan.
+		s.source.plan = plan
 	}
 
-	s.ordering = s.computeOrdering(s.table.node.Ordering())
+	s.ordering = s.computeOrdering(s.source.plan.Ordering())
 
-	// Wrap this node as necessary.
-	return p.limit(limitCount, limitOffset, p.distinct(parsed, sort.wrap(group.wrap(s)))), nil
+	// Expand the sub-query plans in the local sub-expressions, if any.
+	// This must be done for filters after index selection and splitting
+	// the filter, since part of the filter may have landed in the source
+	// scanNode and will be expanded there.
+	if err := s.planner.expandSubqueryPlans(s.filter); err != nil {
+		return err
+	}
+	for _, e := range s.render {
+		if err := s.planner.expandSubqueryPlans(e); err != nil {
+			return err
+		}
+	}
+
+	// Expand the source node.
+	return s.source.plan.expandPlan()
 }
 
 // initFrom initializes the table node, given the parsed select expression
-func (s *selectNode) initFrom(p *planner, parsed *parser.SelectClause) error {
-	from := parsed.From
-	var colAlias parser.NameList
-	switch len(from) {
-	case 0:
-		s.table.node = &emptyNode{results: true}
-
-	case 1:
-		ate, ok := from[0].(*parser.AliasedTableExpr)
-		if !ok {
-			return util.UnimplementedWithIssueErrorf(2970, "unsupported FROM type %T", from[0])
-		}
-
-		switch expr := ate.Expr.(type) {
-		case *parser.QualifiedName:
-			// Usual case: a table.
-			scan := p.Scan()
-			s.table.alias, s.err = scan.initTable(p, expr, ate.Hints)
-			if s.err != nil {
-				return s.err
-			}
-			s.table.node = scan
-
-		case *parser.Subquery:
-			// We have a subquery (this includes a simple "VALUES").
-			if ate.As.Alias == "" {
-				return fmt.Errorf("subquery in FROM must have an alias")
-			}
-
-			s.table.node, s.err = p.newPlan(expr.Select, nil, false)
-			if s.err != nil {
-				return s.err
-			}
-
-		default:
-			panic(fmt.Sprintf("unexpected SimpleTableExpr type: %T", expr))
-		}
-
-		if ate.As.Alias != "" {
-			// If an alias was specified, use that.
-			s.table.alias = string(ate.As.Alias)
-		}
-		colAlias = ate.As.Cols
-	default:
-		s.err = util.UnimplementedWithIssueErrorf(2970, "JOINs and SELECTs from multiple tables "+
-			"are not yet supported: %s", from)
-		return s.err
+func (s *selectNode) initFrom(parsed *parser.SelectClause, scanVisibility scanVisibility) error {
+	// AS OF expressions should be handled by the executor.
+	if parsed.From.AsOf.Expr != nil && !s.planner.asOf {
+		return fmt.Errorf("unexpected AS OF SYSTEM TIME")
 	}
-
-	s.table.columns = s.table.node.Columns()
-	if len(colAlias) > 0 {
-		// Make a copy of the slice since we are about to modify the contents.
-		s.table.columns = append([]ResultColumn(nil), s.table.columns...)
-
-		// The column aliases can only refer to explicit columns.
-		for colIdx, aliasIdx := 0, 0; aliasIdx < len(colAlias); colIdx++ {
-			if colIdx >= len(s.table.columns) {
-				return util.Errorf(
-					"table \"%s\" has %d columns available but %d columns specified",
-					s.table.alias, aliasIdx, len(colAlias))
-			}
-			if s.table.columns[colIdx].hidden {
-				continue
-			}
-			s.table.columns[colIdx].Name = string(colAlias[aliasIdx])
-			aliasIdx++
-		}
+	src, err := s.planner.getSources(parsed.From.Tables, scanVisibility)
+	if err != nil {
+		return err
 	}
+	s.source = src
+	s.sourceInfo = multiSourceInfo{s.source.info}
 	return nil
 }
 
@@ -451,8 +452,8 @@ func (s *selectNode) initTargets(targets parser.SelectExprs, desiredTypes []pars
 		if len(desiredTypes) > i {
 			desiredType = desiredTypes[i]
 		}
-		if s.err = s.addRender(target, desiredType); s.err != nil {
-			return s.err
+		if err := s.addRender(target, desiredType); err != nil {
+			return err
 		}
 	}
 	// `groupBy` or `orderBy` may internally add additional columns which we
@@ -470,35 +471,17 @@ func (s *selectNode) initWhere(where *parser.Where) error {
 		return nil
 	}
 
-	var untypedFilter parser.Expr
-	untypedFilter, s.err = s.planner.expandSubqueries(where.Expr, 1)
-	if s.err != nil {
-		return s.err
-	}
-
-	untypedFilter, s.err = s.resolveQNames(untypedFilter)
-	if s.err != nil {
-		return s.err
-	}
-
-	s.filter, s.err = parser.TypeCheckAndRequire(untypedFilter, s.planner.evalCtx.Args,
-		parser.TypeBool, "WHERE")
-	if s.err != nil {
-		return s.err
-	}
-
-	// Normalize the expression (this will also evaluate any branches that are
-	// constant).
-	s.filter, s.err = s.planner.parser.NormalizeExpr(s.planner.evalCtx, s.filter)
-	if s.err != nil {
-		return s.err
+	var err error
+	s.filter, err = s.planner.analyzeExpr(where.Expr, s.sourceInfo, s.qvals,
+		parser.TypeBool, true, "WHERE")
+	if err != nil {
+		return err
 	}
 
 	// Make sure there are no aggregation functions in the filter (after subqueries have been
 	// expanded).
-	if s.planner.aggregateInExpr(s.filter) {
-		s.err = fmt.Errorf("aggregate functions are not allowed in WHERE")
-		return s.err
+	if s.planner.parser.AggregateInExpr(s.filter) {
+		return fmt.Errorf("aggregate functions are not allowed in WHERE")
 	}
 
 	return nil
@@ -509,7 +492,7 @@ func (s *selectNode) initWhere(where *parser.Where) error {
 // "*" into a list of columns. The qvalMap is updated to include all the relevant columns. A
 // ResultColumns and Expr pair is returned for each column.
 func checkRenderStar(
-	target parser.SelectExpr, table *tableInfo, qvals qvalMap,
+	target parser.SelectExpr, src *dataSourceInfo, qvals qvalMap,
 ) (isStar bool, columns []ResultColumn, exprs []parser.TypedExpr, err error) {
 	qname, ok := target.Expr.(*parser.QualifiedName)
 	if !ok {
@@ -522,27 +505,12 @@ func checkRenderStar(
 		return false, nil, nil, nil
 	}
 
-	if table.alias == "" {
-		return false, nil, nil, fmt.Errorf("\"%s\" with no tables specified is not valid", qname)
-	}
 	if target.As != "" {
 		return false, nil, nil, fmt.Errorf("\"%s\" cannot be aliased", qname)
 	}
 
-	// TODO(radu): support multiple FROMs, consolidate with logic in findColumn
-	if tableName := qname.Table(); tableName != "" && !sqlbase.EqualName(table.alias, tableName) {
-		return false, nil, nil, fmt.Errorf("table \"%s\" not found", tableName)
-	}
-
-	for idx, col := range table.columns {
-		if col.hidden {
-			continue
-		}
-		qval := qvals.getQVal(columnRef{table, idx})
-		columns = append(columns, ResultColumn{Name: col.Name, Typ: qval.datum})
-		exprs = append(exprs, qval)
-	}
-	return true, columns, exprs, nil
+	columns, exprs, err = src.expandStar(qname, qvals)
+	return true, columns, exprs, err
 }
 
 // getRenderColName returns the output column name for a render expression.
@@ -561,9 +529,8 @@ func (s *selectNode) addRender(target parser.SelectExpr, desiredType parser.Datu
 	// outputName will be empty if the target is not aliased.
 	outputName := string(target.As)
 
-	if isStar, cols, typedExprs, err := checkRenderStar(target, &s.table, s.qvals); err != nil {
-		s.err = err
-		return s.err
+	if isStar, cols, typedExprs, err := checkRenderStar(target, s.source.info, s.qvals); err != nil {
+		return err
 	} else if isStar {
 		s.columns = append(s.columns, cols...)
 		s.render = append(s.render, typedExprs...)
@@ -575,27 +542,9 @@ func (s *selectNode) addRender(target parser.SelectExpr, desiredType parser.Datu
 	// manipulations to the expression.
 	outputName = getRenderColName(target)
 
-	// Resolve qualified names. This has the side-effect of normalizing any
-	// qualified name found.
-	var resolved parser.Expr
-	var err error
-	if resolved, s.err = s.resolveQNames(target.Expr); s.err != nil {
-		return s.err
-	}
-	if resolved, s.err = s.planner.expandSubqueries(resolved, 1); s.err != nil {
-		return s.err
-	}
-
-	typedResolved, err := parser.TypeCheck(resolved, s.planner.evalCtx.Args, desiredType)
+	normalized, err := s.planner.analyzeExpr(target.Expr, s.sourceInfo, s.qvals, desiredType, false, "")
 	if err != nil {
-		s.err = err
-		return s.err
-	}
-
-	normalized, err := s.planner.parser.NormalizeExpr(s.planner.evalCtx, typedResolved)
-	if err != nil {
-		s.err = err
-		return s.err
+		return err
 	}
 	s.render = append(s.render, normalized)
 
@@ -619,7 +568,7 @@ func (s *selectNode) renderRow() error {
 	}
 	for i, e := range s.render {
 		var err error
-		s.row[i], err = e.Eval(s.planner.evalCtx)
+		s.row[i], err = e.Eval(&s.planner.evalCtx)
 		if err != nil {
 			return err
 		}
@@ -670,7 +619,7 @@ func (s *selectNode) computeOrdering(fromOrder orderingInfo) orderingInfo {
 	// The rows from the index are ordered by k then by v, but since k is an exact match
 	// column the results are also ordered just by v.
 	for colIdx := range fromOrder.exactMatchCols {
-		colRef := columnRef{&s.table, colIdx}
+		colRef := columnRef{s.source.info, colIdx}
 		if renderIdx, ok := s.findRenderIndexForCol(colRef); ok {
 			ordering.addExactMatchColumn(renderIdx)
 		}
@@ -685,12 +634,12 @@ func (s *selectNode) computeOrdering(fromOrder orderingInfo) orderingInfo {
 	// The rows from the index are ordered by k then by v. We cannot make any use of this
 	// ordering as an ordering on v.
 	for _, colOrder := range fromOrder.ordering {
-		colRef := columnRef{&s.table, colOrder.colIdx}
+		colRef := columnRef{s.source.info, colOrder.ColIdx}
 		renderIdx, ok := s.findRenderIndexForCol(colRef)
 		if !ok {
 			return ordering
 		}
-		ordering.addColumn(renderIdx, colOrder.direction)
+		ordering.addColumn(renderIdx, colOrder.Direction)
 	}
 	// We added all columns in fromOrder; we can copy the distinct flag.
 	ordering.unique = fromOrder.unique

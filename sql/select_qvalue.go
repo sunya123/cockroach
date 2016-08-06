@@ -25,12 +25,12 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/sql/parser"
-	"github.com/cockroachdb/cockroach/sql/sqlbase"
+	"github.com/pkg/errors"
 )
 
 // columnRef is a reference to a resultColumn of a FROM node
 type columnRef struct {
-	table *tableInfo
+	source *dataSourceInfo
 
 	// Index of column (in from.columns).
 	colIdx int
@@ -40,48 +40,12 @@ const invalidColIdx = -1
 
 // get dereferences the columnRef to the resultColumn.
 func (cr columnRef) get() ResultColumn {
-	return cr.table.columns[cr.colIdx]
+	return cr.source.sourceColumns[cr.colIdx]
 }
 
 type qvalResolver struct {
-	tables []*tableInfo
-	qvals  qvalMap
-}
-
-// findColumn looks up the column described by a QualifiedName. The qname will be normalized.
-func (qt qvalResolver) findColumn(qname *parser.QualifiedName) (columnRef, error) {
-
-	ref := columnRef{colIdx: invalidColIdx}
-
-	if err := qname.NormalizeColumnName(); err != nil {
-		return ref, err
-	}
-
-	// We can't resolve stars to a single column.
-	if qname.IsStar() {
-		err := fmt.Errorf("qualified name \"%s\" not found", qname)
-		return ref, err
-	}
-
-	colName := sqlbase.NormalizeName(qname.Column())
-	for _, table := range qt.tables {
-		if qname.Base == "" || sqlbase.EqualName(table.alias, string(qname.Base)) {
-			for idx, col := range table.columns {
-				if sqlbase.NormalizeName(col.Name) == colName {
-					if ref.colIdx != invalidColIdx {
-						return ref, fmt.Errorf("column reference \"%s\" is ambiguous", qname)
-					}
-					ref.table = table
-					ref.colIdx = idx
-				}
-			}
-		}
-	}
-
-	if ref.colIdx == invalidColIdx {
-		return ref, fmt.Errorf("qualified name \"%s\" not found", qname)
-	}
-	return ref, nil
+	sources multiSourceInfo
+	qvals   qvalMap
 }
 
 // qvalue implements the parser.VariableExpr interface and is used as a
@@ -102,6 +66,13 @@ var _ parser.VariableExpr = &qvalue{}
 func (*qvalue) Variable() {}
 
 func (q *qvalue) Format(buf *bytes.Buffer, f parser.FmtFlags) {
+	if f == parser.FmtQualify {
+		tableAlias := q.colRef.source.findTableAlias(q.colRef.colIdx)
+		if tableAlias != "" {
+			buf.WriteString(tableAlias)
+			buf.WriteByte('.')
+		}
+	}
 	buf.WriteString(q.colRef.get().Name)
 }
 func (q *qvalue) String() string { return parser.AsString(q) }
@@ -115,12 +86,12 @@ func (q *qvalue) Walk(v parser.Visitor) parser.Expr {
 }
 
 // TypeCheck implements the Expr interface.
-func (q *qvalue) TypeCheck(args parser.MapArgs, desired parser.Datum) (parser.TypedExpr, error) {
+func (q *qvalue) TypeCheck(_ *parser.SemaContext, desired parser.Datum) (parser.TypedExpr, error) {
 	return q, nil
 }
 
 // Eval implements the TypedExpr interface.
-func (q *qvalue) Eval(ctx parser.EvalContext) (parser.Datum, error) {
+func (q *qvalue) Eval(ctx *parser.EvalContext) (parser.Datum, error) {
 	return q.datum.Eval(ctx)
 }
 
@@ -174,21 +145,14 @@ func (v *qnameVisitor) VisitPre(expr parser.Expr) (recurse bool, newNode parser.
 	case *parser.QualifiedName:
 		var colRef columnRef
 
-		colRef, v.err = v.qt.findColumn(t)
+		colRef.source, colRef.colIdx, v.err = v.qt.sources.findColumn(t)
 		if v.err != nil {
 			return false, expr
 		}
 		return true, v.qt.qvals.getQVal(colRef)
 
 	case *parser.FuncExpr:
-		// Special case handling for COUNT(*). This is a special construct to
-		// count the number of rows; in this case * does NOT refer to a set of
-		// columns.
-		if len(t.Name.Indirect) > 0 || !strings.EqualFold(string(t.Name.Base), "count") {
-			break
-		}
-		// The COUNT function takes a single argument. Exit out if this isn't true
-		// as this will be detected during expression evaluation.
+		// Check for invalid use of *, which, if it is an argument, is the only argument.
 		if len(t.Exprs) != 1 {
 			break
 		}
@@ -200,14 +164,18 @@ func (v *qnameVisitor) VisitPre(expr parser.Expr) (recurse bool, newNode parser.
 		if v.err != nil {
 			return false, expr
 		}
-		if !qname.IsStar() {
-			// This will cause us to recurse into the arguments of the function which
-			// will perform normal qualified name resolution.
-			break
+		if qname.IsStar() {
+			// Special case handling for COUNT(*). This is a special construct to
+			// count the number of rows; in this case * does NOT refer to a set of
+			// columns. A * is invalid elsewhere.
+			if len(t.Name.Indirect) == 0 && strings.EqualFold(string(t.Name.Base), "count") {
+				// Replace the function argument with a special non-NULL VariableExpr.
+				t = t.CopyNode()
+				t.Exprs[0] = starDatumInstance
+			} else {
+				v.err = errors.Errorf("cannot use '*' with %s", t.Name)
+			}
 		}
-		// Replace the function argument with a special non-NULL VariableExpr.
-		t = t.CopyNode()
-		t.Exprs[0] = starDatumInstance
 		return true, t
 
 	case *parser.Subquery:
@@ -225,14 +193,14 @@ func (s *selectNode) resolveQNames(expr parser.Expr) (parser.Expr, error) {
 	if s.planner != nil {
 		v = &s.planner.qnameVisitor
 	}
-	return resolveQNames(expr, []*tableInfo{&s.table}, s.qvals, v)
+	return resolveQNames(expr, s.sourceInfo, s.qvals, v)
 }
 
 // resolveQNames walks the provided expression and resolves all qualified
 // names using the tableInfo and qvalMap. The function takes an optional
 // qnameVisitor to provide the caller the option of avoiding an allocation.
 func resolveQNames(
-	expr parser.Expr, tables []*tableInfo, qvals qvalMap, v *qnameVisitor,
+	expr parser.Expr, sources multiSourceInfo, qvals qvalMap, v *qnameVisitor,
 ) (parser.Expr, error) {
 	if expr == nil {
 		return expr, nil
@@ -242,8 +210,8 @@ func resolveQNames(
 	}
 	*v = qnameVisitor{
 		qt: qvalResolver{
-			tables: tables,
-			qvals:  qvals,
+			sources: sources,
+			qvals:   qvals,
 		},
 	}
 	expr, _ = parser.WalkExpr(v, expr)
@@ -251,9 +219,9 @@ func resolveQNames(
 }
 
 // Populates one table's datum fields in the qval map given a row of values.
-func (q qvalMap) populateQVals(table *tableInfo, row parser.DTuple) {
+func (q qvalMap) populateQVals(source *dataSourceInfo, row parser.DTuple) {
 	for ref, qval := range q {
-		if ref.table == table {
+		if ref.source == source {
 			qval.datum = row[ref.colIdx]
 			if qval.datum == nil {
 				panic(fmt.Sprintf("Unpopulated value for column %d", ref.colIdx))
@@ -267,7 +235,7 @@ func (q qvalMap) populateQVals(table *tableInfo, row parser.DTuple) {
 // aggregator since it is not parser.DNull.
 //
 // We need to implement enough functionality to satisfy the type checker and to
-// allow the the intermediate rendering of the value (before the group
+// allow the intermediate rendering of the value (before the group
 // aggregation).
 type starDatum struct{}
 
@@ -287,12 +255,12 @@ func (s *starDatum) String() string { return parser.AsString(s) }
 func (s *starDatum) Walk(v parser.Visitor) parser.Expr { return s }
 
 // TypeCheck implements the Expr interface.
-func (s *starDatum) TypeCheck(args parser.MapArgs, desired parser.Datum) (parser.TypedExpr, error) {
+func (s *starDatum) TypeCheck(_ *parser.SemaContext, desired parser.Datum) (parser.TypedExpr, error) {
 	return s, nil
 }
 
 // Eval implements the TypedExpr interface.
-func (*starDatum) Eval(ctx parser.EvalContext) (parser.Datum, error) {
+func (*starDatum) Eval(ctx *parser.EvalContext) (parser.Datum, error) {
 	return parser.TypeInt.Eval(ctx)
 }
 

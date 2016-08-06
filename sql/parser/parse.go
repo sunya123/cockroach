@@ -24,10 +24,11 @@ package parser
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/util"
+	"github.com/pkg/errors"
 )
 
 //go:generate make
@@ -58,9 +59,10 @@ const (
 // Parser wraps a scanner, parser and other utilities present in the parser
 // package.
 type Parser struct {
-	scanner          scanner
-	parserImpl       sqlParserImpl
-	normalizeVisitor normalizeVisitor
+	scanner            Scanner
+	parserImpl         sqlParserImpl
+	normalizeVisitor   normalizeVisitor
+	isAggregateVisitor IsAggregateVisitor
 }
 
 // Parse parses the sql and returns a list of statements.
@@ -89,24 +91,24 @@ var NoTypePreference = Datum(nil)
 // the new typed expression tree, which additionally permits evaluation and type
 // introspection globally and on each sub-tree.
 //
-// While doing so, it will fold numeric constants and bind var argument names to
-// their inferred types in the args parameter. The optional desired parameter can
+// While doing so, it will fold numeric constants and bind placeholder names to
+// their inferred types in the provided context. The optional desired parameter can
 // be used to hint the desired type for the root of the resulting typed expression
 // tree.
-func TypeCheck(expr Expr, args MapArgs, desired Datum) (TypedExpr, error) {
-	expr, err := foldNumericConstants(expr)
+func TypeCheck(expr Expr, ctx *SemaContext, desired Datum) (TypedExpr, error) {
+	expr, err := foldConstantLiterals(expr)
 	if err != nil {
 		return nil, err
 	}
-	return expr.TypeCheck(args, desired)
+	return expr.TypeCheck(ctx, desired)
 }
 
 // TypeCheckAndRequire performs type checking on the provided expression tree in
 // an identical manner to TypeCheck. It then asserts that the resulting TypedExpr
 // has the provided return type, returning both the typed expression and an error
 // if it does not.
-func TypeCheckAndRequire(expr Expr, args MapArgs, required Datum, op string) (TypedExpr, error) {
-	typedExpr, err := TypeCheck(expr, args, required)
+func TypeCheckAndRequire(expr Expr, ctx *SemaContext, required Datum, op string) (TypedExpr, error) {
+	typedExpr, err := TypeCheck(expr, ctx, required)
 	if err != nil {
 		return nil, err
 	}
@@ -119,7 +121,10 @@ func TypeCheckAndRequire(expr Expr, args MapArgs, required Datum, op string) (Ty
 
 // NormalizeExpr is wrapper around ctx.NormalizeExpr which avoids allocation of
 // a normalizeVisitor.
-func (p *Parser) NormalizeExpr(ctx EvalContext, typedExpr TypedExpr) (TypedExpr, error) {
+func (p *Parser) NormalizeExpr(ctx *EvalContext, typedExpr TypedExpr) (TypedExpr, error) {
+	if ctx.SkipNormalize {
+		return typedExpr, nil
+	}
 	p.normalizeVisitor = normalizeVisitor{ctx: ctx}
 	expr, _ := WalkExpr(&p.normalizeVisitor, typedExpr)
 	if err := p.normalizeVisitor.err; err != nil {
@@ -146,7 +151,7 @@ func ParseOne(sql string, syntax Syntax) (Statement, error) {
 		return nil, err
 	}
 	if len(stmts) != 1 {
-		return nil, util.Errorf("expected 1 statement, but found %d", len(stmts))
+		return nil, errors.Errorf("expected 1 statement, but found %d", len(stmts))
 	}
 	return stmts[0], nil
 }
@@ -156,27 +161,35 @@ func ParseOneTraditional(sql string) (Statement, error) {
 	return ParseOne(sql, Traditional)
 }
 
-// parseExpr parses a sql expression.
-func parseExpr(expr string, syntax Syntax) (Expr, error) {
-	stmt, err := ParseOne(`SELECT `+expr, syntax)
+// parseExprs parses one or more sql expression.
+func parseExprs(exprs []string, syntax Syntax) (Exprs, error) {
+	stmt, err := ParseOne(fmt.Sprintf("SET ROW (%s)", strings.Join(exprs, ",")), syntax)
 	if err != nil {
 		return nil, err
 	}
-	sel, ok := stmt.(*Select)
+	set, ok := stmt.(*Set)
 	if !ok {
-		return nil, util.Errorf("expected a SELECT statement, but found %T", stmt)
+		return nil, errors.Errorf("expected a SET statement, but found %T", stmt)
 	}
-	selClause, ok := sel.Select.(*SelectClause)
-	if !ok {
-		return nil, util.Errorf("expected a SELECT statement, but found %T", sel.Select)
-	}
-	if n := len(selClause.Exprs); n != 1 {
-		return nil, util.Errorf("expected 1 expression, but found %d", n)
-	}
-	return selClause.Exprs[0].Expr, nil
+	return set.Values, nil
 }
 
-// ParseExprTraditional is a short-hand for parseExpr(sql, Traditional)
+// ParseExprsTraditional is a short-hand for parseExprs(Traditional, sql)
+func ParseExprsTraditional(sql []string) (Exprs, error) {
+	if len(sql) == 0 {
+		return Exprs{}, nil
+	}
+	return parseExprs(sql, Traditional)
+}
+
+// ParseExprTraditional is a short-hand for parseExprs(Traditional, []string{sql})
 func ParseExprTraditional(sql string) (Expr, error) {
-	return parseExpr(sql, Traditional)
+	exprs, err := parseExprs([]string{sql}, Traditional)
+	if err != nil {
+		return nil, err
+	}
+	if len(exprs) != 1 {
+		return nil, errors.Errorf("expected 1 expression, found %d", len(exprs))
+	}
+	return exprs[0], nil
 }

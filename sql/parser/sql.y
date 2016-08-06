@@ -20,9 +20,10 @@
 package parser
 
 import (
-	"errors"
 	"go/constant"
 	"go/token"
+
+    "github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/sql/privilege"
 	"github.com/cockroachdb/cockroach/util"
@@ -45,7 +46,7 @@ func unimplementedWithIssue(issue int) {
 // The purpose of the sqlSymUnion struct is to reduce the memory footprint of
 // the sqlSymType because only one value (of a variety of types) is ever needed
 // to be stored in the union field at a time.
-// 
+//
 // By using an empty interface, we lose the type checking previously provided
 // by yacc and the Go compiler when dealing with union values. Instead, runtime
 // type assertions must be relied upon in the methods below, and as such, the
@@ -146,14 +147,20 @@ func (u *sqlSymUnion) tblDef() TableDef {
 func (u *sqlSymUnion) tblDefs() TableDefs {
     return u.val.(TableDefs)
 }
-func (u *sqlSymUnion) colQual() ColumnQualification {
+func (u *sqlSymUnion) colQual() NamedColumnQualification {
+    if colQual, ok := u.val.(NamedColumnQualification); ok {
+        return colQual
+    }
+    return NamedColumnQualification{}
+}
+func (u *sqlSymUnion) colQualElem() ColumnQualification {
     if colQual, ok := u.val.(ColumnQualification); ok {
         return colQual
     }
     return nil
 }
-func (u *sqlSymUnion) colQuals() []ColumnQualification {
-    return u.val.([]ColumnQualification)
+func (u *sqlSymUnion) colQuals() []NamedColumnQualification {
+    return u.val.([]NamedColumnQualification)
 }
 func (u *sqlSymUnion) colType() ColumnType {
     if colType, ok := u.val.(ColumnType); ok {
@@ -185,6 +192,9 @@ func (u *sqlSymUnion) retExprs() ReturningExprs {
 func (u *sqlSymUnion) aliasClause() AliasClause {
     return u.val.(AliasClause)
 }
+func (u *sqlSymUnion) asOfClause() AsOfClause {
+    return u.val.(AsOfClause)
+}
 func (u *sqlSymUnion) tblExpr() TableExpr {
     if tblExpr, ok := u.val.(TableExpr); ok {
         return tblExpr
@@ -193,6 +203,9 @@ func (u *sqlSymUnion) tblExpr() TableExpr {
 }
 func (u *sqlSymUnion) tblExprs() TableExprs {
     return u.val.(TableExprs)
+}
+func (u *sqlSymUnion) from() *From {
+    return u.val.(*From)
 }
 func (u *sqlSymUnion) joinCond() JoinCond {
     if joinCond, ok := u.val.(JoinCond); ok {
@@ -266,8 +279,17 @@ func (u *sqlSymUnion) idxElem() IndexElem {
 func (u *sqlSymUnion) idxElems() IndexElemList {
     return u.val.(IndexElemList)
 }
+func (u *sqlSymUnion) famElem() FamilyElem {
+    return u.val.(FamilyElem)
+}
+func (u *sqlSymUnion) famElems() FamilyElemList {
+    return u.val.(FamilyElemList)
+}
 func (u *sqlSymUnion) dropBehavior() DropBehavior {
     return u.val.(DropBehavior)
+}
+func (u *sqlSymUnion) interleave() *InterleaveDef {
+    return u.val.(*InterleaveDef)
 }
 
 %}
@@ -293,9 +315,12 @@ func (u *sqlSymUnion) dropBehavior() DropBehavior {
 %type <Statement> drop_stmt
 %type <Statement> explain_stmt
 %type <Statement> explainable_stmt
+%type <Statement> prepare_stmt
+%type <Statement> preparable_stmt
+%type <Statement> execute_stmt
+%type <Statement> deallocate_stmt
 %type <Statement> grant_stmt
 %type <Statement> insert_stmt
-%type <Statement> preparable_stmt
 %type <Statement> release_stmt
 %type <Statement> rename_stmt
 %type <Statement> revoke_stmt
@@ -347,15 +372,18 @@ func (u *sqlSymUnion) dropBehavior() DropBehavior {
 %type <empty> opt_encoding
 
 %type <TableDefs> opt_table_elem_list table_elem_list
+%type <*InterleaveDef> opt_interleave
 %type <empty> opt_all_clause
 %type <bool> distinct_clause
 %type <[]string> opt_column_list
 %type <OrderBy> sort_clause opt_sort_clause
 %type <[]*Order> sortby_list
 %type <IndexElemList> index_params
+%type <FamilyElemList> family_params
 %type <[]string> name_list opt_name_list
 %type <empty> opt_array_bounds
-%type <TableExprs> from_clause from_list
+%type <*From> from_clause update_from_clause
+%type <TableExprs> from_list
 %type <QualifiedNames> qualified_name_list
 %type <QualifiedNames> indirect_name_or_glob_list
 %type <*QualifiedName> any_name
@@ -382,6 +410,7 @@ func (u *sqlSymUnion) dropBehavior() DropBehavior {
 %type <Exprs> position_list
 %type <Exprs> substr_list
 %type <Exprs> trim_list
+%type <Exprs> execute_param_clause
 %type <empty> opt_interval interval_second
 %type <Expr> overlay_placing
 
@@ -399,7 +428,7 @@ func (u *sqlSymUnion) dropBehavior() DropBehavior {
 %type <[]string> opt_conf_expr
 %type <*OnConflict> on_conflict
 
-%type <Statement>  generic_set set_rest set_rest_more transaction_mode_list opt_transaction_mode_list
+%type <Statement>  generic_set set_rest set_rest_more transaction_mode_list opt_transaction_mode_list set_exprs_internal
 
 %type <[]string> opt_storing
 %type <*ColumnTableDef> column_def
@@ -416,7 +445,7 @@ func (u *sqlSymUnion) dropBehavior() DropBehavior {
 %type <Expr>  in_expr
 %type <Expr>  having_clause
 %type <Expr>  array_expr
-%type <[]ColumnType> type_list
+%type <[]ColumnType> type_list prep_type_clause
 %type <Exprs> array_expr_list
 %type <Expr>  row explicit_row implicit_row
 %type <Expr>  case_expr case_arg case_default
@@ -428,12 +457,14 @@ func (u *sqlSymUnion) dropBehavior() DropBehavior {
 %type <AliasClause> alias_clause opt_alias_clause
 %type <*Order> sortby
 %type <IndexElem> index_elem
+%type <FamilyElem> family_elem
 %type <TableExpr> table_ref
 %type <TableExpr> joined_table
 %type <*QualifiedName> relation_expr
 %type <TableExpr> relation_expr_opt_alias
 %type <SelectExpr> target_elem
 %type <*UpdateExpr> single_set_clause
+%type <AsOfClause> opt_as_of_clause
 
 %type <str> explain_option_name
 %type <[]string> explain_option_list
@@ -464,8 +495,10 @@ func (u *sqlSymUnion) dropBehavior() DropBehavior {
 
 %type <ConstraintTableDef> table_constraint constraint_elem
 %type <TableDef> index_def
-%type <[]ColumnQualification> col_qual_list
-%type <ColumnQualification> col_qualification col_qualification_elem
+%type <TableDef> family_def
+%type <[]NamedColumnQualification> col_qual_list
+%type <NamedColumnQualification> col_qualification
+%type <ColumnQualification> col_qualification_elem
 %type <empty> key_actions key_delete key_match key_update key_action
 
 %type <Expr>  func_application func_expr_common_subexpr
@@ -496,9 +529,10 @@ func (u *sqlSymUnion) dropBehavior() DropBehavior {
 // errors. It is needed by PL/pgsql.
 %token <str>   IDENT SCONST BCONST
 %token <*NumVal> ICONST FCONST
-%token <str>   PARAM
+%token <str>   PLACEHOLDER
 %token <str>   TYPECAST DOT_DOT
 %token <str>   LESS_EQUALS GREATER_EQUALS NOT_EQUALS
+%token <str>   NOT_REGMATCH REGIMATCH NOT_REGIMATCH
 %token <str>   ERROR
 
 // If you want to make any keyword changes, update the keyword table in
@@ -508,36 +542,36 @@ func (u *sqlSymUnion) dropBehavior() DropBehavior {
 
 // Ordinary key words in alphabetical order.
 %token <str>   ACTION ADD
-%token <str>   ALL ALTER ANALYSE ANALYZE AND ANY ARRAY AS ASC
+%token <str>   ALL ALTER ANALYSE ANALYZE AND ANY ANNOTATE_TYPE ARRAY AS ASC
 %token <str>   ASYMMETRIC AT
 
-%token <str>   BEGIN BETWEEN BIGINT BIT
+%token <str>   BEGIN BETWEEN BIGINT BIGSERIAL BIT
 %token <str>   BLOB BOOL BOOLEAN BOTH BY BYTEA BYTES
 
 %token <str>   CASCADE CASE CAST CHAR
 %token <str>   CHARACTER CHARACTERISTICS CHECK
 %token <str>   COALESCE COLLATE COLLATION COLUMN COLUMNS COMMIT
-%token <str>   COMMITTED CONCAT CONFLICT CONSTRAINT
+%token <str>   COMMITTED CONCAT CONFLICT CONSTRAINT CONSTRAINTS
 %token <str>   COVERING CREATE
 %token <str>   CROSS CUBE CURRENT CURRENT_CATALOG CURRENT_DATE
 %token <str>   CURRENT_ROLE CURRENT_TIME CURRENT_TIMESTAMP
 %token <str>   CURRENT_USER CYCLE
 
 %token <str>   DATA DATABASE DATABASES DATE DAY DEC DECIMAL DEFAULT
-%token <str>   DEFERRABLE DELETE DESC
+%token <str>   DEALLOCATE DEFERRABLE DELETE DESC
 %token <str>   DISTINCT DO DOUBLE DROP
 
 %token <str>   ELSE ENCODING END ESCAPE EXCEPT
-%token <str>   EXISTS EXPLAIN EXTRACT
+%token <str>   EXISTS EXECUTE EXPLAIN EXTRACT
 
-%token <str>   FALSE FETCH FILTER FIRST FLOAT FOLLOWING FOR
+%token <str>   FALSE FAMILY FETCH FILTER FIRST FLOAT FLOORDIV FOLLOWING FOR
 %token <str>   FORCE_INDEX FOREIGN FROM FULL
 
 %token <str>   GRANT GRANTS GREATEST GROUP GROUPING
 
 %token <str>   HAVING HIGH HOUR
 
-%token <str>   IF IFNULL IN
+%token <str>   IF IFNULL ILIKE IN INTERLEAVE
 %token <str>   INDEX INDEXES INITIALLY
 %token <str>   INNER INSERT INT INT64 INTEGER
 %token <str>   INTERSECT INTERVAL INTO IS ISOLATION
@@ -559,8 +593,8 @@ func (u *sqlSymUnion) dropBehavior() DropBehavior {
 %token <str>   OF OFF OFFSET ON ONLY OR
 %token <str>   ORDER ORDINALITY OUT OUTER OVER OVERLAPS OVERLAY
 
-%token <str>   PARTIAL PARTITION PLACING POSITION
-%token <str>   PRECEDING PRECISION PRIMARY PRIORITY
+%token <str>   PARENT PARTIAL PARTITION PLACING POSITION
+%token <str>   PRECEDING PRECISION PREPARE PRIMARY PRIORITY
 
 %token <str>   RANGE READ REAL RECURSIVE REF REFERENCES
 %token <str>   RENAME REPEATABLE
@@ -569,9 +603,9 @@ func (u *sqlSymUnion) dropBehavior() DropBehavior {
 
 %token <str>   SAVEPOINT SEARCH SECOND SELECT
 %token <str>   SERIAL SERIALIZABLE SESSION SESSION_USER SET SHOW
-%token <str>   SIMILAR SIMPLE SMALLINT SNAPSHOT SOME SQL
+%token <str>   SIMILAR SIMPLE SMALLINT SMALLSERIAL SNAPSHOT SOME SQL
 %token <str>   START STRICT STRING STORING SUBSTRING
-%token <str>   SYMMETRIC
+%token <str>   SYMMETRIC SYSTEM
 
 %token <str>   TABLE TABLES TEXT THEN
 %token <str>   TIME TIMESTAMP TIMESTAMPTZ TO TRAILING TRANSACTION TREAT TRIM TRUE
@@ -596,7 +630,7 @@ func (u *sqlSymUnion) dropBehavior() DropBehavior {
 // precedence as LIKE; otherwise they'd effectively have the same precedence as
 // NOT, at least with respect to their left-hand subexpression. WITH_LA is
 // needed to make the grammar LALR(1).
-%token     NOT_LA WITH_LA
+%token     NOT_LA WITH_LA AS_LA
 
 // Precedence: lowest to highest
 %nonassoc  SET                 // see relation_expr_opt_alias
@@ -607,8 +641,8 @@ func (u *sqlSymUnion) dropBehavior() DropBehavior {
 %right     NOT
 %nonassoc  IS                  // IS sets precedence for IS NULL, etc
 %nonassoc  '<' '>' '=' LESS_EQUALS GREATER_EQUALS NOT_EQUALS
-%nonassoc  BETWEEN IN LIKE SIMILAR NOT_LA
-%nonassoc  ESCAPE              // ESCAPE must be just above LIKE/SIMILAR
+%nonassoc  BETWEEN IN LIKE ILIKE SIMILAR NOT_REGMATCH REGIMATCH, NOT_REGIMATCH NOT_LA
+%nonassoc  ESCAPE              // ESCAPE must be just above LIKE/ILIKE/SIMILAR
 %nonassoc  OVERLAPS
 %left      POSTFIXOP           // dummy for postfix OP rules
 // To support target_elem without AS, we must give IDENT an explicit priority
@@ -642,7 +676,7 @@ func (u *sqlSymUnion) dropBehavior() DropBehavior {
 %left      '&'
 %left      LSHIFT RSHIFT
 %left      '+' '-'
-%left      '*' '/' '%'
+%left      '*' '/' FLOORDIV '%'
 // Unary Operators
 %left      AT                // sets precedence for AT TIME ZONE
 %left      COLLATE
@@ -650,6 +684,8 @@ func (u *sqlSymUnion) dropBehavior() DropBehavior {
 %left      '~'
 %left      '[' ']'
 %left      '(' ')'
+// TODO(nvanbenschoten) introduce a shorthand type annotation notation.
+// %left      '!' TYPECAST
 %left      TYPECAST
 %left      '.'
 // These might seem to be low-precedence, but actually they are not part
@@ -664,7 +700,7 @@ func (u *sqlSymUnion) dropBehavior() DropBehavior {
 stmt_block:
   stmt_list
   {
-    sqllex.(*scanner).stmts = $1.stmts()
+    sqllex.(*Scanner).stmts = $1.stmts()
   }
 
 stmt_list:
@@ -689,6 +725,9 @@ stmt:
 | delete_stmt
 | drop_stmt
 | explain_stmt
+| prepare_stmt
+| execute_stmt
+| deallocate_stmt
 | grant_stmt
 | insert_stmt
 | rename_stmt
@@ -811,10 +850,6 @@ alter_table_cmd:
 alter_column_default:
   SET DEFAULT a_expr
   {
-    if containsSubquery($3.expr()) {
-      sqllex.Error("default expression contains a subquery")
-      return 1
-    }
     $$.val = $3.expr()
   }
 | DROP DEFAULT
@@ -883,13 +918,13 @@ drop_stmt:
       DropBehavior: $6.dropBehavior(),
     }
   }
-| DROP TABLE any_name_list
+| DROP TABLE any_name_list opt_drop_behavior
   {
-    $$.val = &DropTable{Names: $3.qnames(), IfExists: false}
+    $$.val = &DropTable{Names: $3.qnames(), IfExists: false, DropBehavior: $4.dropBehavior()}
   }
-| DROP TABLE IF EXISTS any_name_list
+| DROP TABLE IF EXISTS any_name_list opt_drop_behavior
   {
-    $$.val = &DropTable{Names: $5.qnames(), IfExists: true}
+    $$.val = &DropTable{Names: $5.qnames(), IfExists: true, DropBehavior: $6.dropBehavior()}
   }
 
 any_name_list:
@@ -938,9 +973,13 @@ explainable_stmt:
   {
     $$.val = $1.slct()
   }
+| create_stmt
+| drop_stmt
+| alter_table_stmt
 | insert_stmt
 | update_stmt
 | delete_stmt
+| explain_stmt { /* SKIP DOC */ }
 
 explain_option_list:
   explain_option_name
@@ -954,6 +993,81 @@ explain_option_list:
 
 explain_option_name:
   non_reserved_word
+
+// PREPARE <plan_name> [(args, ...)] AS <query>
+prepare_stmt:
+  PREPARE name prep_type_clause AS preparable_stmt
+	{
+    $$.val = &Prepare{
+      Name: Name($2),
+      Types: $3.colTypes(),
+      Statement: $5.stmt(),
+    }
+  }
+
+prep_type_clause:
+  '(' type_list ')'
+  {
+    $$.val = $2.colTypes();
+  }
+| /* EMPTY */
+  {
+    $$.val = []ColumnType(nil)
+  }
+
+preparable_stmt:
+  select_stmt
+  {
+    $$.val = $1.slct()
+  }
+| insert_stmt
+| update_stmt
+| delete_stmt
+
+execute_stmt:
+  // EXECUTE <plan_name> [(params, ...)]
+  EXECUTE name execute_param_clause
+  {
+    $$.val = &Execute{
+      Name: Name($2),
+      Params: $3.exprs(),
+    }
+  }
+  // CREATE TABLE <name> AS EXECUTE <plan_name> [(params, ...)]
+// | CREATE opt_temp TABLE create_as_target AS EXECUTE name execute_param_clause opt_with_data { unimplemented() }
+
+execute_param_clause:
+  '(' expr_list ')'
+  {
+    $$.val = $2.exprs()
+  }
+| /* EMPTY */
+  {
+    $$.val = Exprs(nil)
+  }
+
+// DEALLOCATE [PREPARE] <plan_name>
+deallocate_stmt:
+  DEALLOCATE name
+  {
+    $$.val = &Deallocate{
+      Name: Name($2),
+    }
+  }
+| DEALLOCATE PREPARE name
+  {
+    $$.val = &Deallocate{
+      Name: Name($3),
+    }
+  }
+| DEALLOCATE ALL
+  {
+    $$.val = &Deallocate{}
+  }
+| DEALLOCATE PREPARE ALL
+  {
+    $$.val = &Deallocate{}
+  }
 
 // GRANT privileges ON privilege_target TO grantee_list
 grant_stmt:
@@ -973,11 +1087,11 @@ revoke_stmt:
 privilege_target:
   indirect_name_or_glob_list
   {
-    $$.val = TargetList{Tables: QualifiedNames($1.qnames())}
+    $$.val = TargetList{Tables: $1.qnames()}
   }
 | TABLE indirect_name_or_glob_list
   {
-    $$.val = TargetList{Tables: QualifiedNames($2.qnames())}
+    $$.val = TargetList{Tables: $2.qnames()}
   }
 |  DATABASE name_list
   {
@@ -1064,6 +1178,15 @@ set_stmt:
   {
     $$.val = $3.stmt()
   }
+| set_exprs_internal { /* SKIP DOC */ }
+
+set_exprs_internal:
+  /* SET ROW serves to accelerate parser.parseExprs().
+     It cannot be used by clients. */
+  SET ROW '(' expr_list ')'
+  {
+    $$.val = &Set{Values: $4.exprs()}
+  }
 
 set_rest:
   TRANSACTION transaction_mode_list
@@ -1142,9 +1265,9 @@ var_list:
 var_value:
   opt_boolean_or_string
 | numeric_only
-| PARAM
+| PLACEHOLDER
   {
-    $$.val = ValArg{Name: $1}
+    $$.val = Placeholder{Name: $1}
   }
 
 iso_level:
@@ -1217,20 +1340,10 @@ zone_value:
   }
 | const_interval SCONST opt_interval
   {
-    expr := &CastExpr{Expr: &StrVal{s: $2}, Type: $1.colType()}
-    typedExpr, err := TypeCheck(expr, nil, NoTypePreference)
+    d, err := ParseDInterval($2)
     if err != nil {
-      sqllex.Error("cannot type check interval type: " + err.Error())
+      sqllex.Error(err.Error())
       return 1
-    }
-    var ctx EvalContext
-    d, err := typedExpr.Eval(ctx)
-    if err != nil {
-      sqllex.Error("cannot evaluate to an interval type: " + err.Error())
-      return 1
-    }
-    if _, ok := d.(*DInterval); !ok {
-      panic("not an interval type")
     }
     $$.val = d
   }
@@ -1287,6 +1400,14 @@ show_stmt:
 | SHOW INDEXES FROM var_name
   {
     $$.val = &ShowIndex{Table: $4.qname()}
+  }
+| SHOW CONSTRAINT FROM var_name
+  {
+    $$.val = &ShowConstraints{Table: $4.qname()}
+  }
+| SHOW CONSTRAINTS FROM var_name
+  {
+    $$.val = &ShowConstraints{Table: $4.qname()}
   }
 | SHOW KEYS FROM var_name
   {
@@ -1350,13 +1471,13 @@ for_grantee_clause:
 
 // CREATE TABLE relname
 create_table_stmt:
-  CREATE TABLE any_name '(' opt_table_elem_list ')'
+  CREATE TABLE any_name '(' opt_table_elem_list ')' opt_interleave
   {
-    $$.val = &CreateTable{Table: $3.qname(), IfNotExists: false, Defs: $5.tblDefs()}
+    $$.val = &CreateTable{Table: $3.qname(), IfNotExists: false, Interleave: $7.interleave(), Defs: $5.tblDefs()}
   }
-| CREATE TABLE IF NOT EXISTS any_name '(' opt_table_elem_list ')'
+| CREATE TABLE IF NOT EXISTS any_name '(' opt_table_elem_list ')' opt_interleave
   {
-    $$.val = &CreateTable{Table: $6.qname(), IfNotExists: true, Defs: $8.tblDefs()}
+    $$.val = &CreateTable{Table: $6.qname(), IfNotExists: true, Interleave: $10.interleave(), Defs: $8.tblDefs()}
   }
 
 opt_table_elem_list:
@@ -1382,9 +1503,25 @@ table_elem:
     $$.val = $1.colDef()
   }
 | index_def
+| family_def
 | table_constraint
   {
     $$.val = $1.constraintDef()
+  }
+
+opt_interleave:
+  INTERLEAVE IN PARENT name '(' name_list ')' opt_drop_behavior
+  {
+    /* SKIP DOC */
+    $$.val = &InterleaveDef{
+        Parent: &QualifiedName{Base: Name($4)},
+        Fields: $6.strs(),
+        DropBehavior: $8.dropBehavior(),
+    }
+  }
+| /* EMPTY */
+  {
+    $$.val = (*InterleaveDef)(nil)
   }
 
 column_def:
@@ -1400,16 +1537,31 @@ col_qual_list:
   }
 | /* EMPTY */
   {
-    $$.val = []ColumnQualification(nil)
+    $$.val = []NamedColumnQualification(nil)
   }
 
 col_qualification:
   CONSTRAINT name col_qualification_elem
   {
-    $$.val = $3.colQual()
+    $$.val = NamedColumnQualification{Name: Name($2), Qualification: $3.colQualElem()}
   }
 | col_qualification_elem
+  {
+    $$.val = NamedColumnQualification{Qualification: $1.colQualElem()}
+  }
 | COLLATE any_name { unimplemented() }
+| FAMILY name
+  {
+    $$.val = NamedColumnQualification{Qualification: &ColumnFamilyConstraint{Family: Name($2)}}
+  }
+| CREATE FAMILY opt_name
+  {
+    $$.val = NamedColumnQualification{Qualification: &ColumnFamilyConstraint{Family: Name($3), Create: true}}
+  }
+| CREATE IF NOT EXISTS FAMILY name
+  {
+    $$.val = NamedColumnQualification{Qualification: &ColumnFamilyConstraint{Family: Name($6), Create: true, IfNotExists: true}}
+  }
 
 // DEFAULT NULL is already the default for Postgres. But define it here and
 // carry it forward into the system to make it explicit.
@@ -1446,10 +1598,6 @@ col_qualification_elem:
   }
 | DEFAULT b_expr
   {
-    if containsSubquery($2.expr()) {
-      sqllex.Error("default expression contains a subquery")
-      return 1
-    }
     $$.val = &ColumnDefault{Expr: $2.expr()}
   }
 | REFERENCES qualified_name opt_name_parens key_match key_actions
@@ -1461,22 +1609,33 @@ col_qualification_elem:
  }
 
 index_def:
-  INDEX opt_name '(' index_params ')' opt_storing
+  INDEX opt_name '(' index_params ')' opt_storing opt_interleave
   {
     $$.val = &IndexTableDef{
       Name:    Name($2),
       Columns: $4.idxElems(),
       Storing: $6.strs(),
+      Interleave: $7.interleave(),
     }
   }
-| UNIQUE INDEX opt_name '(' index_params ')' opt_storing
+| UNIQUE INDEX opt_name '(' index_params ')' opt_storing opt_interleave
   {
     $$.val = &UniqueConstraintTableDef{
       IndexTableDef: IndexTableDef {
         Name:    Name($3),
         Columns: $5.idxElems(),
         Storing: $7.strs(),
+        Interleave: $8.interleave(),
       },
+    }
+  }
+
+family_def:
+  FAMILY opt_name '(' family_params ')'
+  {
+    $$.val = &FamilyTableDef{
+      Name: Name($2),
+      Columns: $4.famElems(),
     }
   }
 
@@ -1501,12 +1660,13 @@ constraint_elem:
       Expr: $3.expr(),
     }
   }
-| UNIQUE '(' name_list ')' opt_storing
+| UNIQUE '(' name_list ')' opt_storing opt_interleave
   {
     $$.val = &UniqueConstraintTableDef{
       IndexTableDef: IndexTableDef{
         Columns: NameListToIndexElems($3.strs()),
         Storing: $5.strs(),
+        Interleave: $6.interleave(),
       },
     }
   }
@@ -1520,7 +1680,14 @@ constraint_elem:
     }
   }
 | FOREIGN KEY '(' name_list ')' REFERENCES qualified_name
-    opt_column_list key_match key_actions { unimplemented() }
+    opt_column_list key_match key_actions
+  {
+    $$.val = &ForeignKeyConstraintTableDef{
+      Table: $7.qname(),
+      FromCols: $4.strs(),
+      ToCols: $8.strs(),
+    }
+  }
 
 storing:
   COVERING
@@ -1608,7 +1775,7 @@ truncate_stmt:
 
 // CREATE INDEX
 create_index_stmt:
-  CREATE opt_unique INDEX opt_name ON qualified_name '(' index_params ')' opt_storing
+  CREATE opt_unique INDEX opt_name ON qualified_name '(' index_params ')' opt_storing opt_interleave
   {
     $$.val = &CreateIndex{
       Name:    Name($4),
@@ -1616,9 +1783,10 @@ create_index_stmt:
       Unique:  $2.bool(),
       Columns: $8.idxElems(),
       Storing: $10.strs(),
+      Interleave: $11.interleave(),
     }
   }
-| CREATE opt_unique INDEX IF NOT EXISTS name ON qualified_name '(' index_params ')' opt_storing
+| CREATE opt_unique INDEX IF NOT EXISTS name ON qualified_name '(' index_params ')' opt_storing opt_interleave
   {
     $$.val = &CreateIndex{
       Name:        Name($7),
@@ -1627,6 +1795,7 @@ create_index_stmt:
       IfNotExists: true,
       Columns:     $11.idxElems(),
       Storing:     $13.strs(),
+      Interleave: $14.interleave(),
     }
   }
 
@@ -1660,6 +1829,22 @@ index_elem:
   }
 | func_expr_windowless opt_collate opt_asc_desc { unimplemented() }
 | '(' a_expr ')' opt_collate opt_asc_desc { unimplemented() }
+
+family_params:
+  family_elem
+  {
+    $$.val = FamilyElemList{$1.famElem()}
+  }
+| family_params ',' family_elem
+  {
+    $$.val = append($1.famElems(), $3.famElem())
+  }
+
+family_elem:
+  name
+  {
+    $$.val = FamilyElem{Column: Name($1)}
+  }
 
 opt_collate:
   COLLATE any_name { unimplemented() }
@@ -1938,10 +2123,15 @@ returning_clause:
 
 update_stmt:
   opt_with_clause UPDATE relation_expr_opt_alias
-    SET set_clause_list from_clause where_clause returning_clause
+    SET set_clause_list update_from_clause where_clause returning_clause
   {
     $$.val = &Update{Table: $3.tblExpr(), Exprs: $5.updateExprs(), Where: newWhere(astWhere, $7.expr()), Returning: $8.retExprs()}
   }
+
+// Mark this as unimplemented until the normal from_clause is supported here.
+update_from_clause:
+  FROM from_list { unimplementedWithIssue(7841) }
+| /* EMPTY */ {}
 
 set_clause_list:
   set_clause
@@ -2101,7 +2291,7 @@ simple_select:
   {
     $$.val = &SelectClause{
       Exprs:   $3.selExprs(),
-      From:    $4.tblExprs(),
+      From:    $4.from(),
       Where:   newWhere(astWhere, $5.expr()),
       GroupBy: $6.groupBy(),
       Having:  newWhere(astHaving, $7.expr()),
@@ -2114,7 +2304,7 @@ simple_select:
     $$.val = &SelectClause{
       Distinct: $2.bool(),
       Exprs:    $3.selExprs(),
-      From:     $4.tblExprs(),
+      From:     $4.from(),
       Where:    newWhere(astWhere, $5.expr()),
       GroupBy:  $6.groupBy(),
       Having:   newWhere(astHaving, $7.expr()),
@@ -2125,7 +2315,7 @@ simple_select:
   {
     $$.val = &SelectClause{
       Exprs:       SelectExprs{starSelectExpr()},
-      From:        TableExprs{&AliasedTableExpr{Expr: $2.qname()}},
+      From:        &From{Tables: TableExprs{&AliasedTableExpr{Expr: $2.qname()}}},
       tableSelect: true,
     }
   }
@@ -2176,15 +2366,6 @@ cte_list:
 
 common_table_expr:
   name opt_name_list AS '(' preparable_stmt ')' { unimplemented() }
-
-preparable_stmt:
-  select_stmt
-  {
-    $$.val = $1.slct()
-  }
-| insert_stmt
-| update_stmt
-| delete_stmt
 
 opt_with_clause:
   with_clause { unimplemented() }
@@ -2377,13 +2558,13 @@ values_clause:
 //  where_clause  - qualifications for joins or restrictions
 
 from_clause:
-  FROM from_list
+  FROM from_list opt_as_of_clause
   {
-    $$.val = $2.tblExprs()
+    $$.val = &From{Tables: $2.tblExprs(), AsOf: $3.asOfClause()}
   }
 | /* EMPTY */
   {
-    $$.val = TableExprs(nil)
+    $$.val = &From{}
   }
 
 from_list:
@@ -2457,7 +2638,13 @@ table_ref:
     $$.val = &AliasedTableExpr{Expr: &Subquery{Select: $1.selectStmt()}, As: $2.aliasClause()}
   }
 | joined_table
-| '(' joined_table ')' alias_clause { unimplemented() }
+  {
+    $$.val = $1.tblExpr()
+  }
+| '(' joined_table ')' alias_clause
+  {
+   $$.val = &AliasedTableExpr{Expr: $2.tblExpr(), As: $4.aliasClause()}
+  }
 
 // It may seem silly to separate joined_table from table_ref, but there is
 // method in SQL's madness: if you don't do it this way you get reduce- reduce
@@ -2492,11 +2679,11 @@ joined_table:
   }
 | table_ref NATURAL join_type JOIN table_ref
   {
-    $$.val = &JoinTableExpr{Join: astNaturalJoin, Left: $1.tblExpr(), Right: $5.tblExpr()}
+    $$.val = &JoinTableExpr{Join: $3, Left: $1.tblExpr(), Right: $5.tblExpr(), Cond: NaturalJoinCond{}}
   }
 | table_ref NATURAL JOIN table_ref
   {
-    $$.val = &JoinTableExpr{Join: astNaturalJoin, Left: $1.tblExpr(), Right: $4.tblExpr()}
+    $$.val = &JoinTableExpr{Join: astJoin, Left: $1.tblExpr(), Right: $4.tblExpr(), Cond: NaturalJoinCond{}}
   }
 
 alias_clause:
@@ -2522,6 +2709,16 @@ opt_alias_clause:
 | /* EMPTY */
   {
     $$.val = AliasClause{}
+  }
+
+opt_as_of_clause:
+  AS_LA OF SYSTEM TIME SCONST
+  {
+    $$.val = AsOfClause{Expr: &StrVal{s: $5}}
+  }
+| /* EMPTY */
+  {
+    $$.val = AsOfClause{}
   }
 
 join_type:
@@ -2666,7 +2863,18 @@ simple_typename:
   {
     $$.val = stringColTypeText
   }
-| SERIAL { unimplementedWithIssue(4491) }
+| SERIAL
+  {
+    $$.val = intColTypeSerial
+  }
+| SMALLSERIAL
+  {
+    $$.val = intColTypeSmallSerial
+  }
+| BIGSERIAL
+  {
+    $$.val = intColTypeBigSerial
+  }
 
 // We have a separate const_typename to allow defaulting fixed-length types
 // such as CHAR() and BIT() to an unspecified length. SQL9x requires that these
@@ -2817,7 +3025,12 @@ bit_with_length:
       sqllex.Error(err.Error())
       return 1
     }
-    $$.val = newIntBitType(int(n))
+    bit, err := newIntBitType(int(n))
+    if err != nil {
+      sqllex.Error(err.Error())
+      return 1
+    }
+    $$.val = bit
   }
 
 bit_without_length:
@@ -2890,6 +3103,10 @@ const_datetime:
   {
     $$.val = timestampColTypeTimestamp
   }
+| TIMESTAMP WITHOUT TIME ZONE
+  {
+    $$.val = timestampColTypeTimestamp
+  }
 | TIMESTAMPTZ
   {
     $$.val = timestampTzColTypeTimestampWithTZ
@@ -2949,6 +3166,11 @@ a_expr:
   {
     $$.val = &CastExpr{Expr: $1.expr(), Type: $3.colType()}
   }
+// TODO(nvanbenschoten) introduce a shorthand type annotation notation.
+//| a_expr '!' typename
+//  {
+//    $$.val = &AnnotateTypeExpr{Expr: $1.expr(), Type: $3.colType()}
+//  }
 | a_expr COLLATE any_name { unimplemented() }
 | a_expr AT TIME ZONE a_expr %prec AT { unimplemented() }
   // These operators must be called out explicitly in order to make use of
@@ -2985,6 +3207,10 @@ a_expr:
 | a_expr '/' a_expr
   {
     $$.val = &BinaryExpr{Operator: Div, Left: $1.expr(), Right: $3.expr()}
+  }
+| a_expr FLOORDIV a_expr
+  {
+    $$.val = &BinaryExpr{Operator: FloorDiv, Left: $1.expr(), Right: $3.expr()}
   }
 | a_expr '%' a_expr
   {
@@ -3066,6 +3292,14 @@ a_expr:
   {
     $$.val = &ComparisonExpr{Operator: NotLike, Left: $1.expr(), Right: $4.expr()}
   }
+| a_expr ILIKE a_expr
+  {
+    $$.val = &ComparisonExpr{Operator: ILike, Left: $1.expr(), Right: $3.expr()}
+  }
+| a_expr NOT_LA ILIKE a_expr %prec NOT_LA
+  {
+    $$.val = &ComparisonExpr{Operator: NotILike, Left: $1.expr(), Right: $4.expr()}
+  }
 | a_expr SIMILAR TO a_expr %prec SIMILAR
   {
     $$.val = &ComparisonExpr{Operator: SimilarTo, Left: $1.expr(), Right: $4.expr()}
@@ -3073,6 +3307,22 @@ a_expr:
 | a_expr NOT_LA SIMILAR TO a_expr %prec NOT_LA
   {
     $$.val = &ComparisonExpr{Operator: NotSimilarTo, Left: $1.expr(), Right: $5.expr()}
+  }
+| a_expr '~' a_expr
+  {
+    $$.val = &ComparisonExpr{Operator: RegMatch, Left: $1.expr(), Right: $3.expr()}
+  }
+| a_expr NOT_REGMATCH a_expr
+  {
+    $$.val = &ComparisonExpr{Operator: NotRegMatch, Left: $1.expr(), Right: $3.expr()}
+  }
+| a_expr REGIMATCH a_expr
+  {
+    $$.val = &ComparisonExpr{Operator: RegIMatch, Left: $1.expr(), Right: $3.expr()}
+  }
+| a_expr NOT_REGIMATCH a_expr
+  {
+    $$.val = &ComparisonExpr{Operator: NotRegIMatch, Left: $1.expr(), Right: $3.expr()}
   }
 | a_expr IS NULL %prec IS
   {
@@ -3164,6 +3414,11 @@ b_expr:
   {
     $$.val = &CastExpr{Expr: $1.expr(), Type: $3.colType()}
   }
+// TODO(nvanbenschoten) introduce a shorthand type annotation notation.
+//| b_expr '!' typename
+//  {
+//    $$.val = &AnnotateTypeExpr{Expr: $1.expr(), Type: $3.colType()}
+//  }
 | '+' b_expr %prec UMINUS
   {
     $$.val = &UnaryExpr{Operator: UnaryPlus, Expr: $2.expr()}
@@ -3191,6 +3446,10 @@ b_expr:
 | b_expr '/' b_expr
   {
     $$.val = &BinaryExpr{Operator: Div, Left: $1.expr(), Right: $3.expr()}
+  }
+| b_expr FLOORDIV b_expr
+  {
+    $$.val = &BinaryExpr{Operator: FloorDiv, Left: $1.expr(), Right: $3.expr()}
   }
 | b_expr '%' b_expr
   {
@@ -3277,9 +3536,9 @@ c_expr:
     $$.val = $1.qname()
   }
 | a_expr_const
-| PARAM
+| PLACEHOLDER
   {
-    $$.val = ValArg{Name: $1}
+    $$.val = Placeholder{Name: $1}
   }
 | '(' a_expr ')'
   {
@@ -3391,6 +3650,10 @@ func_expr_common_subexpr:
 | CAST '(' a_expr AS typename ')'
   {
     $$.val = &CastExpr{Expr: $3.expr(), Type: $5.colType()}
+  }
+| ANNOTATE_TYPE '(' a_expr ',' typename ')'
+  {
+    $$.val = &AnnotateTypeExpr{Expr: $3.expr(), Type: $5.colType()}
   }
 | EXTRACT '(' extract_list ')'
   {
@@ -3584,6 +3847,8 @@ implicit_row:
 //   math_op { unimplemented() }
 // | LIKE { unimplemented() }
 // | NOT_LA LIKE { unimplemented() }
+// | ILIKE { unimplemented() }
+// | NOT_LA ILIKE { unimplemented() }
   // cannot put SIMILAR TO here, because SIMILAR TO is a hack.
   // the regular expression is preprocessed by a function (similar_escape),
   // and the ~ operator for posix regular expressions is used.
@@ -4153,6 +4418,7 @@ unreserved_keyword:
 | COMMIT
 | COMMITTED
 | CONFLICT
+| CONSTRAINTS
 | COVERING
 | CUBE
 | CURRENT
@@ -4161,10 +4427,12 @@ unreserved_keyword:
 | DATABASE
 | DATABASES
 | DAY
+| DEALLOCATE
 | DELETE
 | DOUBLE
 | DROP
 | ENCODING
+| EXECUTE
 | EXPLAIN
 | FILTER
 | FIRST
@@ -4175,6 +4443,7 @@ unreserved_keyword:
 | HOUR
 | INDEXES
 | INSERT
+| INTERLEAVE
 | ISOLATION
 | KEY
 | KEYS
@@ -4196,9 +4465,11 @@ unreserved_keyword:
 | OFF
 | ORDINALITY
 | OVER
+| PARENT
 | PARTIAL
 | PARTITION
 | PRECEDING
+| PREPARE
 | PRIORITY
 | RANGE
 | READ
@@ -4225,6 +4496,7 @@ unreserved_keyword:
 | START
 | STORING
 | STRICT
+| SYSTEM
 | TABLES
 | TEXT
 | TRANSACTION
@@ -4254,8 +4526,10 @@ unreserved_keyword:
 // can be followed by '(' in typename productions, which looks too much like a
 // function call for an LR(1) parser.
 col_name_keyword:
-  BETWEEN
+  ANNOTATE_TYPE
+| BETWEEN
 | BIGINT
+| BIGSERIAL
 | BIT
 | BOOL
 | BOOLEAN
@@ -4290,6 +4564,7 @@ col_name_keyword:
 | ROW
 | SERIAL
 | SMALLINT
+| SMALLSERIAL
 | STRING
 | SUBSTRING
 | TIME
@@ -4314,6 +4589,7 @@ type_func_name_keyword:
 | CROSS
 | FULL
 | INNER
+| ILIKE
 | IS
 | JOIN
 | LEFT
@@ -4361,6 +4637,7 @@ reserved_keyword:
 | END
 | EXCEPT
 | FALSE
+| FAMILY
 | FETCH
 | FOR
 | FOREIGN

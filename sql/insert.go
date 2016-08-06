@@ -20,10 +20,11 @@ import (
 	"bytes"
 	"fmt"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/privilege"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/util"
 )
 
 type insertNode struct {
@@ -33,8 +34,6 @@ type insertNode struct {
 	n            *parser.Insert
 	insertRows   parser.SelectStatement
 	checkHelper  checkHelper
-
-	desiredTypes []parser.Datum // This will go away when we only type check once.
 
 	insertCols            []sqlbase.ColumnDescriptor
 	insertColIDtoRowIndex map[sqlbase.ColumnID]int
@@ -56,7 +55,7 @@ type insertNode struct {
 func (p *planner) Insert(
 	n *parser.Insert, desiredTypes []parser.Datum, autoCommit bool,
 ) (planNode, error) {
-	en, err := p.makeEditNode(n.Table, n.Returning, desiredTypes, autoCommit, privilege.INSERT)
+	en, err := p.makeEditNode(n.Table, autoCommit, privilege.INSERT)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +115,7 @@ func (p *planner) Insert(
 		}
 	}
 
-	defaultExprs, err := makeDefaultExprs(cols, &p.parser, p.evalCtx)
+	defaultExprs, err := makeDefaultExprs(cols, &p.parser, &p.evalCtx)
 	if err != nil {
 		return nil, err
 	}
@@ -132,39 +131,24 @@ func (p *planner) Insert(
 	for i, col := range cols {
 		desiredTypesFromSelect[i] = col.Type.ToDatumType()
 	}
+
+	// Create the plan for the data source.
+	// This performs type checking on source expressions, collecting
+	// types for placeholders in the process.
 	rows, err := p.newPlan(insertRows, desiredTypesFromSelect, false)
 	if err != nil {
 		return nil, err
 	}
 
 	if expressions := len(rows.Columns()); expressions > numInputColumns {
-		return nil, fmt.Errorf("INSERT has more expressions than target columns: %d/%d", expressions, numInputColumns)
+		return nil, fmt.Errorf("INSERT error: table %s has %d columns but %d values were supplied", n.Table, numInputColumns, expressions)
 	}
 
-	// Type check the tuples, if any, to collect placeholder types.
-	if values, ok := n.Rows.Select.(*parser.ValuesClause); ok {
-		for _, tuple := range values.Tuples {
-			for eIdx, val := range tuple.Exprs {
-				if _, ok := val.(parser.DefaultVal); ok {
-					continue
-				}
-				typedExpr, err := parser.TypeCheck(val, p.evalCtx.Args, desiredTypesFromSelect[eIdx])
-				if err != nil {
-					return nil, err
-				}
-				err = sqlbase.CheckColumnType(cols[eIdx], typedExpr.ReturnType(), p.evalCtx.Args)
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-
-	if err := en.rh.TypeCheck(); err != nil {
+	fkTables := TablesNeededForFKs(*en.tableDesc, CheckInserts)
+	if err := p.fillFKTableMap(fkTables); err != nil {
 		return nil, err
 	}
-
-	ri, err := makeRowInserter(en.tableDesc, cols)
+	ri, err := makeRowInserter(p.txn, en.tableDesc, fkTables, cols, checkFKs)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +182,11 @@ func (p *planner) Insert(
 				return nil, err
 			}
 
-			tw = &tableUpserter{ri: ri, updateCols: updateCols, conflictIndex: *conflictIndex, evaler: helper}
+			fkTables := TablesNeededForFKs(*en.tableDesc, CheckUpdates)
+			if err := p.fillFKTableMap(fkTables); err != nil {
+				return nil, err
+			}
+			tw = &tableUpserter{ri: ri, fkTables: fkTables, updateCols: updateCols, conflictIndex: *conflictIndex, evaler: helper}
 		}
 	}
 
@@ -209,31 +197,21 @@ func (p *planner) Insert(
 		insertRows:            insertRows,
 		insertCols:            ri.insertCols,
 		insertColIDtoRowIndex: ri.insertColIDtoRowIndex,
-		desiredTypes:          desiredTypesFromSelect,
-		tw:                    tw,
+		tw: tw,
 	}
+
 	if err := in.checkHelper.init(p, en.tableDesc); err != nil {
 		return nil, err
 	}
+
+	if err := in.run.initEditNode(&in.editNodeBase, rows, n.Returning, desiredTypes); err != nil {
+		return nil, err
+	}
+
 	return in, nil
 }
 
 func (n *insertNode) expandPlan() error {
-	// TODO(knz): We need to re-run makePlan here again
-	// because that's when we can expand sub-queries.
-	// This goes away when sub-query expansion is moved
-	// to the Start() method of the insertRows object.
-
-	// Transform the values into a rows object. This expands SELECT statements or
-	// generates rows from the values contained within the query.
-	rows, err := n.p.newPlan(n.insertRows, n.desiredTypes, false)
-	if err != nil {
-		return err
-	}
-
-	if err := rows.expandPlan(); err != nil {
-		return err
-	}
 
 	// Prepare structures for building values to pass to rh.
 	if n.rh.exprs != nil {
@@ -258,28 +236,33 @@ func (n *insertNode) expandPlan() error {
 		}
 	}
 
-	n.run.buildEditNodePlan(&n.editNodeBase, rows, n.tw)
-	return nil
+	return n.run.expandEditNodePlan(&n.editNodeBase, n.tw)
 }
 
 func (n *insertNode) Start() error {
-	if err := n.run.rows.Start(); err != nil {
+	if err := n.rh.startPlans(); err != nil {
+		return err
+	}
+
+	if err := n.run.startEditNode(); err != nil {
 		return err
 	}
 
 	return n.run.tw.init(n.p.txn)
 }
 
-func (n *insertNode) Next() bool {
-	if n.run.done || n.run.err != nil {
-		return false
+func (n *insertNode) Next() (bool, error) {
+	ctx := context.TODO()
+	if next, err := n.run.rows.Next(); !next {
+		if err == nil {
+			// We're done. Finish the batch.
+			err = n.tw.finalize(ctx)
+		}
+		return false, err
 	}
 
-	if !n.run.rows.Next() {
-		// We're done. Finish the batch.
-		n.run.err = n.tw.finalize()
-		n.run.done = true
-		return false
+	if n.run.explain == explainDebug {
+		return true, nil
 	}
 
 	rowVals := n.run.rows.Values()
@@ -292,10 +275,9 @@ func (n *insertNode) Next() bool {
 			rowVals = append(rowVals, parser.DNull)
 			continue
 		}
-		d, err := n.defaultExprs[i].Eval(n.p.evalCtx)
+		d, err := n.defaultExprs[i].Eval(&n.p.evalCtx)
 		if err != nil {
-			n.run.err = err
-			return false
+			return false, err
 		}
 		rowVals = append(rowVals, d)
 	}
@@ -304,8 +286,7 @@ func (n *insertNode) Next() bool {
 	for _, col := range n.tableDesc.Columns {
 		if !col.Nullable {
 			if i, ok := n.insertColIDtoRowIndex[col.ID]; !ok || rowVals[i] == parser.DNull {
-				n.run.err = newNonNullViolationError(col.Name)
-				return false
+				return false, sqlbase.NewNonNullViolationError(col.Name)
 			}
 		}
 	}
@@ -313,21 +294,18 @@ func (n *insertNode) Next() bool {
 	// Ensure that the values honor the specified column widths.
 	for i := range rowVals {
 		if err := sqlbase.CheckValueWidth(n.insertCols[i], rowVals[i]); err != nil {
-			n.run.err = err
-			return false
+			return false, err
 		}
 	}
 
 	n.checkHelper.loadRow(n.insertColIDtoRowIndex, rowVals, false)
-	if err := n.checkHelper.check(n.p.evalCtx); err != nil {
-		n.run.err = err
-		return false
+	if err := n.checkHelper.check(&n.p.evalCtx); err != nil {
+		return false, err
 	}
 
-	_, err := n.tw.row(rowVals)
+	_, err := n.tw.row(ctx, rowVals)
 	if err != nil {
-		n.run.err = err
-		return false
+		return false, err
 	}
 
 	for i, val := range rowVals {
@@ -338,12 +316,11 @@ func (n *insertNode) Next() bool {
 
 	resultRow, err := n.rh.cookResultRow(n.run.rowTemplate)
 	if err != nil {
-		n.run.err = err
-		return false
+		return false, err
 	}
 	n.run.resultRow = resultRow
 
-	return true
+	return true, nil
 }
 
 func (p *planner) processColumns(tableDesc *sqlbase.TableDescriptor,
@@ -359,17 +336,23 @@ func (p *planner) processColumns(tableDesc *sqlbase.TableDescriptor,
 	cols := make([]sqlbase.ColumnDescriptor, len(node))
 	colIDSet := make(map[sqlbase.ColumnID]struct{}, len(node))
 	for i, n := range node {
-		// TODO(pmattis): If the name is qualified, verify the table name matches
-		// tableDesc.Name.
-		if err := n.NormalizeColumnName(); err != nil {
-			return nil, err
-		}
-		col, err := tableDesc.FindActiveColumnByName(n.Column())
+		// Qualified names in the column list for INSERT and for the LHS
+		// in UPDATE ... SET statements work differently than qualified
+		// column names elsewhere:
+		// - they always start with the column name,
+		// - notation X.Y means access field Y when column X has composite type,
+		// - notation X.* is never allowed.
+		// So NormalizeColumnName() cannot be used here.
+		col, err := tableDesc.FindActiveColumnByName(string(n.Base))
 		if err != nil {
 			return nil, err
 		}
+		if len(n.Indirect) != 0 {
+			// We do not support anything but simple column names yet.
+			return nil, fmt.Errorf("column name \"%s\" cannot be assigned to", n)
+		}
 		if _, ok := colIDSet[col.ID]; ok {
-			return nil, fmt.Errorf("multiple assignments to same column \"%s\"", n.Column())
+			return nil, fmt.Errorf("multiple assignments to same column \"%s\"", n.Base)
 		}
 		colIDSet[col.ID] = struct{}{}
 		cols[i] = col
@@ -411,7 +394,10 @@ func (p *planner) fillDefaults(defaultExprs []parser.TypedExpr,
 						&parser.Tuple{Exprs: append([]parser.Expr(nil), tuple.Exprs...)}
 					tupleCopied = true
 				}
-				if defaultExprs == nil {
+				if defaultExprs == nil || eIdx >= len(defaultExprs) {
+					// The case where eIdx is too large for defaultExprs will be
+					// transformed into an error by the check on the number of
+					// columns in Insert().
 					ret.Tuples[tIdx].Exprs[eIdx] = parser.DNull
 				} else {
 					ret.Tuples[tIdx].Exprs[eIdx] = defaultExprs[eIdx]
@@ -423,7 +409,7 @@ func (p *planner) fillDefaults(defaultExprs []parser.TypedExpr,
 }
 
 func makeDefaultExprs(
-	cols []sqlbase.ColumnDescriptor, parse *parser.Parser, evalCtx parser.EvalContext,
+	cols []sqlbase.ColumnDescriptor, parse *parser.Parser, evalCtx *parser.EvalContext,
 ) ([]parser.TypedExpr, error) {
 	// Check to see if any of the columns have DEFAULT expressions. If there
 	// are no DEFAULT expressions, we don't bother with constructing the
@@ -441,15 +427,24 @@ func makeDefaultExprs(
 
 	// Build the default expressions map from the parsed SELECT statement.
 	defaultExprs := make([]parser.TypedExpr, 0, len(cols))
+	exprStrings := make([]string, 0, len(cols))
+	for _, col := range cols {
+		if col.DefaultExpr != nil {
+			exprStrings = append(exprStrings, *col.DefaultExpr)
+		}
+	}
+	exprs, err := parser.ParseExprsTraditional(exprStrings)
+	if err != nil {
+		return nil, err
+	}
+
+	defExprIdx := 0
 	for _, col := range cols {
 		if col.DefaultExpr == nil {
 			defaultExprs = append(defaultExprs, parser.DNull)
 			continue
 		}
-		expr, err := parser.ParseExprTraditional(*col.DefaultExpr)
-		if err != nil {
-			return nil, err
-		}
+		expr := exprs[defExprIdx]
 		typedExpr, err := parser.TypeCheck(expr, nil, col.Type.ToDatumType())
 		if err != nil {
 			return nil, err
@@ -457,10 +452,8 @@ func makeDefaultExprs(
 		if typedExpr, err = parse.NormalizeExpr(evalCtx, typedExpr); err != nil {
 			return nil, err
 		}
-		if parser.ContainsVars(typedExpr) {
-			return nil, util.Errorf("default expression contains variables")
-		}
 		defaultExprs = append(defaultExprs, typedExpr)
+		defExprIdx++
 	}
 	return defaultExprs, nil
 }
@@ -474,6 +467,10 @@ func (n *insertNode) Values() parser.DTuple {
 }
 
 func (n *insertNode) MarkDebug(mode explainMode) {
+	if mode != explainDebug {
+		panic(fmt.Sprintf("unknown debug mode %d", mode))
+	}
+	n.run.explain = mode
 	n.run.rows.MarkDebug(mode)
 }
 
@@ -483,10 +480,6 @@ func (n *insertNode) DebugValues() debugValues {
 
 func (n *insertNode) Ordering() orderingInfo {
 	return n.run.rows.Ordering()
-}
-
-func (n *insertNode) Err() error {
-	return n.run.err
 }
 
 func (n *insertNode) ExplainPlan(v bool) (name, description string, children []planNode) {
@@ -508,7 +501,18 @@ func (n *insertNode) ExplainPlan(v bool) (name, description string, children []p
 		}
 		fmt.Fprintf(&buf, ")")
 	}
-	return "insert", buf.String(), []planNode{n.run.rows}
+
+	subplans := []planNode{n.run.rows}
+	for _, e := range n.defaultExprs {
+		subplans = n.p.collectSubqueryPlans(e, subplans)
+	}
+	for _, e := range n.checkHelper.exprs {
+		subplans = n.p.collectSubqueryPlans(e, subplans)
+	}
+	for _, e := range n.rh.exprs {
+		subplans = n.p.collectSubqueryPlans(e, subplans)
+	}
+	return "insert", buf.String(), subplans
 }
 
 func (n *insertNode) ExplainTypes(regTypes func(string, string)) {

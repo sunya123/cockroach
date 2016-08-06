@@ -24,6 +24,8 @@ import (
 )
 
 // Constants for system-reserved keys in the KV map.
+//
+// Note: preserve group-wise ordering when adding new constants.
 var (
 	// localPrefix is the prefix for keys which hold data local to a
 	// RocksDB instance, such as store and range-specific metadata which
@@ -89,17 +91,21 @@ var (
 	// after it's been aborted.
 	LocalAbortCacheSuffix = []byte("abc-")
 	// localRangeFrozenStatusSuffix is the suffix for a frozen status.
-	localRangeFrozenStatusSuffix = []byte("fzn-")
-	// localRaftTombstoneSuffix is the suffix for the raft tombstone.
-	localRaftTombstoneSuffix = []byte("rftb")
+	LocalRangeFrozenStatusSuffix = []byte("fzn-")
+	// localRangeLastGCSuffix is the suffix for the last GC.
+	LocalRangeLastGCSuffix = []byte("lgc-")
 	// LocalRaftAppliedIndexSuffix is the suffix for the raft applied index.
 	LocalRaftAppliedIndexSuffix = []byte("rfta")
+	// localRaftTombstoneSuffix is the suffix for the raft tombstone.
+	LocalRaftTombstoneSuffix = []byte("rftb")
 	// localRaftTruncatedStateSuffix is the suffix for the RaftTruncatedState.
 	LocalRaftTruncatedStateSuffix = []byte("rftt")
-	// localRangeLeaderLeaseSuffix is the suffix for a range leader lease.
-	localRangeLeaderLeaseSuffix = []byte("rll-")
+	// localRangeLeaseSuffix is the suffix for a range lease.
+	LocalRangeLeaseSuffix = []byte("rll-")
+	// LocalLeaseAppliedIndexSuffix is the suffix for the applied lease index.
+	LocalLeaseAppliedIndexSuffix = []byte("rlla")
 	// localRangeStatsSuffix is the suffix for range statistics.
-	localRangeStatsSuffix = []byte("stat")
+	LocalRangeStatsSuffix = []byte("stat")
 
 	// localRangeIDUnreplicatedInfix is the post-Range ID specifier for all
 	// per-range data that is not fully Raft replicated. By appending this
@@ -108,17 +114,20 @@ var (
 	// together or individually in a single scan.
 	localRangeIDUnreplicatedInfix = []byte("u")
 	// localRaftHardStateSuffix is the Suffix for the raft HardState.
-	localRaftHardStateSuffix = []byte("rfth")
+	LocalRaftHardStateSuffix = []byte("rfth")
 	// localRaftLastIndexSuffix is the suffix for raft's last index.
-	localRaftLastIndexSuffix = []byte("rfti")
+	LocalRaftLastIndexSuffix = []byte("rfti")
 	// LocalRaftLogSuffix is the suffix for the raft log.
 	LocalRaftLogSuffix = []byte("rftl")
 	// localRangeLastReplicaGCTimestampSuffix is the suffix for a range's
 	// last replica GC timestamp (for GC of old replicas).
-	localRangeLastReplicaGCTimestampSuffix = []byte("rlrt")
+	LocalRangeLastReplicaGCTimestampSuffix = []byte("rlrt")
 	// localRangeLastVerificationTimestampSuffix is the suffix for a range's
 	// last verification timestamp (for checking integrity of on-disk data).
-	localRangeLastVerificationTimestampSuffix = []byte("rlvt")
+	LocalRangeLastVerificationTimestampSuffix = []byte("rlvt")
+	// LocalRangeReplicaDestroyedErrorSuffix is the suffix for a range's replica
+	// destroyed error (for marking replicas as dead).
+	LocalRangeReplicaDestroyedErrorSuffix = []byte("rrde")
 
 	// LocalRangePrefix is the prefix identifying per-range data indexed
 	// by range key (either start key, or some key in the range). The
@@ -134,9 +143,6 @@ var (
 	// LocalRangeDescriptorSuffix is the suffix for keys storing
 	// range descriptors. The value is a struct of type RangeDescriptor.
 	LocalRangeDescriptorSuffix = roachpb.RKey("rdsc")
-	// localRangeTreeNodeSuffix is the suffix for keys storing
-	// range tree nodes.  The value is a struct of type RangeTreeNode.
-	localRangeTreeNodeSuffix = roachpb.RKey("rtn-")
 	// localTransactionSuffix specifies the key suffix for
 	// transaction records. The additional detail is the transaction id.
 	// NOTE: if this value changes, it must be updated in C++
@@ -176,8 +182,6 @@ var (
 	RangeIDGenerator = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("range-idgen")))
 	// StoreIDGenerator is the global store ID generator sequence.
 	StoreIDGenerator = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("store-idgen")))
-	// RangeTreeRoot specifies the root range in the range tree.
-	RangeTreeRoot = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("range-tree-root")))
 
 	// StatusPrefix specifies the key prefix to store all status details.
 	StatusPrefix = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("status-")))
@@ -220,6 +224,9 @@ const (
 	// IDs. Reserved IDs are used by namespaces and tables used internally by
 	// cockroach.
 	MaxReservedDescID = 49
+
+	// VirtualDescriptorID is the ID used by all virtual descriptors.
+	VirtualDescriptorID = math.MaxUint32
 
 	// RootNamespaceID is the ID of the root namespace.
 	RootNamespaceID = 0

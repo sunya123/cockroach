@@ -30,7 +30,7 @@ import (
 
 func TestParseInitNodeAttributes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	ctx := NewContext()
+	ctx := MakeContext()
 	ctx.Attrs = "attr1=val1::attr2=val2"
 	ctx.Stores = StoreSpecList{Specs: []StoreSpec{{InMemory: true, SizeInBytes: minimumStoreSize * 100}}}
 	stopper := stop.NewStopper()
@@ -47,12 +47,12 @@ func TestParseInitNodeAttributes(t *testing.T) {
 	}
 }
 
-// TestParseJoinUsingAddrs verifies that JoinUsing is parsed
+// TestParseJoinUsingAddrs verifies that JoinList is parsed
 // correctly.
 func TestParseJoinUsingAddrs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	ctx := NewContext()
-	ctx.JoinUsing = "localhost:12345,,localhost:23456"
+	ctx := MakeContext()
+	ctx.JoinList = []string{"localhost:12345,,localhost:23456", "localhost:34567"}
 	ctx.Stores = StoreSpecList{Specs: []StoreSpec{{InMemory: true, SizeInBytes: minimumStoreSize * 100}}}
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
@@ -62,15 +62,19 @@ func TestParseJoinUsingAddrs(t *testing.T) {
 	if err := ctx.InitNode(); err != nil {
 		t.Fatalf("Failed to initialize node: %s", err)
 	}
-	r1, err := resolver.NewResolver(&ctx.Context, "localhost:12345")
+	r1, err := resolver.NewResolver(ctx.Context, "localhost:12345")
 	if err != nil {
 		t.Fatal(err)
 	}
-	r2, err := resolver.NewResolver(&ctx.Context, "localhost:23456")
+	r2, err := resolver.NewResolver(ctx.Context, "localhost:23456")
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := []resolver.Resolver{r1, r2}
+	r3, err := resolver.NewResolver(ctx.Context, "localhost:34567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := []resolver.Resolver{r1, r2, r3}
 	if !reflect.DeepEqual(ctx.GossipBootstrapResolvers, expected) {
 		t.Fatalf("Unexpected bootstrap addresses: %v, expected: %v", ctx.GossipBootstrapResolvers, expected)
 	}
@@ -110,12 +114,15 @@ func TestReadEnvironmentVariables(t *testing.T) {
 		if err := os.Unsetenv("COCKROACH_CONSISTENCY_CHECK_INTERVAL"); err != nil {
 			t.Fatal(err)
 		}
+		if err := os.Unsetenv("COCKROACH_RESERVATIONS_ENABLED"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	defer resetEnvVar()
 
 	// Makes sure no values are set when no environment variables are set.
-	ctx := NewContext()
-	ctxExpected := NewContext()
+	ctx := MakeContext()
+	ctxExpected := MakeContext()
 
 	resetEnvVar()
 	ctx.readEnvironmentVariables()
@@ -161,6 +168,10 @@ func TestReadEnvironmentVariables(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctxExpected.ConsistencyCheckInterval = time.Millisecond * 10
+	if err := os.Setenv("COCKROACH_RESERVATIONS_ENABLED", "false"); err != nil {
+		t.Fatal(err)
+	}
+	ctxExpected.ReservationsEnabled = false
 
 	envutil.ClearEnvCache()
 	ctx.readEnvironmentVariables()
@@ -170,8 +181,8 @@ func TestReadEnvironmentVariables(t *testing.T) {
 
 	// Set all the environment variables to invalid values and test that the
 	// defaults are still set.
-	ctx = NewContext()
-	ctxExpected = NewContext()
+	ctx = MakeContext()
+	ctxExpected = MakeContext()
 
 	if err := os.Setenv("COCKROACH_LINEARIZABLE", "abcd"); err != nil {
 		t.Fatal(err)
@@ -198,6 +209,9 @@ func TestReadEnvironmentVariables(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Setenv("COCKROACH_CONSISTENCY_CHECK_INTERVAL", "abcd"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("COCKROACH_RESERVATIONS_ENABLED", "abcd"); err != nil {
 		t.Fatal(err)
 	}
 

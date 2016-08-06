@@ -30,7 +30,11 @@ import (
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
+	"github.com/cockroachdb/cockroach/util/netutil"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/syncutil"
+	"github.com/pkg/errors"
+	circuit "github.com/rubyist/circuitbreaker"
 )
 
 func newTestServer(t *testing.T, ctx *Context, manual bool) (*grpc.Server, net.Listener) {
@@ -40,7 +44,7 @@ func newTestServer(t *testing.T, ctx *Context, manual bool) (*grpc.Server, net.L
 	}
 	s := grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsConfig)))
 
-	ln, err := util.ListenAndServeGRPC(ctx.Stopper, s, util.TestAddr)
+	ln, err := netutil.ListenAndServeGRPC(ctx.Stopper, s, util.TestAddr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,6 +88,88 @@ func TestHeartbeatCB(t *testing.T) {
 	<-ch
 }
 
+// TestHeartbeatHealth verifies that the health status changes after heartbeats
+// succeed or fail.
+func TestHeartbeatHealth(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	stopper := stop.NewStopper()
+	defer stopper.Stop()
+
+	// Can't be zero because that'd be an empty offset.
+	clock := hlc.NewClock(time.Unix(0, 1).UnixNano)
+
+	serverCtx := newNodeTestContext(clock, stopper)
+	s, ln := newTestServer(t, serverCtx, true)
+	remoteAddr := ln.Addr().String()
+
+	heartbeat := &ManualHeartbeatService{
+		ready:              make(chan struct{}),
+		stopper:            stopper,
+		clock:              clock,
+		remoteClockMonitor: serverCtx.RemoteClocks,
+	}
+	RegisterHeartbeatServer(s, heartbeat)
+
+	clientCtx := newNodeTestContext(clock, stopper)
+	// Make the intervals and timeouts shorter to speed up the tests.
+	clientCtx.HeartbeatInterval = 1 * time.Millisecond
+	clientCtx.HeartbeatTimeout = 1 * time.Millisecond
+	if _, err := clientCtx.GRPCDial(remoteAddr); err != nil {
+		t.Fatal(err)
+	}
+
+	// This code is inherently racy so when we need to verify heartbeats we want
+	// them to always succeed.
+	sendHeartbeats := func() func() {
+		done := make(chan struct{})
+		go func() {
+			for {
+				select {
+				case <-done:
+					return
+				case heartbeat.ready <- struct{}{}:
+				}
+			}
+		}()
+		return func() {
+			done <- struct{}{}
+		}
+	}
+
+	// Should be healthy after the first successful heartbeat.
+	stopHeartbeats := sendHeartbeats()
+	util.SucceedsSoon(t, func() error {
+		if !clientCtx.IsConnHealthy(remoteAddr) {
+			return errors.Errorf("expected %s to be healthy", remoteAddr)
+		}
+		return nil
+	})
+	stopHeartbeats()
+
+	// Should no longer be healthy after heartbeating stops.
+	util.SucceedsSoon(t, func() error {
+		if clientCtx.IsConnHealthy(remoteAddr) {
+			return errors.Errorf("expected %s to be unhealthy", remoteAddr)
+		}
+		return nil
+	})
+
+	// Should return to healthy after another successful heartbeat.
+	stopHeartbeats = sendHeartbeats()
+	util.SucceedsSoon(t, func() error {
+		if !clientCtx.IsConnHealthy(remoteAddr) {
+			return errors.Errorf("expected %s to be healthy", remoteAddr)
+		}
+		return nil
+	})
+	stopHeartbeats()
+
+	if clientCtx.IsConnHealthy("non-existent connection") {
+		t.Errorf("non-existent connection is reported as healthy")
+	}
+}
+
 func TestOffsetMeasurement(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -117,9 +203,9 @@ func TestOffsetMeasurement(t *testing.T) {
 		defer clientCtx.RemoteClocks.mu.Unlock()
 
 		if o, ok := clientCtx.RemoteClocks.mu.offsets[remoteAddr]; !ok {
-			return util.Errorf("expected offset of %s to be initialized, but it was not", remoteAddr)
+			return errors.Errorf("expected offset of %s to be initialized, but it was not", remoteAddr)
 		} else if o != expectedOffset {
-			return util.Errorf("expected:\n%v\nactual:\n%v", expectedOffset, o)
+			return errors.Errorf("expected:\n%v\nactual:\n%v", expectedOffset, o)
 		}
 		return nil
 	})
@@ -134,7 +220,7 @@ func TestOffsetMeasurement(t *testing.T) {
 		defer clientCtx.RemoteClocks.mu.Unlock()
 
 		if o, ok := clientCtx.RemoteClocks.mu.offsets[remoteAddr]; ok {
-			return util.Errorf("expected offset to have been cleared, but found %s", o)
+			return errors.Errorf("expected offset to have been cleared, but found %s", o)
 		}
 		return nil
 	})
@@ -176,7 +262,7 @@ func TestFailedOffsetMeasurement(t *testing.T) {
 		defer clientCtx.RemoteClocks.mu.Unlock()
 
 		if _, ok := clientCtx.RemoteClocks.mu.offsets[remoteAddr]; !ok {
-			return util.Errorf("expected offset of %s to be initialized, but it was not", remoteAddr)
+			return errors.Errorf("expected offset of %s to be initialized, but it was not", remoteAddr)
 		}
 		return nil
 	})
@@ -186,14 +272,14 @@ func TestFailedOffsetMeasurement(t *testing.T) {
 		defer serverCtx.RemoteClocks.mu.Unlock()
 
 		if o, ok := serverCtx.RemoteClocks.mu.offsets[remoteAddr]; ok {
-			return util.Errorf("expected offset of %s to not be initialized, but it was: %v", remoteAddr, o)
+			return errors.Errorf("expected offset of %s to not be initialized, but it was: %v", remoteAddr, o)
 		}
 		return nil
 	})
 }
 
 type AdvancingClock struct {
-	sync.Mutex
+	syncutil.Mutex
 	time                time.Time
 	advancementInterval atomic.Value // time.Duration
 }
@@ -260,7 +346,7 @@ func TestRemoteOffsetUnhealthy(t *testing.T) {
 			clock:              clock,
 			remoteClockMonitor: nodeCtxs[i].ctx.RemoteClocks,
 		})
-		nodeCtxs[i].ctx.localAddr = ln.Addr().String()
+		nodeCtxs[i].ctx.Addr = ln.Addr().String()
 	}
 
 	// Fully connect the nodes.
@@ -269,7 +355,7 @@ func TestRemoteOffsetUnhealthy(t *testing.T) {
 			if i == j {
 				continue
 			}
-			if _, err := clientNodeContext.ctx.GRPCDial(serverNodeContext.ctx.localAddr); err != nil {
+			if _, err := clientNodeContext.ctx.GRPCDial(serverNodeContext.ctx.Addr); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -282,7 +368,7 @@ func TestRemoteOffsetUnhealthy(t *testing.T) {
 			defer nodeCtx.ctx.RemoteClocks.mu.Unlock()
 
 			if a, e := len(nodeCtx.ctx.RemoteClocks.mu.offsets), len(nodeCtxs)-1; a != e {
-				return util.Errorf("not yet fully connected: have %d of %d connections: %v", a, e, nodeCtx.ctx.RemoteClocks.mu.offsets)
+				return errors.Errorf("not yet fully connected: have %d of %d connections: %v", a, e, nodeCtx.ctx.RemoteClocks.mu.offsets)
 			}
 			return nil
 		})
@@ -302,5 +388,41 @@ func TestRemoteOffsetUnhealthy(t *testing.T) {
 				t.Logf("max offset: %s - node %d with acceptable clock offset of %s did not return an error, as expected", maxOffset, i, nodeOffset)
 			}
 		}
+	}
+}
+
+func TestCircuitBreaker(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	stopper := stop.NewStopper()
+	defer stopper.Stop()
+
+	clock := hlc.NewClock(time.Unix(0, 1).UnixNano)
+	serverCtx := newNodeTestContext(clock, stopper)
+	_, ln := newTestServer(t, serverCtx, true)
+	remoteAddr := ln.Addr().String()
+
+	clientCtx := newNodeTestContext(clock, stopper)
+	// The first dial will succeed because the breaker is closed.
+	if _, err := clientCtx.GRPCDial(remoteAddr); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait until the breaker opens. This will occur when the heartbeat fails
+	// (because there is no heartbeat service).
+	util.SucceedsSoon(t, func() error {
+		_, err := clientCtx.GRPCDial(remoteAddr)
+		if err == circuit.ErrBreakerOpen {
+			return nil
+		}
+		return errors.Errorf("breaker not open: %v", err)
+	})
+
+	// Reset the breaker. The next dial will succeed.
+	clientCtx.conns.Lock()
+	clientCtx.conns.breakers[remoteAddr].Reset()
+	clientCtx.conns.Unlock()
+	if _, err := clientCtx.GRPCDial(remoteAddr); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -22,17 +22,40 @@
 package storage
 
 import (
-	"time"
-
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/cockroachdb/cockroach/util/retry"
-	"github.com/coreos/etcd/raft"
-	"github.com/coreos/etcd/raft/raftpb"
+	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/util/hlc"
 )
 
+// HandleRaftMessage delegates to handleRaftMessage.
+func (s *Store) HandleRaftMessage(req *RaftMessageRequest) error {
+	return s.handleRaftMessage(req)
+}
+
+// ComputeMVCCStats immediately computes correct total MVCC usage statistics
+// for the store, returning the computed values (but without modifying the
+// store).
+func (s *Store) ComputeMVCCStats() (enginepb.MVCCStats, error) {
+	var totalStats enginepb.MVCCStats
+	var err error
+
+	visitor := newStoreRangeSet(s)
+	now := s.Clock().PhysicalNow()
+	visitor.Visit(func(r *Replica) bool {
+		var stats enginepb.MVCCStats
+		stats, err = ComputeStatsForRange(r.Desc(), s.Engine(), now)
+		if err != nil {
+			return false
+		}
+		totalStats.Add(stats)
+		return true
+	})
+	return totalStats, err
+}
+
 // ForceReplicationScanAndProcess iterates over all ranges and
-// enqueues any that need to be replicated. Exposed only for testing.
+// enqueues any that need to be replicated.
 func (s *Store) ForceReplicationScanAndProcess() {
 	s.mu.Lock()
 	for _, r := range s.mu.replicas {
@@ -43,14 +66,8 @@ func (s *Store) ForceReplicationScanAndProcess() {
 	s.replicateQueue.DrainQueue(s.ctx.Clock)
 }
 
-// DisableReplicaGCQueue disables or enables the replica GC queue.
-// Exposed only for testing.
-func (s *Store) DisableReplicaGCQueue(disabled bool) {
-	s.replicaGCQueue.SetDisabled(disabled)
-}
-
 // ForceReplicaGCScanAndProcess iterates over all ranges and enqueues any that
-// may need to be GC'd. Exposed only for testing.
+// may need to be GC'd.
 func (s *Store) ForceReplicaGCScanAndProcess() {
 	s.mu.Lock()
 	for _, r := range s.mu.replicas {
@@ -61,15 +78,8 @@ func (s *Store) ForceReplicaGCScanAndProcess() {
 	s.replicaGCQueue.DrainQueue(s.ctx.Clock)
 }
 
-// DisableRaftLogQueue disables or enables the raft log queue.
-// Exposed only for testing.
-func (s *Store) DisableRaftLogQueue(disabled bool) {
-	s.raftLogQueue.SetDisabled(disabled)
-}
-
 // ForceRaftLogScanAndProcess iterates over all ranges and enqueues any that
 // need their raft logs truncated and then process each of them.
-// Exposed only for testing.
 func (s *Store) ForceRaftLogScanAndProcess() {
 	// Gather the list of replicas to call MaybeAdd on to avoid locking the
 	// Mutex twice.
@@ -89,42 +99,65 @@ func (s *Store) ForceRaftLogScanAndProcess() {
 }
 
 // LogReplicaChangeTest adds a fake replica change event to the log for the
-// range which contains the given key. This is intended for usage only in unit tests.
+// range which contains the given key.
 func (s *Store) LogReplicaChangeTest(txn *client.Txn, changeType roachpb.ReplicaChangeType, replica roachpb.ReplicaDescriptor, desc roachpb.RangeDescriptor) error {
 	return s.logChange(txn, changeType, replica, desc)
 }
 
-// GetSnapshot wraps Snapshot() but does not require the replica lock
-// to be held and it will block instead of returning
-// ErrSnapshotTemporaryUnavailable.
-func (r *Replica) GetSnapshot() (raftpb.Snapshot, error) {
-	retryOptions := retry.Options{
-		InitialBackoff: 1 * time.Millisecond,
-		MaxBackoff:     50 * time.Millisecond,
-		Multiplier:     2,
-	}
-	for retry := retry.Start(retryOptions); retry.Next(); {
-		r.mu.Lock()
-		snap, err := r.Snapshot()
-		snapshotChan := r.mu.snapshotChan
-		r.mu.Unlock()
-		if err == raft.ErrSnapshotTemporarilyUnavailable {
-			if snapshotChan == nil {
-				// The call to Snapshot() didn't start an async process due to
-				// rate limiting. Try again later.
-				continue
-			}
-			var ok bool
-			snap, ok = <-snapshotChan
-			if ok {
-				return snap, nil
-			}
-			// Each snapshot worker's output can only be consumed once.
-			// We could be racing with raft itself, so if we get a closed
-			// channel loop back and try again.
-		} else {
-			return snap, err
-		}
-	}
-	panic("unreachable") // due to infinite retries
+// ReplicateQueuePurgatoryLength returns the number of replicas in replicate
+// queue purgatory.
+func (s *Store) ReplicateQueuePurgatoryLength() int {
+	return s.replicateQueue.PurgatoryLength()
+}
+
+// SetRaftLogQueueActive enables or disables the raft log queue.
+func (s *Store) SetRaftLogQueueActive(active bool) {
+	s.setRaftLogQueueActive(active)
+}
+
+// SetReplicaGCQueueActive enables or disables the replica GC queue.
+func (s *Store) SetReplicaGCQueueActive(active bool) {
+	s.setReplicaGCQueueActive(active)
+}
+
+// SetSplitQueueActive enables or disables the split queue.
+func (s *Store) SetSplitQueueActive(active bool) {
+	s.setSplitQueueActive(active)
+}
+
+// SetReplicaScannerActive enables or disables the scanner. Note that while
+// inactive, removals are still processed.
+func (s *Store) SetReplicaScannerActive(active bool) {
+	s.setScannerActive(active)
+}
+
+// GetLastIndex is the same function as LastIndex but it does not require
+// that the replica lock is held.
+func (r *Replica) GetLastIndex() (uint64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.LastIndex()
+}
+
+// GetLease exposes replica.getLease for tests.
+func (r *Replica) GetLease() (*roachpb.Lease, *roachpb.Lease) {
+	return r.getLease()
+}
+
+// GetTimestampCacheLowWater returns the timestamp cache low water mark.
+func (r *Replica) GetTimestampCacheLowWater() hlc.Timestamp {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mu.tsCache.lowWater
+}
+
+func (r *Replica) GetLastFromReplicaDesc() roachpb.ReplicaDescriptor {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mu.lastFromReplica
+}
+
+// GetDeadReplicas exports s.deadReplicas for tests.
+func (s *Store) GetDeadReplicas() roachpb.StoreDeadReplicas {
+	return s.deadReplicas()
 }

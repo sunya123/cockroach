@@ -18,24 +18,24 @@
 package kv
 
 import (
-	"errors"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	basictracer "github.com/opentracing/basictracer-go"
 	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/base"
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/metric"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/syncutil"
 	"github.com/cockroachdb/cockroach/util/timeutil"
 	"github.com/cockroachdb/cockroach/util/tracing"
 	"github.com/cockroachdb/cockroach/util/uuid"
@@ -150,7 +150,7 @@ type TxnCoordSender struct {
 	clock             *hlc.Clock
 	heartbeatInterval time.Duration
 	clientTimeout     time.Duration
-	sync.Mutex                                   // protects txns and txnStats
+	syncutil.Mutex                               // protects txns and txnStats
 	txns              map[uuid.UUID]*txnMetadata // txn key to metadata
 	linearizable      bool                       // enables linearizable behaviour
 	tracer            opentracing.Tracer
@@ -236,7 +236,7 @@ func (tc *TxnCoordSender) startStats() {
 			rMax := restarts.Max()
 			num := durations.TotalCount()
 
-			log.Infof(
+			log.Infof(context.TODO(),
 				"txn coordinator: %.2f txn/sec, %.2f/%.2f/%.2f/%.2f %%cmmt/cmmt1pc/abrt/abnd, %s/%s/%s avg/σ/max duration, %.1f/%.1f/%d avg/σ/max restarts (%d samples)",
 				totalRate, pCommitted, pCommitted1PC, pAborted, pAbandoned,
 				util.TruncateDuration(time.Duration(dMean), res),
@@ -280,7 +280,7 @@ func (tc *TxnCoordSender) Send(ctx context.Context, ba roachpb.BatchRequest) (*r
 		if ba.Header.Trace == nil {
 			ba.Header.Trace = &tracing.Span{}
 		}
-		if err := tc.tracer.Inject(sp, basictracer.Delegator, ba.Trace); err != nil {
+		if err := tc.tracer.Inject(sp.Context(), basictracer.Delegator, ba.Trace); err != nil {
 			return nil, roachpb.NewError(err)
 		}
 	}
@@ -327,8 +327,13 @@ func (tc *TxnCoordSender) Send(ctx context.Context, ba roachpb.BatchRequest) (*r
 			// Populate et.IntentSpans, taking into account both any existing
 			// and new writes, and taking care to perform proper deduplication.
 			txnMeta := tc.txns[*ba.Txn.ID]
+			distinctSpans := true
 			if txnMeta != nil {
 				et.IntentSpans = txnMeta.keys
+				// Defensively set distinctSpans to false if we had any previous
+				// requests in this transaction. This effectively limits the distinct
+				// spans optimization to 1pc transactions.
+				distinctSpans = len(txnMeta.keys) == 0
 			}
 			ba.IntentSpanIterate(func(key, endKey roachpb.Key) {
 				et.IntentSpans = append(et.IntentSpans, roachpb.Span{
@@ -336,7 +341,11 @@ func (tc *TxnCoordSender) Send(ctx context.Context, ba roachpb.BatchRequest) (*r
 					EndKey: endKey,
 				})
 			})
-			roachpb.MergeSpans(&et.IntentSpans)
+			// TODO(peter): Populate DistinctSpans on all batches, not just batches
+			// which contain an EndTransactionRequest.
+			var distinct bool
+			et.IntentSpans, distinct = roachpb.MergeSpans(et.IntentSpans)
+			ba.Header.DistinctSpans = distinct && distinctSpans
 			if len(et.IntentSpans) == 0 {
 				// If there aren't any intents, then there's factually no
 				// transaction to end. Read-only txns have all of their state
@@ -353,8 +362,7 @@ func (tc *TxnCoordSender) Send(ctx context.Context, ba roachpb.BatchRequest) (*r
 
 		if hasET && log.V(1) {
 			for _, intent := range et.IntentSpans {
-				log.Trace(ctx, fmt.Sprintf("intent: [%s,%s)",
-					intent.Key, intent.EndKey))
+				log.Tracef(ctx, "intent: [%s,%s)", intent.Key, intent.EndKey)
 			}
 		}
 	}
@@ -372,7 +380,7 @@ func (tc *TxnCoordSender) Send(ctx context.Context, ba roachpb.BatchRequest) (*r
 		}
 
 		if pErr = tc.updateState(startNS, ctx, ba, br, pErr); pErr != nil {
-			log.Trace(ctx, fmt.Sprintf("error: %s", pErr))
+			log.Tracef(ctx, "error: %s", pErr)
 			return nil, pErr
 		}
 	}
@@ -400,7 +408,7 @@ func (tc *TxnCoordSender) Send(ctx context.Context, ba roachpb.BatchRequest) (*r
 	if tc.linearizable && sleepNS > 0 {
 		defer func() {
 			if log.V(1) {
-				log.Infof("%v: waiting %s on EndTransaction for linearizability", br.Txn.ID.Short(), util.TruncateDuration(sleepNS, time.Millisecond))
+				log.Infof(ctx, "%v: waiting %s on EndTransaction for linearizability", br.Txn.ID.Short(), util.TruncateDuration(sleepNS, time.Millisecond))
 			}
 			time.Sleep(sleepNS)
 		}()
@@ -462,7 +470,7 @@ func (tc *TxnCoordSender) maybeRejectClientLocked(
 // transaction is already in state txn.Writing=true.
 func (tc *TxnCoordSender) maybeBeginTxn(ba *roachpb.BatchRequest) error {
 	if len(ba.Requests) == 0 {
-		return util.Errorf("empty batch with txn")
+		return errors.Errorf("empty batch with txn")
 	}
 	if ba.Txn.ID == nil {
 		// Create transaction without a key. The key is set when a begin
@@ -471,7 +479,7 @@ func (tc *TxnCoordSender) maybeBeginTxn(ba *roachpb.BatchRequest) error {
 		// The initial timestamp may be communicated by a higher layer.
 		// If so, use that. Otherwise make up a new one.
 		timestamp := ba.Txn.OrigTimestamp
-		if timestamp == roachpb.ZeroTimestamp {
+		if timestamp == hlc.ZeroTimestamp {
 			timestamp = tc.clock.Now()
 		}
 		newTxn := roachpb.NewTransaction(ba.Txn.Name, nil, ba.UserPriority,
@@ -492,7 +500,7 @@ func (tc *TxnCoordSender) maybeBeginTxn(ba *roachpb.BatchRequest) error {
 		args := req.GetInner()
 		if bt, ok := args.(*roachpb.BeginTransactionRequest); ok {
 			if haveBeginTxn || ba.Txn.Writing {
-				return util.Errorf("begin transaction requested twice in the same transaction: %s", ba.Txn)
+				return errors.Errorf("begin transaction requested twice in the same transaction: %s", ba.Txn)
 			}
 			haveBeginTxn = true
 			if ba.Txn.Key == nil {
@@ -500,7 +508,7 @@ func (tc *TxnCoordSender) maybeBeginTxn(ba *roachpb.BatchRequest) error {
 			}
 		}
 		if roachpb.IsTransactionWrite(args) && !haveBeginTxn && !ba.Txn.Writing {
-			return util.Errorf("transactional write before begin transaction")
+			return errors.Errorf("transactional write before begin transaction")
 		}
 	}
 	return nil
@@ -557,6 +565,7 @@ func (tc *TxnCoordSender) unregisterTxnLocked(txnID uuid.UUID) (
 // own associated lifetime and we're ignoring all but the first. It happens now
 // that we pass the same one in every request, but it's brittle to rely on this
 // forever.
+// TODO(wiz): Update (*DBServer).Batch to not use context.TODO().
 func (tc *TxnCoordSender) heartbeatLoop(ctx context.Context, txnID uuid.UUID) {
 	var tickChan <-chan time.Time
 	{
@@ -568,7 +577,7 @@ func (tc *TxnCoordSender) heartbeatLoop(ctx context.Context, txnID uuid.UUID) {
 		tc.Lock()
 		duration, restarts, status := tc.unregisterTxnLocked(txnID)
 		tc.Unlock()
-		tc.updateStats(duration, int64(restarts), status, false)
+		tc.updateStats(duration, restarts, status, false)
 	}()
 
 	var closer <-chan struct{}
@@ -607,7 +616,7 @@ func (tc *TxnCoordSender) heartbeatLoop(ctx context.Context, txnID uuid.UUID) {
 			// responsible for client timeouts.
 			tc.tryAsyncAbort(txnID)
 			return
-		case <-tc.stopper.ShouldDrain():
+		case <-tc.stopper.ShouldQuiesce():
 			return
 		}
 	}
@@ -619,9 +628,8 @@ func (tc *TxnCoordSender) heartbeatLoop(ctx context.Context, txnID uuid.UUID) {
 func (tc *TxnCoordSender) tryAsyncAbort(txnID uuid.UUID) {
 	tc.Lock()
 	txnMeta := tc.txns[txnID]
-	// Grab the intents and clone the txn to avoid data races.
-	roachpb.MergeSpans(&txnMeta.keys)
-	intentSpans := txnMeta.keys
+	// Clone the intents and the txn to avoid data races.
+	intentSpans, _ := roachpb.MergeSpans(append([]roachpb.Span(nil), txnMeta.keys...))
 	txnMeta.keys = nil
 	txn := txnMeta.txn.Clone()
 	tc.Unlock()
@@ -644,7 +652,7 @@ func (tc *TxnCoordSender) tryAsyncAbort(txnID uuid.UUID) {
 		IntentSpans: intentSpans,
 	}
 	ba.Add(et)
-	tc.stopper.RunAsyncTask(func() {
+	if err := tc.stopper.RunAsyncTask(func() {
 		// Use the wrapped sender since the normal Sender does not allow
 		// clients to specify intents.
 		// TODO(tschottdorf): not using the existing context here since that
@@ -652,10 +660,12 @@ func (tc *TxnCoordSender) tryAsyncAbort(txnID uuid.UUID) {
 		// before the goroutine.
 		if _, pErr := tc.wrapped.Send(context.Background(), ba); pErr != nil {
 			if log.V(1) {
-				log.Warningf("abort due to inactivity failed for %s: %s ", txn, pErr)
+				log.Warningf(context.TODO(), "abort due to inactivity failed for %s: %s ", txn, pErr)
 			}
 		}
-	})
+	}); err != nil {
+		log.Warning(context.TODO(), err)
+	}
 }
 
 func (tc *TxnCoordSender) heartbeat(ctx context.Context, txnID uuid.UUID) bool {
@@ -679,7 +689,7 @@ func (tc *TxnCoordSender) heartbeat(ctx context.Context, txnID uuid.UUID) bool {
 	// instead of a timeout.
 	if ctx.Done() == nil && hasAbandoned {
 		if log.V(1) {
-			log.Infof("transaction %s abandoned; stopping heartbeat", txnMeta.txn)
+			log.Infof(ctx, "transaction %s abandoned; stopping heartbeat", txnMeta.txn)
 		}
 		tc.tryAsyncAbort(txnID)
 		return false
@@ -703,7 +713,7 @@ func (tc *TxnCoordSender) heartbeat(ctx context.Context, txnID uuid.UUID) bool {
 	// transaction record at all, we're going to have to assume we're aborted
 	// as well.
 	if pErr != nil {
-		log.Warningf("heartbeat to %s failed: %s", txn, pErr)
+		log.Warningf(ctx, "heartbeat to %s failed: %s", txn, pErr)
 		// We're not going to let the client carry out additional requests, so
 		// try to clean up.
 		tc.tryAsyncAbort(*txn.ID)
@@ -766,7 +776,7 @@ func (tc *TxnCoordSender) updateState(
 		// timestamp from the node.
 		restartTS, ok := newTxn.GetObservedTimestamp(pErr.OriginNode)
 		if !ok {
-			pErr = roachpb.NewError(util.Errorf("no observed timestamp for node %d found on uncertainty restart", pErr.OriginNode))
+			pErr = roachpb.NewError(errors.Errorf("no observed timestamp for node %d found on uncertainty restart", pErr.OriginNode))
 		} else {
 			newTxn.Timestamp.Forward(restartTS)
 			newTxn.Restart(ba.UserPriority, newTxn.Priority, newTxn.Timestamp)
@@ -858,15 +868,15 @@ func (tc *TxnCoordSender) updateState(
 				}
 				tc.txns[txnID] = txnMeta
 
-				if !tc.stopper.RunAsyncTask(func() {
+				if err := tc.stopper.RunAsyncTask(func() {
 					tc.heartbeatLoop(ctx, txnID)
-				}) {
+				}); err != nil {
 					// The system is already draining and we can't start the
 					// heartbeat. We refuse new transactions for now because
 					// they're likely not going to have all intents committed.
 					// In principle, we can relax this as needed though.
 					tc.unregisterTxnLocked(txnID)
-					return roachpb.NewError(&roachpb.NodeUnavailableError{})
+					return roachpb.NewError(err)
 				}
 			} else {
 				// If this was a successful one phase commit, update stats
@@ -915,7 +925,7 @@ func (tc *TxnCoordSender) updateState(
 func (tc *TxnCoordSender) resendWithTxn(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 	// Run a one-off transaction with that single command.
 	if log.V(1) {
-		log.Infof("%s: auto-wrapping in txn and re-executing: ", ba)
+		log.Infof(context.TODO(), "%s: auto-wrapping in txn and re-executing: ", ba)
 	}
 	// TODO(bdarnell): need to be able to pass other parts of DBContext
 	// through here.

@@ -7,6 +7,8 @@ package roachpb
 import proto "github.com/gogo/protobuf/proto"
 import fmt "fmt"
 import math "math"
+import cockroach_storage_engine_enginepb "github.com/cockroachdb/cockroach/storage/engine/enginepb"
+import cockroach_util_hlc "github.com/cockroachdb/cockroach/util/hlc"
 
 // skipping weak import gogoproto "github.com/cockroachdb/gogoproto"
 
@@ -28,38 +30,53 @@ var _ = math.Inf
 type ValueType int32
 
 const (
-	// This is a subset of the SQL column type values, representing the
-	// underlying storage for various types.
-	ValueType_UNKNOWN  ValueType = 0
-	ValueType_INT      ValueType = 1
-	ValueType_FLOAT    ValueType = 2
-	ValueType_BYTES    ValueType = 3
-	ValueType_TIME     ValueType = 4
-	ValueType_DECIMAL  ValueType = 5
-	ValueType_DURATION ValueType = 6
+	// This is a subset of the SQL column type values, representing the underlying
+	// storage for various types. The DELIMITED_foo entries each represent a foo
+	// variant that self-delimits length.
+	ValueType_UNKNOWN           ValueType = 0
+	ValueType_NULL              ValueType = 7
+	ValueType_INT               ValueType = 1
+	ValueType_FLOAT             ValueType = 2
+	ValueType_BYTES             ValueType = 3
+	ValueType_DELIMITED_BYTES   ValueType = 8
+	ValueType_TIME              ValueType = 4
+	ValueType_DECIMAL           ValueType = 5
+	ValueType_DELIMITED_DECIMAL ValueType = 9
+	ValueType_DURATION          ValueType = 6
+	// TUPLE represents a DTuple, encoded as repeated pairs of varint field number
+	// followed by a value encoded Datum.
+	ValueType_TUPLE ValueType = 10
 	// TIMESERIES is applied to values which contain InternalTimeSeriesData.
 	ValueType_TIMESERIES ValueType = 100
 )
 
 var ValueType_name = map[int32]string{
 	0:   "UNKNOWN",
+	7:   "NULL",
 	1:   "INT",
 	2:   "FLOAT",
 	3:   "BYTES",
+	8:   "DELIMITED_BYTES",
 	4:   "TIME",
 	5:   "DECIMAL",
+	9:   "DELIMITED_DECIMAL",
 	6:   "DURATION",
+	10:  "TUPLE",
 	100: "TIMESERIES",
 }
 var ValueType_value = map[string]int32{
-	"UNKNOWN":    0,
-	"INT":        1,
-	"FLOAT":      2,
-	"BYTES":      3,
-	"TIME":       4,
-	"DECIMAL":    5,
-	"DURATION":   6,
-	"TIMESERIES": 100,
+	"UNKNOWN":           0,
+	"NULL":              7,
+	"INT":               1,
+	"FLOAT":             2,
+	"BYTES":             3,
+	"DELIMITED_BYTES":   8,
+	"TIME":              4,
+	"DECIMAL":           5,
+	"DELIMITED_DECIMAL": 9,
+	"DURATION":          6,
+	"TUPLE":             10,
+	"TIMESERIES":        100,
 }
 
 func (x ValueType) Enum() *ValueType {
@@ -115,43 +132,6 @@ func (x *ReplicaChangeType) UnmarshalJSON(data []byte) error {
 }
 func (ReplicaChangeType) EnumDescriptor() ([]byte, []int) { return fileDescriptorData, []int{1} }
 
-// IsolationType TODO(jiajia) Needs documentation.
-type IsolationType int32
-
-const (
-	// SERIALIZABLE TODO(jiajia) Needs documentation.
-	SERIALIZABLE IsolationType = 0
-	// SNAPSHOT TODO(jiajia) Needs documentation.
-	SNAPSHOT IsolationType = 1
-)
-
-var IsolationType_name = map[int32]string{
-	0: "SERIALIZABLE",
-	1: "SNAPSHOT",
-}
-var IsolationType_value = map[string]int32{
-	"SERIALIZABLE": 0,
-	"SNAPSHOT":     1,
-}
-
-func (x IsolationType) Enum() *IsolationType {
-	p := new(IsolationType)
-	*p = x
-	return p
-}
-func (x IsolationType) String() string {
-	return proto.EnumName(IsolationType_name, int32(x))
-}
-func (x *IsolationType) UnmarshalJSON(data []byte) error {
-	value, err := proto.UnmarshalJSONEnum(IsolationType_value, data, "IsolationType")
-	if err != nil {
-		return err
-	}
-	*x = IsolationType(value)
-	return nil
-}
-func (IsolationType) EnumDescriptor() ([]byte, []int) { return fileDescriptorData, []int{2} }
-
 // TransactionStatus specifies possible states for a transaction.
 type TransactionStatus int32
 
@@ -201,7 +181,7 @@ func (x *TransactionStatus) UnmarshalJSON(data []byte) error {
 	*x = TransactionStatus(value)
 	return nil
 }
-func (TransactionStatus) EnumDescriptor() ([]byte, []int) { return fileDescriptorData, []int{3} }
+func (TransactionStatus) EnumDescriptor() ([]byte, []int) { return fileDescriptorData, []int{2} }
 
 // Span is supplied with every storage node request.
 type Span struct {
@@ -219,22 +199,6 @@ func (m *Span) Reset()                    { *m = Span{} }
 func (m *Span) String() string            { return proto.CompactTextString(m) }
 func (*Span) ProtoMessage()               {}
 func (*Span) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{0} }
-
-// Timestamp represents a state of the hybrid logical clock.
-type Timestamp struct {
-	// Holds a wall time, typically a unix epoch time
-	// expressed in nanoseconds.
-	WallTime int64 `protobuf:"varint,1,opt,name=wall_time,json=wallTime" json:"wall_time"`
-	// The logical component captures causality for events whose wall
-	// times are equal. It is effectively bounded by (maximum clock
-	// skew)/(minimal ns between events) and nearly impossible to
-	// overflow.
-	Logical int32 `protobuf:"varint,2,opt,name=logical" json:"logical"`
-}
-
-func (m *Timestamp) Reset()                    { *m = Timestamp{} }
-func (*Timestamp) ProtoMessage()               {}
-func (*Timestamp) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{1} }
 
 // Value specifies the value at a key. Multiple values at the same key are
 // supported based on timestamp. The data stored within a value is typed
@@ -254,13 +218,13 @@ type Value struct {
 	// raw_bytes contains the encoded value and checksum.
 	RawBytes []byte `protobuf:"bytes,1,opt,name=raw_bytes,json=rawBytes" json:"raw_bytes,omitempty"`
 	// Timestamp of value.
-	Timestamp Timestamp `protobuf:"bytes,2,opt,name=timestamp" json:"timestamp"`
+	Timestamp cockroach_util_hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp" json:"timestamp"`
 }
 
 func (m *Value) Reset()                    { *m = Value{} }
 func (m *Value) String() string            { return proto.CompactTextString(m) }
 func (*Value) ProtoMessage()               {}
-func (*Value) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{2} }
+func (*Value) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{1} }
 
 // KeyValue is a pair of Key and Value for returned Key/Value pairs
 // from ScanRequest/ScanResponse. It embeds a Key and a Value.
@@ -272,7 +236,7 @@ type KeyValue struct {
 func (m *KeyValue) Reset()                    { *m = KeyValue{} }
 func (m *KeyValue) String() string            { return proto.CompactTextString(m) }
 func (*KeyValue) ProtoMessage()               {}
-func (*KeyValue) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{3} }
+func (*KeyValue) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{2} }
 
 // A StoreIdent uniquely identifies a store in the cluster. The
 // StoreIdent is written to the underlying storage engine at a
@@ -286,45 +250,40 @@ type StoreIdent struct {
 func (m *StoreIdent) Reset()                    { *m = StoreIdent{} }
 func (m *StoreIdent) String() string            { return proto.CompactTextString(m) }
 func (*StoreIdent) ProtoMessage()               {}
-func (*StoreIdent) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{4} }
+func (*StoreIdent) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{3} }
 
 // A SplitTrigger is run after a successful commit of an AdminSplit
-// command. It provides the updated range descriptor covering the
-// first half of the split and the new range descriptor covering the
-// second half. This information allows the final bookkeeping for
-// the split to be completed and the new range put into operation.
+// command. It provides the updated left hand side of the split's
+// range descriptor (left_desc) and the new range descriptor covering
+// the right hand side of the split (right_desc). This information
+// allows the final bookkeeping for the split to be completed and the
+// new range put into operation.
 type SplitTrigger struct {
-	UpdatedDesc RangeDescriptor `protobuf:"bytes,1,opt,name=updated_desc,json=updatedDesc" json:"updated_desc"`
-	NewDesc     RangeDescriptor `protobuf:"bytes,2,opt,name=new_desc,json=newDesc" json:"new_desc"`
-	// initial_leader_store_id designates the replica which should start
-	// a raft election upon processing this split.
-	InitialLeaderStoreID StoreID `protobuf:"varint,3,opt,name=initial_leader_store_id,json=initialLeaderStoreId,casttype=StoreID" json:"initial_leader_store_id"`
+	LeftDesc  RangeDescriptor `protobuf:"bytes,1,opt,name=left_desc,json=leftDesc" json:"left_desc"`
+	RightDesc RangeDescriptor `protobuf:"bytes,2,opt,name=right_desc,json=rightDesc" json:"right_desc"`
 }
 
 func (m *SplitTrigger) Reset()                    { *m = SplitTrigger{} }
 func (m *SplitTrigger) String() string            { return proto.CompactTextString(m) }
 func (*SplitTrigger) ProtoMessage()               {}
-func (*SplitTrigger) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{5} }
+func (*SplitTrigger) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{4} }
 
 // A MergeTrigger is run after a successful commit of an AdminMerge
-// command. It provides the updated range descriptor that now encompasses
-// what was originally both ranges and the soon to be invalid range
-// descriptor that used to cover the subsumed half of the merge. This
-// information allows the final bookkeeping for the merge to be completed
-// and put into operation.
+// command. It provides the updated left hand side of the split's
+// range descriptor (left_desc) that now encompasses what was
+// originally both ranges and the soon-to-be-invalid range descriptor
+// that used to cover the subsumed, right hand side of the merge
+// (right_desc). This information allows the final bookkeeping for the
+// merge to be completed and put into operation.
 type MergeTrigger struct {
-	// The updated range descriptor that now encompasses what was originally
-	// both ranges.
-	UpdatedDesc RangeDescriptor `protobuf:"bytes,1,opt,name=updated_desc,json=updatedDesc" json:"updated_desc"`
-	// The soon to be invalid range descriptor that used to cover the subsumed
-	// half of the merge.
-	SubsumedDesc RangeDescriptor `protobuf:"bytes,2,opt,name=subsumed_desc,json=subsumedDesc" json:"subsumed_desc"`
+	LeftDesc  RangeDescriptor `protobuf:"bytes,1,opt,name=left_desc,json=leftDesc" json:"left_desc"`
+	RightDesc RangeDescriptor `protobuf:"bytes,2,opt,name=right_desc,json=rightDesc" json:"right_desc"`
 }
 
 func (m *MergeTrigger) Reset()                    { *m = MergeTrigger{} }
 func (m *MergeTrigger) String() string            { return proto.CompactTextString(m) }
 func (*MergeTrigger) ProtoMessage()               {}
-func (*MergeTrigger) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{6} }
+func (*MergeTrigger) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{5} }
 
 type ChangeReplicasTrigger struct {
 	ChangeType ReplicaChangeType `protobuf:"varint,1,opt,name=change_type,json=changeType,enum=cockroach.roachpb.ReplicaChangeType" json:"change_type"`
@@ -338,7 +297,7 @@ type ChangeReplicasTrigger struct {
 func (m *ChangeReplicasTrigger) Reset()                    { *m = ChangeReplicasTrigger{} }
 func (m *ChangeReplicasTrigger) String() string            { return proto.CompactTextString(m) }
 func (*ChangeReplicasTrigger) ProtoMessage()               {}
-func (*ChangeReplicasTrigger) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{7} }
+func (*ChangeReplicasTrigger) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{6} }
 
 // ModifiedSpanTrigger indicates that a specific span has been modified.
 // This can be used to trigger scan-and-gossip for the given span.
@@ -349,7 +308,7 @@ type ModifiedSpanTrigger struct {
 func (m *ModifiedSpanTrigger) Reset()                    { *m = ModifiedSpanTrigger{} }
 func (m *ModifiedSpanTrigger) String() string            { return proto.CompactTextString(m) }
 func (*ModifiedSpanTrigger) ProtoMessage()               {}
-func (*ModifiedSpanTrigger) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{8} }
+func (*ModifiedSpanTrigger) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{7} }
 
 // InternalCommitTrigger encapsulates all of the internal-only commit triggers.
 // Only one may be set.
@@ -363,7 +322,7 @@ type InternalCommitTrigger struct {
 func (m *InternalCommitTrigger) Reset()                    { *m = InternalCommitTrigger{} }
 func (m *InternalCommitTrigger) String() string            { return proto.CompactTextString(m) }
 func (*InternalCommitTrigger) ProtoMessage()               {}
-func (*InternalCommitTrigger) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{9} }
+func (*InternalCommitTrigger) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{8} }
 
 func (m *InternalCommitTrigger) GetSplitTrigger() *SplitTrigger {
 	if m != nil {
@@ -393,37 +352,6 @@ func (m *InternalCommitTrigger) GetModifiedSpanTrigger() *ModifiedSpanTrigger {
 	return nil
 }
 
-// TxnMeta is the metadata of a Transaction record.
-type TxnMeta struct {
-	// id is a unique UUID value which identifies the transaction.
-	ID        *github_com_cockroachdb_cockroach_util_uuid.UUID `protobuf:"bytes,1,opt,name=id,customtype=github.com/cockroachdb/cockroach/util/uuid.UUID" json:"id,omitempty"`
-	Isolation IsolationType                                    `protobuf:"varint,2,opt,name=isolation,enum=cockroach.roachpb.IsolationType" json:"isolation"`
-	// key is the key which anchors the transaction. This is typically
-	// the first key read or written during the transaction and determines which
-	// range in the cluster will hold the transaction record.
-	Key Key `protobuf:"bytes,3,opt,name=key,casttype=Key" json:"key,omitempty"`
-	// Incremented on txn retry.
-	Epoch uint32 `protobuf:"varint,4,opt,name=epoch" json:"epoch"`
-	// The proposed timestamp for the transaction. This starts as
-	// the current wall time on the txn coordinator.
-	Timestamp Timestamp `protobuf:"bytes,5,opt,name=timestamp" json:"timestamp"`
-	Priority  int32     `protobuf:"varint,6,opt,name=priority" json:"priority"`
-	// A one-indexed sequence number which is increased on each batch
-	// sent as part of the transaction. Used to prevent replay and
-	// out-of-order application protection (by means of a transaction
-	// retry).
-	Sequence int32 `protobuf:"varint,7,opt,name=sequence" json:"sequence"`
-	// A zero-indexed sequence number indicating the index of a
-	// command within a batch. This disambiguate Raft replays of a batch
-	// from multiple commands in a batch which modify the same key.
-	BatchIndex int32 `protobuf:"varint,8,opt,name=batch_index,json=batchIndex" json:"batch_index"`
-}
-
-func (m *TxnMeta) Reset()                    { *m = TxnMeta{} }
-func (m *TxnMeta) String() string            { return proto.CompactTextString(m) }
-func (*TxnMeta) ProtoMessage()               {}
-func (*TxnMeta) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{10} }
-
 // A Transaction is a unit of work performed on the database.
 // Cockroach transactions support two isolation levels: snapshot
 // isolation and serializable snapshot isolation. Each Cockroach
@@ -435,23 +363,53 @@ func (*TxnMeta) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{
 // Transaction.Clone. Failure to do so will result in test failures.
 type Transaction struct {
 	// The transaction metadata. These are persisted with every intent.
-	TxnMeta `protobuf:"bytes,1,opt,name=meta,embedded=meta" json:"meta"`
+	cockroach_storage_engine_enginepb.TxnMeta `protobuf:"bytes,1,opt,name=meta,embedded=meta" json:"meta"`
 	// A free-text identifier for debug purposes.
 	Name   string            `protobuf:"bytes,2,opt,name=name" json:"name"`
 	Status TransactionStatus `protobuf:"varint,4,opt,name=status,enum=cockroach.roachpb.TransactionStatus" json:"status"`
 	// The last heartbeat timestamp.
-	LastHeartbeat *Timestamp `protobuf:"bytes,5,opt,name=last_heartbeat,json=lastHeartbeat" json:"last_heartbeat,omitempty"`
+	LastHeartbeat *cockroach_util_hlc.Timestamp `protobuf:"bytes,5,opt,name=last_heartbeat,json=lastHeartbeat" json:"last_heartbeat,omitempty"`
 	// The original timestamp at which the transaction started. For serializable
 	// transactions, if the timestamp drifts from the original timestamp, the
 	// transaction will retry.
-	OrigTimestamp Timestamp `protobuf:"bytes,6,opt,name=orig_timestamp,json=origTimestamp" json:"orig_timestamp"`
+	//
+	// This timestamp is the one at which all transactions will read. It is also,
+	// surprisingly, the timestamp at which transactions will _write_. This is
+	// ultimately because of correctness concerns around SNAPSHOT transactions.
+	// Note first that for SERIALIZABLE transactions, the original and commit
+	// timestamps must not diverge, and so an intent which may be committed is
+	// always written when both timestamps coincide.
+	//
+	// For a SNAPSHOT transaction however, this is not the case. Intuitively,
+	// one could think that the timestamp at which intents should be written
+	// should be the provisional commit timestamp, and while this is morally
+	// true, consider the following scenario, where txn1 is a SNAPSHOT txn:
+	//
+	// - txn1 at orig_timestamp=5 reads key1: {Amount: 1, Price: 10}
+	// - txn1 writes elsewhere, has its commit timestamp increased to 20.
+	// - txn2 at orig_timestamp=10 reads key1: {Amount: 1, Price: 10}
+	// - txn2 increases Price by 5: {Amount: 1, Price: 15} and commits
+	// - txn1 increases Amount by 1: {Amount: 2, Price: 10}, attempts commit
+	//
+	// If txn1 uses its orig_timestamp for updating key1 (as it does), it
+	// conflicts with txn2's committed value (which is at timestamp 10, in the
+	// future of 5), and restarts.
+	// Using instead its candidate commit timestamp, it wouldn't see a conflict
+	// and commit, but this is not the expected outcome {Amount: 2, Price: 15}
+	// and we are experiencing the Lost Update Anomaly.
+	//
+	// Note that in practice, before restarting, txn1 would still lay down an
+	// intent (just above the committed value) not with the intent to commit it,
+	// but to avoid being starved by short-lived transactions on that key which
+	// would otherwise not have to go through conflict resolution with txn1.
+	OrigTimestamp cockroach_util_hlc.Timestamp `protobuf:"bytes,6,opt,name=orig_timestamp,json=origTimestamp" json:"orig_timestamp"`
 	// Initial Timestamp + clock skew. Reads which encounter values with
 	// timestamps between timestamp and max_timestamp trigger a txn
 	// retry error, unless the node being read is listed in observed_timestamps
 	// (in which case no more read uncertainty can occur).
 	// The case max_timestamp < timestamp is possible for transactions which have
 	// been pushed; in this case, max_timestamp should be ignored.
-	MaxTimestamp Timestamp `protobuf:"bytes,7,opt,name=max_timestamp,json=maxTimestamp" json:"max_timestamp"`
+	MaxTimestamp cockroach_util_hlc.Timestamp `protobuf:"bytes,7,opt,name=max_timestamp,json=maxTimestamp" json:"max_timestamp"`
 	// A map of NodeID to timestamps as observed from their local clock during
 	// this transaction. The purpose of this map is to avoid uncertainty related
 	// restarts which normally occur when reading a value in the near future as
@@ -460,7 +418,7 @@ type Transaction struct {
 	// is executing on, we can run the command with the map's timestamp as the
 	// top boundary of our uncertainty interval, limiting (and often avoiding)
 	// uncertainty restarts.
-	ObservedTimestamps map[NodeID]Timestamp `protobuf:"bytes,8,rep,name=observed_timestamps,json=observedTimestamps,castkey=NodeID" json:"observed_timestamps" protobuf_key:"varint,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	ObservedTimestamps map[NodeID]cockroach_util_hlc.Timestamp `protobuf:"bytes,8,rep,name=observed_timestamps,json=observedTimestamps,castkey=NodeID" json:"observed_timestamps" protobuf_key:"varint,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Writing is true if the transaction has previously executed a successful
 	// write request, i.e. a request that may have left intents (across retries).
 	Writing bool `protobuf:"varint,9,opt,name=writing" json:"writing"`
@@ -482,59 +440,59 @@ type Transaction struct {
 
 func (m *Transaction) Reset()                    { *m = Transaction{} }
 func (*Transaction) ProtoMessage()               {}
-func (*Transaction) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{11} }
+func (*Transaction) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{9} }
 
 // A Intent is a Span together with a Transaction metadata and its status.
 type Intent struct {
 	Span   `protobuf:"bytes,1,opt,name=span,embedded=span" json:"span"`
-	Txn    TxnMeta           `protobuf:"bytes,2,opt,name=txn" json:"txn"`
-	Status TransactionStatus `protobuf:"varint,3,opt,name=status,enum=cockroach.roachpb.TransactionStatus" json:"status"`
+	Txn    cockroach_storage_engine_enginepb.TxnMeta `protobuf:"bytes,2,opt,name=txn" json:"txn"`
+	Status TransactionStatus                         `protobuf:"varint,3,opt,name=status,enum=cockroach.roachpb.TransactionStatus" json:"status"`
 }
 
 func (m *Intent) Reset()                    { *m = Intent{} }
 func (m *Intent) String() string            { return proto.CompactTextString(m) }
 func (*Intent) ProtoMessage()               {}
-func (*Intent) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{12} }
+func (*Intent) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{10} }
 
-// Lease contains information about leader leases including the
+// Lease contains information about range leases including the
 // expiration and lease holder. It defines the two intervals
 // [start, start_stasis) and [start_stasis, expiration). The
 // former encompasses those timestamps for which the lease is
 // active, while the latter is a cooldown period which avoids
-// inconsistencies during leadership changes as explained below.
+// inconsistencies during lease holder changes as explained below.
 type Lease struct {
 	// The start is a timestamp at which the lease begins. This value
 	// must be greater than the last lease expiration or the lease request
 	// is considered invalid.
-	Start Timestamp `protobuf:"bytes,1,opt,name=start" json:"start"`
+	Start cockroach_util_hlc.Timestamp `protobuf:"bytes,1,opt,name=start" json:"start"`
 	// Before the lease expires, it enters a "stasis period" the length of which
 	// is usually determined by the lease holder's maximum allowed clock offset.
 	// During this stasis period, the lease must not be used (but can be extended
 	// by the owner instead). This prevents a failure of linearizability on a
 	// single register during lease changes. Without that stasis period, the
 	// following could occur:
-	// * a leader lease gets committed on the new leader (but not the old).
-	// * client proposes and commits a write on new leader (with a timestamp
+	// * a range lease gets committed on the new lease holder (but not the old).
+	// * client proposes and commits a write on new lease holder (with a timestamp
 	//   just greater than the expiration of the old lease).
 	// * client tries to read what it wrote, but hits a slow coordinator
 	//   (which assigns a timestamp covered by the old lease).
-	// * the read is served by the old leader (which has not processed the
-	//   change in leadership).
+	// * the read is served by the old lease holder (which has not processed the
+	//   change in lease holdership).
 	// * the client fails to read their own write.
 	//
-	// Instead, the old leader must refuse to serve the client's command on the
+	// Instead, the old lease holder must refuse to serve the client's command on the
 	// basis that its timestamp falls within the stasis period.
-	StartStasis Timestamp `protobuf:"bytes,4,opt,name=start_stasis,json=startStasis" json:"start_stasis"`
+	StartStasis cockroach_util_hlc.Timestamp `protobuf:"bytes,4,opt,name=start_stasis,json=startStasis" json:"start_stasis"`
 	// The expiration is a timestamp at which the lease expires. This means that
 	// a new lease can be granted for a later timestamp.
-	Expiration Timestamp `protobuf:"bytes,2,opt,name=expiration" json:"expiration"`
+	Expiration cockroach_util_hlc.Timestamp `protobuf:"bytes,2,opt,name=expiration" json:"expiration"`
 	// The address of the would-be lease holder.
 	Replica ReplicaDescriptor `protobuf:"bytes,3,opt,name=replica" json:"replica"`
 }
 
 func (m *Lease) Reset()                    { *m = Lease{} }
 func (*Lease) ProtoMessage()               {}
-func (*Lease) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{13} }
+func (*Lease) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{11} }
 
 // AbortCacheEntry contains information about a transaction which has
 // been aborted. It's written to a range's abort cache if the range
@@ -547,7 +505,7 @@ type AbortCacheEntry struct {
 	Key Key `protobuf:"bytes,1,opt,name=key,casttype=Key" json:"key,omitempty"`
 	// The candidate commit timestamp the transaction record held at the time
 	// it was aborted.
-	Timestamp Timestamp `protobuf:"bytes,2,opt,name=timestamp" json:"timestamp"`
+	Timestamp cockroach_util_hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp" json:"timestamp"`
 	// The priority of the transaction.
 	Priority int32 `protobuf:"varint,3,opt,name=priority" json:"priority"`
 }
@@ -555,11 +513,10 @@ type AbortCacheEntry struct {
 func (m *AbortCacheEntry) Reset()                    { *m = AbortCacheEntry{} }
 func (m *AbortCacheEntry) String() string            { return proto.CompactTextString(m) }
 func (*AbortCacheEntry) ProtoMessage()               {}
-func (*AbortCacheEntry) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{14} }
+func (*AbortCacheEntry) Descriptor() ([]byte, []int) { return fileDescriptorData, []int{12} }
 
 func init() {
 	proto.RegisterType((*Span)(nil), "cockroach.roachpb.Span")
-	proto.RegisterType((*Timestamp)(nil), "cockroach.roachpb.Timestamp")
 	proto.RegisterType((*Value)(nil), "cockroach.roachpb.Value")
 	proto.RegisterType((*KeyValue)(nil), "cockroach.roachpb.KeyValue")
 	proto.RegisterType((*StoreIdent)(nil), "cockroach.roachpb.StoreIdent")
@@ -568,14 +525,12 @@ func init() {
 	proto.RegisterType((*ChangeReplicasTrigger)(nil), "cockroach.roachpb.ChangeReplicasTrigger")
 	proto.RegisterType((*ModifiedSpanTrigger)(nil), "cockroach.roachpb.ModifiedSpanTrigger")
 	proto.RegisterType((*InternalCommitTrigger)(nil), "cockroach.roachpb.InternalCommitTrigger")
-	proto.RegisterType((*TxnMeta)(nil), "cockroach.roachpb.TxnMeta")
 	proto.RegisterType((*Transaction)(nil), "cockroach.roachpb.Transaction")
 	proto.RegisterType((*Intent)(nil), "cockroach.roachpb.Intent")
 	proto.RegisterType((*Lease)(nil), "cockroach.roachpb.Lease")
 	proto.RegisterType((*AbortCacheEntry)(nil), "cockroach.roachpb.AbortCacheEntry")
 	proto.RegisterEnum("cockroach.roachpb.ValueType", ValueType_name, ValueType_value)
 	proto.RegisterEnum("cockroach.roachpb.ReplicaChangeType", ReplicaChangeType_name, ReplicaChangeType_value)
-	proto.RegisterEnum("cockroach.roachpb.IsolationType", IsolationType_name, IsolationType_value)
 	proto.RegisterEnum("cockroach.roachpb.TransactionStatus", TransactionStatus_name, TransactionStatus_value)
 }
 func (m *Span) Marshal() (data []byte, err error) {
@@ -605,30 +560,6 @@ func (m *Span) MarshalTo(data []byte) (int, error) {
 		i = encodeVarintData(data, i, uint64(len(m.EndKey)))
 		i += copy(data[i:], m.EndKey)
 	}
-	return i, nil
-}
-
-func (m *Timestamp) Marshal() (data []byte, err error) {
-	size := m.Size()
-	data = make([]byte, size)
-	n, err := m.MarshalTo(data)
-	if err != nil {
-		return nil, err
-	}
-	return data[:n], nil
-}
-
-func (m *Timestamp) MarshalTo(data []byte) (int, error) {
-	var i int
-	_ = i
-	var l int
-	_ = l
-	data[i] = 0x8
-	i++
-	i = encodeVarintData(data, i, uint64(m.WallTime))
-	data[i] = 0x10
-	i++
-	i = encodeVarintData(data, i, uint64(m.Logical))
 	return i, nil
 }
 
@@ -745,23 +676,20 @@ func (m *SplitTrigger) MarshalTo(data []byte) (int, error) {
 	_ = l
 	data[i] = 0xa
 	i++
-	i = encodeVarintData(data, i, uint64(m.UpdatedDesc.Size()))
-	n4, err := m.UpdatedDesc.MarshalTo(data[i:])
+	i = encodeVarintData(data, i, uint64(m.LeftDesc.Size()))
+	n4, err := m.LeftDesc.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n4
 	data[i] = 0x12
 	i++
-	i = encodeVarintData(data, i, uint64(m.NewDesc.Size()))
-	n5, err := m.NewDesc.MarshalTo(data[i:])
+	i = encodeVarintData(data, i, uint64(m.RightDesc.Size()))
+	n5, err := m.RightDesc.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n5
-	data[i] = 0x18
-	i++
-	i = encodeVarintData(data, i, uint64(m.InitialLeaderStoreID))
 	return i, nil
 }
 
@@ -782,16 +710,16 @@ func (m *MergeTrigger) MarshalTo(data []byte) (int, error) {
 	_ = l
 	data[i] = 0xa
 	i++
-	i = encodeVarintData(data, i, uint64(m.UpdatedDesc.Size()))
-	n6, err := m.UpdatedDesc.MarshalTo(data[i:])
+	i = encodeVarintData(data, i, uint64(m.LeftDesc.Size()))
+	n6, err := m.LeftDesc.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n6
 	data[i] = 0x12
 	i++
-	i = encodeVarintData(data, i, uint64(m.SubsumedDesc.Size()))
-	n7, err := m.SubsumedDesc.MarshalTo(data[i:])
+	i = encodeVarintData(data, i, uint64(m.RightDesc.Size()))
+	n7, err := m.RightDesc.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
@@ -927,63 +855,6 @@ func (m *InternalCommitTrigger) MarshalTo(data []byte) (int, error) {
 	return i, nil
 }
 
-func (m *TxnMeta) Marshal() (data []byte, err error) {
-	size := m.Size()
-	data = make([]byte, size)
-	n, err := m.MarshalTo(data)
-	if err != nil {
-		return nil, err
-	}
-	return data[:n], nil
-}
-
-func (m *TxnMeta) MarshalTo(data []byte) (int, error) {
-	var i int
-	_ = i
-	var l int
-	_ = l
-	if m.ID != nil {
-		data[i] = 0xa
-		i++
-		i = encodeVarintData(data, i, uint64(m.ID.Size()))
-		n13, err := m.ID.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n13
-	}
-	data[i] = 0x10
-	i++
-	i = encodeVarintData(data, i, uint64(m.Isolation))
-	if m.Key != nil {
-		data[i] = 0x1a
-		i++
-		i = encodeVarintData(data, i, uint64(len(m.Key)))
-		i += copy(data[i:], m.Key)
-	}
-	data[i] = 0x20
-	i++
-	i = encodeVarintData(data, i, uint64(m.Epoch))
-	data[i] = 0x2a
-	i++
-	i = encodeVarintData(data, i, uint64(m.Timestamp.Size()))
-	n14, err := m.Timestamp.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n14
-	data[i] = 0x30
-	i++
-	i = encodeVarintData(data, i, uint64(m.Priority))
-	data[i] = 0x38
-	i++
-	i = encodeVarintData(data, i, uint64(m.Sequence))
-	data[i] = 0x40
-	i++
-	i = encodeVarintData(data, i, uint64(m.BatchIndex))
-	return i, nil
-}
-
 func (m *Transaction) Marshal() (data []byte, err error) {
 	size := m.Size()
 	data = make([]byte, size)
@@ -1002,11 +873,11 @@ func (m *Transaction) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintData(data, i, uint64(m.TxnMeta.Size()))
-	n15, err := m.TxnMeta.MarshalTo(data[i:])
+	n13, err := m.TxnMeta.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n15
+	i += n13
 	data[i] = 0x12
 	i++
 	i = encodeVarintData(data, i, uint64(len(m.Name)))
@@ -1018,28 +889,28 @@ func (m *Transaction) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x2a
 		i++
 		i = encodeVarintData(data, i, uint64(m.LastHeartbeat.Size()))
-		n16, err := m.LastHeartbeat.MarshalTo(data[i:])
+		n14, err := m.LastHeartbeat.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n16
+		i += n14
 	}
 	data[i] = 0x32
 	i++
 	i = encodeVarintData(data, i, uint64(m.OrigTimestamp.Size()))
-	n17, err := m.OrigTimestamp.MarshalTo(data[i:])
+	n15, err := m.OrigTimestamp.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n17
+	i += n15
 	data[i] = 0x3a
 	i++
 	i = encodeVarintData(data, i, uint64(m.MaxTimestamp.Size()))
-	n18, err := m.MaxTimestamp.MarshalTo(data[i:])
+	n16, err := m.MaxTimestamp.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n18
+	i += n16
 	if len(m.ObservedTimestamps) > 0 {
 		keysForObservedTimestamps := make([]int32, 0, len(m.ObservedTimestamps))
 		for k := range m.ObservedTimestamps {
@@ -1050,8 +921,12 @@ func (m *Transaction) MarshalTo(data []byte) (int, error) {
 			data[i] = 0x42
 			i++
 			v := m.ObservedTimestamps[NodeID(k)]
-			msgSize := (&v).Size()
-			mapSize := 1 + sovData(uint64(k)) + 1 + msgSize + sovData(uint64(msgSize))
+			msgSize := 0
+			if (&v) != nil {
+				msgSize = (&v).Size()
+				msgSize += 1 + sovData(uint64(msgSize))
+			}
+			mapSize := 1 + sovData(uint64(k)) + msgSize
 			i = encodeVarintData(data, i, uint64(mapSize))
 			data[i] = 0x8
 			i++
@@ -1059,11 +934,11 @@ func (m *Transaction) MarshalTo(data []byte) (int, error) {
 			data[i] = 0x12
 			i++
 			i = encodeVarintData(data, i, uint64((&v).Size()))
-			n19, err := (&v).MarshalTo(data[i:])
+			n17, err := (&v).MarshalTo(data[i:])
 			if err != nil {
 				return 0, err
 			}
-			i += n19
+			i += n17
 		}
 	}
 	data[i] = 0x48
@@ -1123,19 +998,19 @@ func (m *Intent) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintData(data, i, uint64(m.Span.Size()))
-	n20, err := m.Span.MarshalTo(data[i:])
+	n18, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n20
+	i += n18
 	data[i] = 0x12
 	i++
 	i = encodeVarintData(data, i, uint64(m.Txn.Size()))
-	n21, err := m.Txn.MarshalTo(data[i:])
+	n19, err := m.Txn.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n21
+	i += n19
 	data[i] = 0x18
 	i++
 	i = encodeVarintData(data, i, uint64(m.Status))
@@ -1160,35 +1035,35 @@ func (m *Lease) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintData(data, i, uint64(m.Start.Size()))
-	n22, err := m.Start.MarshalTo(data[i:])
+	n20, err := m.Start.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n20
+	data[i] = 0x12
+	i++
+	i = encodeVarintData(data, i, uint64(m.Expiration.Size()))
+	n21, err := m.Expiration.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n21
+	data[i] = 0x1a
+	i++
+	i = encodeVarintData(data, i, uint64(m.Replica.Size()))
+	n22, err := m.Replica.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n22
-	data[i] = 0x12
+	data[i] = 0x22
 	i++
-	i = encodeVarintData(data, i, uint64(m.Expiration.Size()))
-	n23, err := m.Expiration.MarshalTo(data[i:])
+	i = encodeVarintData(data, i, uint64(m.StartStasis.Size()))
+	n23, err := m.StartStasis.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n23
-	data[i] = 0x1a
-	i++
-	i = encodeVarintData(data, i, uint64(m.Replica.Size()))
-	n24, err := m.Replica.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n24
-	data[i] = 0x22
-	i++
-	i = encodeVarintData(data, i, uint64(m.StartStasis.Size()))
-	n25, err := m.StartStasis.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n25
 	return i, nil
 }
 
@@ -1216,11 +1091,11 @@ func (m *AbortCacheEntry) MarshalTo(data []byte) (int, error) {
 	data[i] = 0x12
 	i++
 	i = encodeVarintData(data, i, uint64(m.Timestamp.Size()))
-	n26, err := m.Timestamp.MarshalTo(data[i:])
+	n24, err := m.Timestamp.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n26
+	i += n24
 	data[i] = 0x18
 	i++
 	i = encodeVarintData(data, i, uint64(m.Priority))
@@ -1275,81 +1150,33 @@ func NewPopulatedSpan(r randyData, easy bool) *Span {
 	return this
 }
 
-func NewPopulatedTimestamp(r randyData, easy bool) *Timestamp {
-	this := &Timestamp{}
-	this.WallTime = int64(r.Int63())
-	if r.Intn(2) == 0 {
-		this.WallTime *= -1
-	}
-	this.Logical = int32(r.Int31())
-	if r.Intn(2) == 0 {
-		this.Logical *= -1
-	}
-	if !easy && r.Intn(10) != 0 {
-	}
-	return this
-}
-
-func NewPopulatedTxnMeta(r randyData, easy bool) *TxnMeta {
-	this := &TxnMeta{}
-	if r.Intn(10) != 0 {
-		this.ID = github_com_cockroachdb_cockroach_util_uuid.NewPopulatedUUID(r)
-	}
-	this.Isolation = IsolationType([]int32{0, 1}[r.Intn(2)])
-	if r.Intn(10) != 0 {
-		v3 := r.Intn(100)
-		this.Key = make(Key, v3)
-		for i := 0; i < v3; i++ {
-			this.Key[i] = byte(r.Intn(256))
-		}
-	}
-	this.Epoch = uint32(r.Uint32())
-	v4 := NewPopulatedTimestamp(r, easy)
-	this.Timestamp = *v4
-	this.Priority = int32(r.Int31())
-	if r.Intn(2) == 0 {
-		this.Priority *= -1
-	}
-	this.Sequence = int32(r.Int31())
-	if r.Intn(2) == 0 {
-		this.Sequence *= -1
-	}
-	this.BatchIndex = int32(r.Int31())
-	if r.Intn(2) == 0 {
-		this.BatchIndex *= -1
-	}
-	if !easy && r.Intn(10) != 0 {
-	}
-	return this
-}
-
 func NewPopulatedTransaction(r randyData, easy bool) *Transaction {
 	this := &Transaction{}
-	v5 := NewPopulatedTxnMeta(r, easy)
-	this.TxnMeta = *v5
+	v3 := cockroach_storage_engine_enginepb.NewPopulatedTxnMeta(r, easy)
+	this.TxnMeta = *v3
 	this.Name = randStringData(r)
 	this.Status = TransactionStatus([]int32{0, 1, 2}[r.Intn(3)])
 	if r.Intn(10) != 0 {
-		this.LastHeartbeat = NewPopulatedTimestamp(r, easy)
+		this.LastHeartbeat = cockroach_util_hlc.NewPopulatedTimestamp(r, easy)
 	}
-	v6 := NewPopulatedTimestamp(r, easy)
-	this.OrigTimestamp = *v6
-	v7 := NewPopulatedTimestamp(r, easy)
-	this.MaxTimestamp = *v7
+	v4 := cockroach_util_hlc.NewPopulatedTimestamp(r, easy)
+	this.OrigTimestamp = *v4
+	v5 := cockroach_util_hlc.NewPopulatedTimestamp(r, easy)
+	this.MaxTimestamp = *v5
 	if r.Intn(10) != 0 {
-		v8 := r.Intn(10)
-		this.ObservedTimestamps = make(map[NodeID]Timestamp)
-		for i := 0; i < v8; i++ {
-			this.ObservedTimestamps[NodeID(int32(r.Int31()))] = *NewPopulatedTimestamp(r, easy)
+		v6 := r.Intn(10)
+		this.ObservedTimestamps = make(map[NodeID]cockroach_util_hlc.Timestamp)
+		for i := 0; i < v6; i++ {
+			this.ObservedTimestamps[NodeID(int32(r.Int31()))] = *cockroach_util_hlc.NewPopulatedTimestamp(r, easy)
 		}
 	}
 	this.Writing = bool(bool(r.Intn(2) == 0))
 	if r.Intn(10) != 0 {
-		v9 := r.Intn(5)
-		this.Intents = make([]Span, v9)
-		for i := 0; i < v9; i++ {
-			v10 := NewPopulatedSpan(r, easy)
-			this.Intents[i] = *v10
+		v7 := r.Intn(5)
+		this.Intents = make([]Span, v7)
+		for i := 0; i < v7; i++ {
+			v8 := NewPopulatedSpan(r, easy)
+			this.Intents[i] = *v8
 		}
 	}
 	this.WriteTooOld = bool(bool(r.Intn(2) == 0))
@@ -1361,14 +1188,14 @@ func NewPopulatedTransaction(r randyData, easy bool) *Transaction {
 
 func NewPopulatedLease(r randyData, easy bool) *Lease {
 	this := &Lease{}
-	v11 := NewPopulatedTimestamp(r, easy)
-	this.Start = *v11
-	v12 := NewPopulatedTimestamp(r, easy)
-	this.Expiration = *v12
-	v13 := NewPopulatedReplicaDescriptor(r, easy)
-	this.Replica = *v13
-	v14 := NewPopulatedTimestamp(r, easy)
-	this.StartStasis = *v14
+	v9 := cockroach_util_hlc.NewPopulatedTimestamp(r, easy)
+	this.Start = *v9
+	v10 := cockroach_util_hlc.NewPopulatedTimestamp(r, easy)
+	this.Expiration = *v10
+	v11 := NewPopulatedReplicaDescriptor(r, easy)
+	this.Replica = *v11
+	v12 := cockroach_util_hlc.NewPopulatedTimestamp(r, easy)
+	this.StartStasis = *v12
 	if !easy && r.Intn(10) != 0 {
 	}
 	return this
@@ -1377,14 +1204,14 @@ func NewPopulatedLease(r randyData, easy bool) *Lease {
 func NewPopulatedAbortCacheEntry(r randyData, easy bool) *AbortCacheEntry {
 	this := &AbortCacheEntry{}
 	if r.Intn(10) != 0 {
-		v15 := r.Intn(100)
-		this.Key = make(Key, v15)
-		for i := 0; i < v15; i++ {
+		v13 := r.Intn(100)
+		this.Key = make(Key, v13)
+		for i := 0; i < v13; i++ {
 			this.Key[i] = byte(r.Intn(256))
 		}
 	}
-	v16 := NewPopulatedTimestamp(r, easy)
-	this.Timestamp = *v16
+	v14 := cockroach_util_hlc.NewPopulatedTimestamp(r, easy)
+	this.Timestamp = *v14
 	this.Priority = int32(r.Int31())
 	if r.Intn(2) == 0 {
 		this.Priority *= -1
@@ -1413,9 +1240,9 @@ func randUTF8RuneData(r randyData) rune {
 	return rune(ru + 61)
 }
 func randStringData(r randyData) string {
-	v17 := r.Intn(100)
-	tmps := make([]rune, v17)
-	for i := 0; i < v17; i++ {
+	v15 := r.Intn(100)
+	tmps := make([]rune, v15)
+	for i := 0; i < v15; i++ {
 		tmps[i] = randUTF8RuneData(r)
 	}
 	return string(tmps)
@@ -1437,11 +1264,11 @@ func randFieldData(data []byte, r randyData, fieldNumber int, wire int) []byte {
 	switch wire {
 	case 0:
 		data = encodeVarintPopulateData(data, uint64(key))
-		v18 := r.Int63()
+		v16 := r.Int63()
 		if r.Intn(2) == 0 {
-			v18 *= -1
+			v16 *= -1
 		}
-		data = encodeVarintPopulateData(data, uint64(v18))
+		data = encodeVarintPopulateData(data, uint64(v16))
 	case 1:
 		data = encodeVarintPopulateData(data, uint64(key))
 		data = append(data, byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)))
@@ -1477,14 +1304,6 @@ func (m *Span) Size() (n int) {
 		l = len(m.EndKey)
 		n += 1 + l + sovData(uint64(l))
 	}
-	return n
-}
-
-func (m *Timestamp) Size() (n int) {
-	var l int
-	_ = l
-	n += 1 + sovData(uint64(m.WallTime))
-	n += 1 + sovData(uint64(m.Logical))
 	return n
 }
 
@@ -1525,20 +1344,19 @@ func (m *StoreIdent) Size() (n int) {
 func (m *SplitTrigger) Size() (n int) {
 	var l int
 	_ = l
-	l = m.UpdatedDesc.Size()
+	l = m.LeftDesc.Size()
 	n += 1 + l + sovData(uint64(l))
-	l = m.NewDesc.Size()
+	l = m.RightDesc.Size()
 	n += 1 + l + sovData(uint64(l))
-	n += 1 + sovData(uint64(m.InitialLeaderStoreID))
 	return n
 }
 
 func (m *MergeTrigger) Size() (n int) {
 	var l int
 	_ = l
-	l = m.UpdatedDesc.Size()
+	l = m.LeftDesc.Size()
 	n += 1 + l + sovData(uint64(l))
-	l = m.SubsumedDesc.Size()
+	l = m.RightDesc.Size()
 	n += 1 + l + sovData(uint64(l))
 	return n
 }
@@ -1585,27 +1403,6 @@ func (m *InternalCommitTrigger) Size() (n int) {
 		l = m.ModifiedSpanTrigger.Size()
 		n += 1 + l + sovData(uint64(l))
 	}
-	return n
-}
-
-func (m *TxnMeta) Size() (n int) {
-	var l int
-	_ = l
-	if m.ID != nil {
-		l = m.ID.Size()
-		n += 1 + l + sovData(uint64(l))
-	}
-	n += 1 + sovData(uint64(m.Isolation))
-	if m.Key != nil {
-		l = len(m.Key)
-		n += 1 + l + sovData(uint64(l))
-	}
-	n += 1 + sovData(uint64(m.Epoch))
-	l = m.Timestamp.Size()
-	n += 1 + l + sovData(uint64(l))
-	n += 1 + sovData(uint64(m.Priority))
-	n += 1 + sovData(uint64(m.Sequence))
-	n += 1 + sovData(uint64(m.BatchIndex))
 	return n
 }
 
@@ -1788,94 +1585,6 @@ func (m *Span) Unmarshal(data []byte) error {
 				m.EndKey = []byte{}
 			}
 			iNdEx = postIndex
-		default:
-			iNdEx = preIndex
-			skippy, err := skipData(data[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthData
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
-func (m *Timestamp) Unmarshal(data []byte) error {
-	l := len(data)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowData
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := data[iNdEx]
-			iNdEx++
-			wire |= (uint64(b) & 0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: Timestamp: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: Timestamp: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field WallTime", wireType)
-			}
-			m.WallTime = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.WallTime |= (int64(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Logical", wireType)
-			}
-			m.Logical = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.Logical |= (int32(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
 		default:
 			iNdEx = preIndex
 			skippy, err := skipData(data[iNdEx:])
@@ -2268,7 +1977,7 @@ func (m *SplitTrigger) Unmarshal(data []byte) error {
 		switch fieldNum {
 		case 1:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field UpdatedDesc", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field LeftDesc", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -2292,13 +2001,13 @@ func (m *SplitTrigger) Unmarshal(data []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if err := m.UpdatedDesc.Unmarshal(data[iNdEx:postIndex]); err != nil {
+			if err := m.LeftDesc.Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
 		case 2:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field NewDesc", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field RightDesc", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -2322,29 +2031,10 @@ func (m *SplitTrigger) Unmarshal(data []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if err := m.NewDesc.Unmarshal(data[iNdEx:postIndex]); err != nil {
+			if err := m.RightDesc.Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
-		case 3:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field InitialLeaderStoreID", wireType)
-			}
-			m.InitialLeaderStoreID = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.InitialLeaderStoreID |= (StoreID(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
 		default:
 			iNdEx = preIndex
 			skippy, err := skipData(data[iNdEx:])
@@ -2397,7 +2087,7 @@ func (m *MergeTrigger) Unmarshal(data []byte) error {
 		switch fieldNum {
 		case 1:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field UpdatedDesc", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field LeftDesc", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -2421,13 +2111,13 @@ func (m *MergeTrigger) Unmarshal(data []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if err := m.UpdatedDesc.Unmarshal(data[iNdEx:postIndex]); err != nil {
+			if err := m.LeftDesc.Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
 		case 2:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field SubsumedDesc", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field RightDesc", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -2451,7 +2141,7 @@ func (m *MergeTrigger) Unmarshal(data []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if err := m.SubsumedDesc.Unmarshal(data[iNdEx:postIndex]); err != nil {
+			if err := m.RightDesc.Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -2877,244 +2567,6 @@ func (m *InternalCommitTrigger) Unmarshal(data []byte) error {
 	}
 	return nil
 }
-func (m *TxnMeta) Unmarshal(data []byte) error {
-	l := len(data)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowData
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := data[iNdEx]
-			iNdEx++
-			wire |= (uint64(b) & 0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: TxnMeta: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: TxnMeta: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field ID", wireType)
-			}
-			var byteLen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				byteLen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if byteLen < 0 {
-				return ErrInvalidLengthData
-			}
-			postIndex := iNdEx + byteLen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			var v github_com_cockroachdb_cockroach_util_uuid.UUID
-			m.ID = &v
-			if err := m.ID.Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Isolation", wireType)
-			}
-			m.Isolation = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.Isolation |= (IsolationType(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 3:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Key", wireType)
-			}
-			var byteLen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				byteLen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if byteLen < 0 {
-				return ErrInvalidLengthData
-			}
-			postIndex := iNdEx + byteLen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.Key = append(m.Key[:0], data[iNdEx:postIndex]...)
-			if m.Key == nil {
-				m.Key = []byte{}
-			}
-			iNdEx = postIndex
-		case 4:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Epoch", wireType)
-			}
-			m.Epoch = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.Epoch |= (uint32(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 5:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Timestamp", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthData
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := m.Timestamp.Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 6:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Priority", wireType)
-			}
-			m.Priority = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.Priority |= (int32(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 7:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Sequence", wireType)
-			}
-			m.Sequence = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.Sequence |= (int32(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 8:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field BatchIndex", wireType)
-			}
-			m.BatchIndex = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.BatchIndex |= (int32(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		default:
-			iNdEx = preIndex
-			skippy, err := skipData(data[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthData
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
 func (m *Transaction) Unmarshal(data []byte) error {
 	l := len(data)
 	iNdEx := 0
@@ -3249,7 +2701,7 @@ func (m *Transaction) Unmarshal(data []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			if m.LastHeartbeat == nil {
-				m.LastHeartbeat = &Timestamp{}
+				m.LastHeartbeat = &cockroach_util_hlc.Timestamp{}
 			}
 			if err := m.LastHeartbeat.Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
@@ -3371,55 +2823,60 @@ func (m *Transaction) Unmarshal(data []byte) error {
 					break
 				}
 			}
-			var valuekey uint64
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				valuekey |= (uint64(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			var mapmsglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowData
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				mapmsglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if mapmsglen < 0 {
-				return ErrInvalidLengthData
-			}
-			postmsgIndex := iNdEx + mapmsglen
-			if mapmsglen < 0 {
-				return ErrInvalidLengthData
-			}
-			if postmsgIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			mapvalue := &Timestamp{}
-			if err := mapvalue.Unmarshal(data[iNdEx:postmsgIndex]); err != nil {
-				return err
-			}
-			iNdEx = postmsgIndex
 			if m.ObservedTimestamps == nil {
-				m.ObservedTimestamps = make(map[NodeID]Timestamp)
+				m.ObservedTimestamps = make(map[NodeID]cockroach_util_hlc.Timestamp)
 			}
-			m.ObservedTimestamps[NodeID(mapkey)] = *mapvalue
+			if iNdEx < postIndex {
+				var valuekey uint64
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowData
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := data[iNdEx]
+					iNdEx++
+					valuekey |= (uint64(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				var mapmsglen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowData
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := data[iNdEx]
+					iNdEx++
+					mapmsglen |= (int(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if mapmsglen < 0 {
+					return ErrInvalidLengthData
+				}
+				postmsgIndex := iNdEx + mapmsglen
+				if mapmsglen < 0 {
+					return ErrInvalidLengthData
+				}
+				if postmsgIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				mapvalue := &cockroach_util_hlc.Timestamp{}
+				if err := mapvalue.Unmarshal(data[iNdEx:postmsgIndex]); err != nil {
+					return err
+				}
+				iNdEx = postmsgIndex
+				m.ObservedTimestamps[NodeID(mapkey)] = *mapvalue
+			} else {
+				var mapvalue cockroach_util_hlc.Timestamp
+				m.ObservedTimestamps[NodeID(mapkey)] = mapvalue
+			}
 			iNdEx = postIndex
 		case 9:
 			if wireType != 0 {
@@ -4067,104 +3524,100 @@ var (
 	ErrIntOverflowData   = fmt.Errorf("proto: integer overflow")
 )
 
+func init() { proto.RegisterFile("cockroach/roachpb/data.proto", fileDescriptorData) }
+
 var fileDescriptorData = []byte{
-	// 1568 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x09, 0x6e, 0x88, 0x02, 0xff, 0xb4, 0x57, 0x4f, 0x6f, 0x1b, 0x45,
-	0x14, 0x8f, 0xff, 0xdb, 0xcf, 0x76, 0xe2, 0x4e, 0x5b, 0xc5, 0x84, 0x2a, 0x4e, 0x2d, 0xfe, 0x54,
-	0x3d, 0x24, 0x22, 0xa2, 0x50, 0x72, 0x40, 0xf8, 0x1f, 0xed, 0xd2, 0xd8, 0x8e, 0xd6, 0x4e, 0x29,
-	0x45, 0x62, 0x59, 0xef, 0x4e, 0x9d, 0x55, 0xd7, 0xbb, 0x66, 0x77, 0xdd, 0x24, 0x37, 0x84, 0x38,
-	0xf4, 0x88, 0x84, 0x84, 0x38, 0x70, 0xa8, 0xc4, 0x8d, 0x2f, 0x00, 0x1f, 0xa1, 0x17, 0xa4, 0x1e,
-	0x11, 0x48, 0x01, 0xca, 0x81, 0xef, 0xd0, 0x13, 0x6f, 0x66, 0x67, 0xd7, 0x1b, 0xec, 0x46, 0x69,
-	0x10, 0x07, 0x27, 0xe3, 0xf7, 0x7e, 0xbf, 0xdf, 0xbc, 0x79, 0xf3, 0xde, 0xcc, 0x18, 0x2e, 0x69,
-	0xb6, 0x76, 0xdf, 0xb1, 0x55, 0x6d, 0x6f, 0x83, 0xff, 0x1d, 0x0f, 0x36, 0x74, 0xd5, 0x53, 0xd7,
-	0xc7, 0x8e, 0xed, 0xd9, 0xe4, 0x5c, 0xe8, 0x5d, 0x17, 0xde, 0x95, 0xb5, 0x59, 0xc2, 0x88, 0x7a,
-	0xea, 0x94, 0xb4, 0x72, 0x61, 0x68, 0x0f, 0x6d, 0x3e, 0xdc, 0x60, 0x23, 0xdf, 0x5a, 0x95, 0x20,
-	0xd9, 0x1b, 0xab, 0x16, 0x79, 0x09, 0x12, 0xf7, 0xe9, 0x61, 0x39, 0xb1, 0x16, 0xbb, 0x52, 0xa8,
-	0x67, 0x9e, 0x1d, 0x55, 0x12, 0xb7, 0xe8, 0xa1, 0xcc, 0x6c, 0x64, 0x0d, 0x32, 0xd4, 0xd2, 0x15,
-	0xe6, 0x4e, 0x1e, 0x77, 0xa7, 0xd1, 0x8e, 0xff, 0xb7, 0x92, 0x3f, 0x3d, 0xaa, 0xc4, 0xaa, 0x77,
-	0x20, 0xd7, 0x37, 0x46, 0xd4, 0xf5, 0xd4, 0xd1, 0x98, 0x5c, 0x86, 0xdc, 0xbe, 0x6a, 0x9a, 0x8a,
-	0x87, 0x96, 0x72, 0x0c, 0x69, 0x89, 0x7a, 0xf2, 0xf1, 0x51, 0x65, 0x41, 0xce, 0x32, 0x33, 0xc3,
-	0x91, 0x55, 0xc8, 0x98, 0xf6, 0xd0, 0xd0, 0x54, 0xb3, 0x1c, 0x47, 0x40, 0x4a, 0x00, 0x02, 0xe3,
-	0x56, 0xf6, 0xdb, 0x47, 0x95, 0x05, 0xae, 0x7c, 0x0f, 0x52, 0xb7, 0x55, 0x73, 0x42, 0xc9, 0xcb,
-	0x90, 0x73, 0xd4, 0x7d, 0x65, 0x70, 0xe8, 0x51, 0x97, 0xab, 0x16, 0xe4, 0x2c, 0x1a, 0xea, 0xec,
-	0x3b, 0x79, 0x0f, 0x72, 0x5e, 0x30, 0x3f, 0x57, 0xcc, 0x6f, 0x5e, 0x5a, 0x9f, 0xc9, 0xd4, 0x7a,
-	0x18, 0xa3, 0x98, 0x6f, 0x4a, 0xaa, 0x7e, 0x0c, 0x59, 0x5c, 0x8e, 0x3f, 0x95, 0x48, 0x48, 0x6c,
-	0x4e, 0x42, 0xde, 0x84, 0xd4, 0x03, 0x86, 0x11, 0x93, 0x94, 0xe7, 0x4c, 0xc2, 0x35, 0xc4, 0x04,
-	0x3e, 0xb8, 0xfa, 0x5b, 0x0c, 0xa0, 0xe7, 0xd9, 0x0e, 0x95, 0x74, 0x6a, 0x79, 0x44, 0x03, 0xd0,
-	0xcc, 0x89, 0xeb, 0x51, 0x47, 0x31, 0x74, 0x31, 0x4d, 0x93, 0xe1, 0x7f, 0x3d, 0xaa, 0x6c, 0x0c,
-	0x0d, 0x6f, 0x6f, 0x32, 0x40, 0xdd, 0xd1, 0x46, 0xa8, 0xad, 0x0f, 0xa6, 0xe3, 0x8d, 0x89, 0x67,
-	0x98, 0x1b, 0x93, 0x89, 0xa1, 0xaf, 0xef, 0xee, 0x4a, 0xcd, 0xa7, 0x47, 0x95, 0x5c, 0xc3, 0x17,
-	0x93, 0x9a, 0x72, 0x4e, 0xe8, 0x4a, 0x3a, 0x79, 0x03, 0x32, 0x96, 0xad, 0x53, 0x36, 0x83, 0x9f,
-	0xe2, 0x32, 0x9b, 0x01, 0xe1, 0xe9, 0x0e, 0x9a, 0xa5, 0xe6, 0xb3, 0x70, 0x24, 0xa7, 0x19, 0x10,
-	0x29, 0xd7, 0x20, 0xeb, 0xb2, 0x28, 0x19, 0x27, 0xc1, 0x39, 0x2b, 0x82, 0x93, 0xf1, 0xa3, 0x67,
-	0xa4, 0x60, 0x28, 0x67, 0x5c, 0x7f, 0x45, 0xd5, 0xcf, 0xe3, 0x50, 0xe8, 0x8d, 0x4d, 0xc3, 0xeb,
-	0x3b, 0xc6, 0x70, 0x48, 0x1d, 0x72, 0x0b, 0x0a, 0x93, 0x31, 0x96, 0x1f, 0xd5, 0x15, 0x9d, 0xba,
-	0x1a, 0x5f, 0x61, 0x7e, 0xb3, 0x3a, 0x27, 0x57, 0xb2, 0x6a, 0x0d, 0x69, 0x13, 0x31, 0x8e, 0x31,
-	0x46, 0x35, 0x91, 0xb5, 0xbc, 0x60, 0x33, 0x07, 0x69, 0x40, 0xd6, 0xa2, 0xfb, 0xbe, 0x50, 0xfc,
-	0x05, 0x85, 0x32, 0xc8, 0xe4, 0x22, 0x9f, 0xc0, 0xb2, 0x61, 0x19, 0x9e, 0xa1, 0x9a, 0x8a, 0x49,
-	0x55, 0x1d, 0x13, 0xff, 0xaf, 0x85, 0xbe, 0x2e, 0x16, 0x7a, 0x41, 0xf2, 0x61, 0xdb, 0x1c, 0x35,
-	0x67, 0xd5, 0x17, 0x8c, 0x59, 0x80, 0x5e, 0xfd, 0x21, 0x06, 0x85, 0x36, 0x75, 0x86, 0xf4, 0x7f,
-	0x49, 0x41, 0x1b, 0x8a, 0xee, 0x64, 0xe0, 0x4e, 0x46, 0x81, 0xda, 0x8b, 0xe6, 0xa1, 0x10, 0xd0,
-	0x99, 0xa7, 0xfa, 0x73, 0x1c, 0x2e, 0x36, 0xf6, 0x18, 0x50, 0xa6, 0xb8, 0x6d, 0x9a, 0xea, 0x4e,
-	0xa3, 0xce, 0x6b, 0xdc, 0xa1, 0x78, 0x87, 0x63, 0xbf, 0x77, 0x17, 0x37, 0x5f, 0x99, 0x37, 0x8d,
-	0x4f, 0xf4, 0x55, 0xfa, 0x88, 0x15, 0x13, 0x81, 0x16, 0x5a, 0x48, 0x13, 0x32, 0x8e, 0x0f, 0x13,
-	0xf1, 0x9e, 0x20, 0x34, 0xbb, 0x73, 0x82, 0x4a, 0x76, 0xa1, 0x14, 0x24, 0x52, 0x98, 0x5c, 0xdc,
-	0xb2, 0xc4, 0x0b, 0xca, 0x2d, 0x09, 0x8d, 0x60, 0xc1, 0xe4, 0x03, 0x58, 0xb2, 0xe8, 0x81, 0x17,
-	0x68, 0xb2, 0x42, 0x48, 0xf2, 0x42, 0xa8, 0x8a, 0x42, 0x28, 0x76, 0xd0, 0x2d, 0xe0, 0xbc, 0x02,
-	0x72, 0xe1, 0x17, 0xb9, 0x68, 0x45, 0x7c, 0x3a, 0x9e, 0xa3, 0xe7, 0xdb, 0xb6, 0x6e, 0xdc, 0x33,
-	0xa8, 0xce, 0xce, 0xd3, 0x20, 0x99, 0x9b, 0x40, 0xdc, 0x43, 0x6c, 0xc6, 0x91, 0xa2, 0xd9, 0xd6,
-	0x3d, 0x63, 0xa8, 0xb8, 0xe8, 0xe4, 0x39, 0xcd, 0x8a, 0xa8, 0x4a, 0xbe, 0xbf, 0xc1, 0xdd, 0x8c,
-	0x5a, 0xfd, 0x1b, 0xb7, 0x46, 0xb2, 0xb0, 0x81, 0x2d, 0xd5, 0x6c, 0xd8, 0xa3, 0xd1, 0xb4, 0xa7,
-	0x9a, 0x58, 0x03, 0xac, 0xc7, 0x14, 0xcf, 0x37, 0x88, 0x8a, 0xaa, 0xcc, 0x49, 0x42, 0xb4, 0x17,
-	0x71, 0xeb, 0xa3, 0x9d, 0x89, 0x2a, 0x23, 0x56, 0xa6, 0xa1, 0x4a, 0xfc, 0xb9, 0x2a, 0xd1, 0x72,
-	0x96, 0x0b, 0xa3, 0x68, 0x71, 0x7f, 0x0a, 0xcb, 0xa2, 0x4c, 0x82, 0x2d, 0x09, 0xf5, 0x12, 0x5c,
-	0xef, 0xca, 0x1c, 0xbd, 0xb9, 0x15, 0x27, 0x5f, 0xd4, 0xe6, 0x16, 0xe2, 0x5d, 0xb8, 0x38, 0x12,
-	0x29, 0xe5, 0x69, 0x0b, 0xf5, 0x93, 0x5c, 0xff, 0xb5, 0x79, 0xf1, 0xce, 0x6e, 0x81, 0x7c, 0x7e,
-	0x34, 0x6b, 0xdc, 0x4a, 0x3e, 0x64, 0xf7, 0xca, 0x97, 0x09, 0xc8, 0xf4, 0x0f, 0xac, 0x36, 0x5e,
-	0x94, 0x44, 0x82, 0x78, 0x78, 0x0e, 0xbf, 0x73, 0xb6, 0x33, 0x38, 0x8e, 0x65, 0x81, 0x22, 0x98,
-	0xe0, 0x9c, 0xe1, 0xda, 0xa6, 0xea, 0x19, 0xb6, 0xc5, 0x93, 0xbb, 0xb8, 0xb9, 0x36, 0x27, 0x58,
-	0x29, 0xc0, 0x44, 0x7a, 0x67, 0x4a, 0x3c, 0xe9, 0x46, 0x5e, 0x81, 0x14, 0x1d, 0xdb, 0xda, 0x1e,
-	0xcf, 0x44, 0x31, 0xb8, 0x66, 0xb8, 0xe9, 0xf8, 0x2d, 0x98, 0x3a, 0xc3, 0x2d, 0x88, 0xf7, 0x7d,
-	0x76, 0xec, 0x18, 0xb6, 0x63, 0x78, 0x87, 0xe5, 0x74, 0xe4, 0x62, 0x0e, 0xad, 0x0c, 0xe1, 0xd2,
-	0xcf, 0x26, 0xd4, 0xd2, 0x68, 0x39, 0x13, 0x45, 0x04, 0x56, 0xf2, 0x2a, 0xe4, 0x07, 0xaa, 0xa7,
-	0xed, 0x29, 0x86, 0xa5, 0xd3, 0x83, 0x72, 0x36, 0x02, 0x02, 0xee, 0x90, 0x98, 0x5d, 0x3c, 0x1c,
-	0xbe, 0x4e, 0x43, 0xbe, 0xef, 0xa8, 0x96, 0xab, 0x6a, 0x7c, 0xe5, 0xd7, 0x21, 0xc9, 0xde, 0x2e,
-	0xa2, 0xba, 0x57, 0xe6, 0x45, 0xef, 0x6f, 0x5a, 0x3d, 0xcb, 0x14, 0x9f, 0x1c, 0x55, 0x62, 0x32,
-	0x67, 0x90, 0x32, 0x24, 0x2d, 0x75, 0xe4, 0x5f, 0xcc, 0x39, 0x31, 0x1f, 0xb7, 0x90, 0x3a, 0xa4,
-	0x71, 0x75, 0xde, 0xc4, 0xe5, 0x39, 0x9b, 0x7f, 0xa0, 0x45, 0x62, 0xe8, 0x71, 0xac, 0x50, 0x10,
-	0x4c, 0xbc, 0x85, 0x16, 0x4d, 0xd5, 0xf5, 0x94, 0x3d, 0xaa, 0x3a, 0xde, 0x80, 0xaa, 0xde, 0x69,
-	0xf2, 0x2b, 0x17, 0x19, 0xe7, 0x66, 0x40, 0xc1, 0x3a, 0x5b, 0xc4, 0x24, 0x0e, 0x95, 0xe9, 0x26,
-	0xa5, 0x4f, 0xbd, 0x49, 0x45, 0xc6, 0x9c, 0xbe, 0xb1, 0x6e, 0x60, 0x23, 0xab, 0x07, 0x11, 0xa5,
-	0xcc, 0xa9, 0x95, 0x0a, 0x48, 0x9c, 0x0a, 0xed, 0xc3, 0x79, 0x7b, 0xe0, 0x52, 0xe7, 0x01, 0x76,
-	0x5a, 0xa8, 0xe6, 0xe2, 0xae, 0xb1, 0x23, 0xf6, 0xad, 0x93, 0x33, 0xb5, 0xde, 0x15, 0xcc, 0x50,
-	0xce, 0x6d, 0x59, 0x9e, 0x73, 0x58, 0x5f, 0x64, 0x13, 0x7d, 0xf1, 0x7b, 0xf8, 0xc0, 0x20, 0xf6,
-	0x0c, 0x90, 0x3d, 0x01, 0xf7, 0xb1, 0xa2, 0x0c, 0x6b, 0x58, 0xce, 0x45, 0xce, 0xc4, 0xc0, 0x48,
-	0xde, 0x86, 0x8c, 0x81, 0x27, 0xa1, 0xe5, 0xb9, 0xe5, 0x3c, 0x0f, 0x66, 0x79, 0xee, 0x51, 0xa7,
-	0x5a, 0x01, 0x51, 0xa0, 0xc9, 0x15, 0x28, 0x32, 0x0d, 0x3c, 0xe3, 0x6c, 0x5b, 0xb1, 0x4d, 0xbd,
-	0x5c, 0x88, 0xc8, 0xe7, 0xb9, 0xab, 0x6f, 0xdb, 0x5d, 0x53, 0x67, 0x48, 0x87, 0x62, 0xbc, 0x8a,
-	0x6d, 0x29, 0xe3, 0x89, 0xbb, 0x57, 0x2e, 0x46, 0x91, 0xdc, 0xd5, 0xb5, 0x76, 0xd0, 0xb1, 0xa2,
-	0xc1, 0xf2, 0x73, 0xd6, 0x4a, 0x4a, 0xd3, 0xc7, 0x62, 0xca, 0x6f, 0xd1, 0xcd, 0xe3, 0x6f, 0xc4,
-	0x93, 0x4b, 0xc4, 0x87, 0x6e, 0xc5, 0xaf, 0xc7, 0x22, 0x8f, 0xde, 0x1f, 0x63, 0x90, 0x96, 0xf8,
-	0x72, 0xf0, 0x4d, 0x96, 0x0c, 0xef, 0x8d, 0x13, 0x72, 0x10, 0xe9, 0x06, 0x06, 0xc7, 0x18, 0x12,
-	0xde, 0x81, 0x25, 0x22, 0x38, 0xa9, 0x8d, 0xfc, 0xc5, 0x32, 0x70, 0xa4, 0x4f, 0x12, 0x67, 0xed,
-	0x93, 0xea, 0x77, 0x71, 0x48, 0xe1, 0xd3, 0xc8, 0xa5, 0xd8, 0xc9, 0x29, 0xb4, 0x39, 0x9e, 0x88,
-	0xfc, 0x34, 0x95, 0xe9, 0x13, 0x30, 0x0e, 0xa0, 0x07, 0x63, 0xc3, 0x99, 0x1e, 0xa2, 0xa7, 0xa3,
-	0x47, 0x58, 0xd1, 0xc7, 0x47, 0xe2, 0xec, 0x8f, 0x8f, 0x16, 0x14, 0x78, 0x48, 0xf8, 0x5a, 0x54,
-	0x5d, 0xc3, 0x15, 0xb7, 0xcf, 0x69, 0x62, 0xc9, 0x73, 0x5e, 0x8f, 0xd3, 0x22, 0x1b, 0xfb, 0x4d,
-	0x0c, 0x96, 0x6a, 0x03, 0xdb, 0xf1, 0x1a, 0x48, 0xa3, 0x7e, 0x01, 0x9d, 0xf0, 0x6b, 0xe3, 0x3f,
-	0xff, 0xac, 0x39, 0x76, 0xa0, 0x27, 0xe6, 0x1d, 0xe8, 0xfe, 0x39, 0x7c, 0xd5, 0x84, 0x1c, 0xff,
-	0xdd, 0xc2, 0x5f, 0x6e, 0x79, 0xc8, 0xec, 0x76, 0x6e, 0x75, 0xba, 0x1f, 0x76, 0x4a, 0x0b, 0x24,
-	0x03, 0x09, 0xa9, 0xd3, 0x2f, 0xc5, 0x48, 0x0e, 0x52, 0xef, 0x6f, 0x77, 0x6b, 0xfd, 0x52, 0x9c,
-	0x0d, 0xeb, 0x1f, 0xf5, 0x5b, 0xbd, 0x52, 0x82, 0x64, 0x21, 0xd9, 0x97, 0xda, 0xad, 0x52, 0x92,
-	0xb1, 0x9a, 0xad, 0x86, 0xd4, 0xae, 0x6d, 0x97, 0x52, 0xa4, 0x00, 0xd9, 0xe6, 0xae, 0x5c, 0xeb,
-	0x4b, 0xdd, 0x4e, 0x29, 0x4d, 0x16, 0x01, 0x18, 0xa8, 0xd7, 0x92, 0x25, 0x24, 0xe9, 0x57, 0xdf,
-	0x85, 0x73, 0x33, 0x2f, 0x48, 0xb2, 0x04, 0xf9, 0x5a, 0xb3, 0xa9, 0xc8, 0xad, 0x9d, 0x6d, 0xa9,
-	0x51, 0xc3, 0x99, 0x09, 0x2c, 0xca, 0xad, 0x76, 0xf7, 0x76, 0x2b, 0xb4, 0xc5, 0x56, 0x92, 0x0f,
-	0xbf, 0x5f, 0x5d, 0xb8, 0x7a, 0x0d, 0x8a, 0xc7, 0x6e, 0x50, 0x6c, 0xc2, 0x02, 0x13, 0xaf, 0x6d,
-	0x4b, 0x77, 0x6b, 0xf5, 0xed, 0x16, 0x92, 0x31, 0x80, 0x5e, 0xa7, 0xb6, 0xd3, 0xbb, 0xd9, 0xed,
-	0x87, 0xb4, 0x3a, 0x9c, 0x9b, 0xa9, 0x5f, 0x16, 0xf6, 0x4e, 0xab, 0xd3, 0x94, 0x3a, 0x37, 0x90,
-	0x55, 0x84, 0x5c, 0xa3, 0xdb, 0x6e, 0x4b, 0xfd, 0x7e, 0xab, 0x89, 0x4b, 0x46, 0x5f, 0xad, 0xde,
-	0x95, 0xd9, 0x97, 0xb8, 0xaf, 0x51, 0xbf, 0xfc, 0xf8, 0xcf, 0xd5, 0x85, 0xc7, 0x4f, 0x57, 0x63,
-	0x4f, 0xf0, 0xf3, 0x0b, 0x7e, 0xfe, 0xc0, 0xcf, 0x57, 0x7f, 0xad, 0x2e, 0xdc, 0xcd, 0x88, 0xed,
-	0xb8, 0x13, 0xfb, 0x27, 0x00, 0x00, 0xff, 0xff, 0xb4, 0x6e, 0xc3, 0x33, 0xc3, 0x0f, 0x00, 0x00,
+	// 1457 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x09, 0x6e, 0x88, 0x02, 0xff, 0xcc, 0x56, 0xcd, 0x6f, 0xdb, 0x46,
+	0x16, 0x17, 0xf5, 0xad, 0x27, 0xc9, 0xa6, 0xc7, 0x6b, 0x44, 0xeb, 0xdd, 0x95, 0xbc, 0xc2, 0x62,
+	0x61, 0x18, 0x0b, 0x09, 0xeb, 0xdd, 0xf4, 0xc3, 0x87, 0x02, 0x92, 0xa8, 0x24, 0x8c, 0xf5, 0x61,
+	0x50, 0x72, 0xda, 0xa6, 0x07, 0x76, 0x4c, 0x4e, 0x24, 0x22, 0x12, 0x29, 0x90, 0xa3, 0xd8, 0xba,
+	0xf6, 0x94, 0x63, 0x6f, 0xed, 0xa9, 0x0d, 0xd0, 0x02, 0x3d, 0xf5, 0xde, 0xff, 0xa0, 0xb9, 0x14,
+	0xc8, 0xb1, 0x68, 0x01, 0xb7, 0x75, 0x0f, 0xfd, 0x1f, 0x72, 0x2a, 0x66, 0x38, 0x94, 0x98, 0x4a,
+	0x71, 0xed, 0xf4, 0xd2, 0x8b, 0x4d, 0xbd, 0xf7, 0x7e, 0xbf, 0x79, 0xf3, 0xe6, 0x37, 0xf3, 0x1e,
+	0xfc, 0xdd, 0x70, 0x8c, 0x87, 0xae, 0x83, 0x8d, 0x61, 0x95, 0xff, 0x9d, 0x9c, 0x54, 0x4d, 0x4c,
+	0x71, 0x65, 0xe2, 0x3a, 0xd4, 0x41, 0x1b, 0x73, 0x6f, 0x45, 0x78, 0xb7, 0x77, 0x96, 0x01, 0x63,
+	0x42, 0xf1, 0x02, 0xb4, 0xfd, 0x9f, 0x45, 0x84, 0x47, 0x1d, 0x17, 0x0f, 0x48, 0x95, 0xd8, 0x03,
+	0xcb, 0x0e, 0xfe, 0x31, 0xc4, 0x23, 0xc3, 0x10, 0xd1, 0xe5, 0x45, 0xf4, 0x94, 0x5a, 0xa3, 0xea,
+	0x70, 0x64, 0x54, 0xa9, 0x35, 0x26, 0x1e, 0xc5, 0xe3, 0x89, 0x88, 0xf9, 0xcb, 0xc0, 0x19, 0x38,
+	0xfc, 0xb3, 0xca, 0xbe, 0x7c, 0x6b, 0x59, 0x85, 0x78, 0x6f, 0x82, 0x6d, 0xf4, 0x57, 0x88, 0x3d,
+	0x24, 0xb3, 0x42, 0x6c, 0x47, 0xda, 0xcd, 0xd5, 0x53, 0xcf, 0xcf, 0x4b, 0xb1, 0x43, 0x32, 0xd3,
+	0x98, 0x0d, 0xed, 0x40, 0x8a, 0xd8, 0xa6, 0xce, 0xdc, 0xf1, 0x17, 0xdd, 0x49, 0x62, 0x9b, 0x87,
+	0x64, 0x76, 0x10, 0xff, 0xea, 0x49, 0x49, 0x2a, 0x0f, 0x20, 0x71, 0x0f, 0x8f, 0xa6, 0x04, 0xfd,
+	0x0d, 0x32, 0x2e, 0x3e, 0xd5, 0x4f, 0x66, 0x94, 0x78, 0x05, 0x89, 0x41, 0xb4, 0xb4, 0x8b, 0x4f,
+	0xeb, 0xec, 0x37, 0xaa, 0x41, 0x66, 0x9e, 0x59, 0x21, 0xba, 0x23, 0xed, 0x66, 0xf7, 0xff, 0x51,
+	0x59, 0x54, 0x88, 0xa5, 0x5f, 0x19, 0x8e, 0x8c, 0x4a, 0x3f, 0x08, 0xaa, 0xc7, 0x9f, 0x9e, 0x97,
+	0x22, 0xda, 0x02, 0x55, 0x7e, 0x0f, 0xd2, 0x87, 0x64, 0xe6, 0xaf, 0x25, 0xf2, 0x96, 0x56, 0xe4,
+	0xfd, 0x7f, 0x48, 0x3c, 0x62, 0x31, 0x62, 0x95, 0x42, 0x65, 0xe9, 0x1c, 0x2a, 0x9c, 0x43, 0x2c,
+	0xe0, 0x07, 0x97, 0xbf, 0x97, 0x00, 0x7a, 0xd4, 0x71, 0x89, 0x6a, 0x12, 0x9b, 0x22, 0x03, 0xc0,
+	0x18, 0x4d, 0x3d, 0x4a, 0x5c, 0xdd, 0x32, 0xc5, 0x32, 0x0a, 0x8b, 0xff, 0xee, 0xbc, 0x54, 0x1d,
+	0x58, 0x74, 0x38, 0x3d, 0xa9, 0x18, 0xce, 0xb8, 0x3a, 0xe7, 0x36, 0x4f, 0xaa, 0xbf, 0x39, 0x8c,
+	0xe9, 0xd4, 0x32, 0x2b, 0xc7, 0xc7, 0xaa, 0x72, 0x71, 0x5e, 0xca, 0x34, 0x7c, 0x32, 0x55, 0xd1,
+	0x32, 0x82, 0x57, 0x35, 0xd1, 0x7f, 0x21, 0x65, 0x3b, 0x26, 0x61, 0x2b, 0xb0, 0x5c, 0x13, 0xf5,
+	0x02, 0x5b, 0xe1, 0xe2, 0xbc, 0x94, 0xec, 0x38, 0x26, 0x51, 0x95, 0xe7, 0xf3, 0x2f, 0x2d, 0xc9,
+	0x02, 0x55, 0x13, 0xdd, 0x84, 0x34, 0xd3, 0x05, 0xc7, 0xc4, 0x38, 0x66, 0x5b, 0x60, 0x52, 0x7e,
+	0xf6, 0x0c, 0x14, 0x7c, 0x6a, 0x29, 0xcf, 0xdf, 0x51, 0xf9, 0x73, 0x09, 0x72, 0xbd, 0xc9, 0xc8,
+	0xa2, 0x7d, 0xd7, 0x1a, 0x0c, 0x88, 0x8b, 0x9a, 0x90, 0x19, 0x91, 0x07, 0x54, 0x37, 0x89, 0x67,
+	0xf0, 0xed, 0x65, 0xf7, 0xcb, 0x2b, 0x0a, 0xa5, 0x61, 0x7b, 0x40, 0x14, 0xe2, 0x19, 0xae, 0x35,
+	0xa1, 0x8e, 0x2b, 0x4a, 0x96, 0x66, 0x50, 0x66, 0x45, 0xb7, 0x01, 0x5c, 0x6b, 0x30, 0x14, 0x3c,
+	0xd1, 0x6b, 0xf2, 0x64, 0x38, 0x96, 0x99, 0xef, 0xc6, 0xd3, 0x31, 0x39, 0x5e, 0xfe, 0x44, 0x82,
+	0x5c, 0x9b, 0xb8, 0x03, 0xf2, 0x27, 0x4d, 0xb3, 0xfc, 0x4d, 0x14, 0xb6, 0x1a, 0x43, 0x16, 0xa5,
+	0x91, 0xc9, 0xc8, 0x32, 0xb0, 0x17, 0x64, 0x7a, 0x08, 0x59, 0x83, 0x3b, 0x74, 0x3a, 0x9b, 0x10,
+	0x9e, 0xeb, 0xda, 0xfe, 0xbf, 0x56, 0xad, 0xe1, 0x03, 0x7d, 0x96, 0xfe, 0x6c, 0x12, 0xe8, 0x10,
+	0x8c, 0xb9, 0x05, 0x29, 0x90, 0x72, 0xfd, 0x30, 0x91, 0xec, 0x25, 0x44, 0x4b, 0xe9, 0x06, 0x50,
+	0x74, 0x0c, 0xf2, 0x74, 0x62, 0x62, 0x4a, 0x4c, 0x5d, 0x98, 0xbc, 0x42, 0x6c, 0x27, 0x76, 0x4d,
+	0xba, 0x75, 0xc1, 0x11, 0x6c, 0x18, 0xdd, 0x85, 0x75, 0x9b, 0x9c, 0xd1, 0x80, 0x93, 0x29, 0x31,
+	0xce, 0x95, 0x58, 0x16, 0x4a, 0xcc, 0x77, 0xc8, 0x19, 0x15, 0xe1, 0x5c, 0x8f, 0x99, 0xf9, 0x0f,
+	0x2d, 0x6f, 0x87, 0x7c, 0x66, 0x59, 0x85, 0xcd, 0xb6, 0x63, 0x5a, 0x0f, 0x2c, 0x62, 0xb2, 0xe7,
+	0x28, 0x28, 0xe6, 0x3e, 0x20, 0x6f, 0xe6, 0x51, 0x32, 0xd6, 0x0d, 0xc7, 0x7e, 0x60, 0x0d, 0x74,
+	0x6f, 0x82, 0x6d, 0x5e, 0xd3, 0xb4, 0xc8, 0x4a, 0xf6, 0xfd, 0x0d, 0xee, 0x66, 0xd0, 0xf2, 0x2f,
+	0x51, 0xd8, 0x52, 0x6d, 0x4a, 0x5c, 0x1b, 0x8f, 0x1a, 0xce, 0x78, 0xbc, 0xd0, 0xba, 0x02, 0x79,
+	0x8f, 0x69, 0x5f, 0xa7, 0xbe, 0x41, 0x08, 0xa9, 0xb4, 0xa2, 0x08, 0xe1, 0x3b, 0xa2, 0xe5, 0xbc,
+	0xf0, 0x8d, 0x51, 0x20, 0x3f, 0x66, 0xd2, 0x9c, 0xb3, 0x44, 0x5f, 0xca, 0x12, 0x96, 0xb0, 0x96,
+	0x1b, 0x87, 0x05, 0xfd, 0x3e, 0xdc, 0x10, 0x32, 0x09, 0x8e, 0x64, 0xce, 0x17, 0xe3, 0x7c, 0xbb,
+	0x2b, 0xf8, 0x56, 0x2a, 0x4e, 0xdb, 0x32, 0x56, 0x0a, 0xf1, 0x3e, 0x6c, 0x8d, 0x45, 0x49, 0x79,
+	0xd9, 0xe6, 0xfc, 0x71, 0xce, 0xff, 0xef, 0x55, 0xf9, 0x2e, 0x1f, 0x81, 0xb6, 0x39, 0x5e, 0x36,
+	0x1e, 0xc4, 0x1f, 0xb3, 0x07, 0xff, 0x8b, 0x24, 0x64, 0xfb, 0x2e, 0xb6, 0x3d, 0x6c, 0x50, 0xcb,
+	0xb1, 0xd1, 0x1d, 0x88, 0xb3, 0x2e, 0x26, 0xca, 0xba, 0x17, 0x5a, 0x40, 0xb4, 0xb0, 0x8a, 0xdf,
+	0xbb, 0x2a, 0x41, 0x0b, 0xab, 0xf4, 0xcf, 0xec, 0x36, 0xa1, 0xb8, 0x9e, 0x66, 0x67, 0xf9, 0xec,
+	0xbc, 0x24, 0x69, 0x9c, 0x01, 0x15, 0x20, 0x6e, 0xe3, 0xb1, 0xff, 0x72, 0x67, 0xc4, 0x49, 0x73,
+	0x0b, 0xaa, 0x43, 0xd2, 0xa3, 0x98, 0x4e, 0x3d, 0xbe, 0x8d, 0xd5, 0x37, 0x2b, 0x94, 0x53, 0x8f,
+	0xc7, 0x0a, 0x06, 0x81, 0x44, 0x0a, 0xac, 0x8d, 0xb0, 0x47, 0xf5, 0x21, 0xc1, 0x2e, 0x3d, 0x21,
+	0x98, 0x16, 0x12, 0x57, 0xe8, 0x43, 0x5a, 0x9e, 0x81, 0xee, 0x04, 0x18, 0x74, 0x17, 0xd6, 0x1c,
+	0xd7, 0x1a, 0xe8, 0x8b, 0x6e, 0x96, 0xbc, 0x7a, 0x37, 0xcb, 0x33, 0xe8, 0xdc, 0x88, 0xee, 0x40,
+	0x7e, 0x8c, 0xcf, 0x42, 0x54, 0xa9, 0xab, 0x53, 0xe5, 0xc6, 0xf8, 0x6c, 0xc1, 0x74, 0x0a, 0x9b,
+	0xce, 0x89, 0x47, 0xdc, 0x47, 0xc4, 0x5c, 0xd0, 0x79, 0x85, 0x34, 0xbf, 0xee, 0xaf, 0x5d, 0x5e,
+	0xac, 0x4a, 0x57, 0x20, 0xe7, 0x74, 0x5e, 0xd3, 0xa6, 0xee, 0xac, 0xbe, 0xc6, 0x16, 0xfa, 0xe0,
+	0x87, 0x79, 0x13, 0x42, 0xce, 0x52, 0x20, 0x2a, 0x42, 0xea, 0xd4, 0xb5, 0xa8, 0x65, 0x0f, 0x0a,
+	0x99, 0xd0, 0xfd, 0x0c, 0x8c, 0xe8, 0x75, 0x48, 0x59, 0x36, 0x25, 0x36, 0xf5, 0x0a, 0x59, 0x9e,
+	0xcc, 0x8d, 0x95, 0xd7, 0x0e, 0xdb, 0x01, 0x50, 0x44, 0xa3, 0x5d, 0xc8, 0x33, 0x0e, 0xa2, 0x53,
+	0xc7, 0xd1, 0x9d, 0x91, 0x59, 0xc8, 0x85, 0xe8, 0xb3, 0xdc, 0xd5, 0x77, 0x9c, 0xee, 0xc8, 0x64,
+	0x91, 0x2e, 0xa1, 0xee, 0x4c, 0x77, 0x6c, 0x7d, 0x32, 0xf5, 0x86, 0x85, 0x7c, 0x38, 0x92, 0xbb,
+	0xba, 0xf6, 0xd1, 0xd4, 0x1b, 0x6e, 0x9b, 0x70, 0xe3, 0x25, 0x7b, 0x45, 0xf2, 0x62, 0xa0, 0x48,
+	0xf8, 0x73, 0xc4, 0xff, 0x5e, 0x9c, 0x23, 0x7e, 0x47, 0x25, 0x7e, 0xec, 0x41, 0xf4, 0x0d, 0xe9,
+	0x20, 0xfd, 0xf1, 0x93, 0x52, 0x84, 0x8f, 0x46, 0x5f, 0x4b, 0x90, 0x54, 0xf9, 0x7e, 0xd0, 0x4d,
+	0x88, 0xcf, 0x1f, 0xb1, 0x4b, 0x8a, 0x10, 0xba, 0x11, 0x2c, 0x1c, 0xd5, 0x21, 0x46, 0xcf, 0x6c,
+	0x91, 0xc2, 0x75, 0xae, 0x96, 0xbf, 0x7b, 0x06, 0x0e, 0xdd, 0x9d, 0xd8, 0xab, 0xde, 0x9d, 0xf2,
+	0xa7, 0x51, 0x48, 0xb4, 0x08, 0xf6, 0x08, 0x7a, 0x13, 0x12, 0x1e, 0xc5, 0x2e, 0x15, 0x3b, 0xb9,
+	0x92, 0x56, 0x7d, 0x04, 0x6a, 0x00, 0x90, 0xb3, 0x89, 0xe5, 0x62, 0xb6, 0xcc, 0x75, 0x86, 0xc0,
+	0x10, 0x2c, 0xdc, 0x1b, 0x63, 0xaf, 0xde, 0x1b, 0x6f, 0x41, 0x8e, 0xe7, 0xa4, 0x7b, 0x14, 0x7b,
+	0x96, 0x27, 0x1e, 0xc7, 0x2b, 0x25, 0x93, 0xe5, 0xc0, 0x1e, 0xc7, 0x85, 0xce, 0xfa, 0x23, 0x09,
+	0xd6, 0x6b, 0x27, 0x8e, 0x4b, 0x1b, 0xd8, 0x18, 0x12, 0x5f, 0x54, 0x97, 0x4c, 0xa9, 0x7f, 0x7c,
+	0x1e, 0x46, 0x3b, 0x90, 0x9e, 0xb8, 0x96, 0xe3, 0x5a, 0x74, 0x26, 0x66, 0x41, 0x31, 0xf7, 0x04,
+	0x56, 0x7f, 0x40, 0xdf, 0xfb, 0x52, 0x82, 0x0c, 0x9f, 0x78, 0xf9, 0x6c, 0x91, 0x85, 0xd4, 0x71,
+	0xe7, 0xb0, 0xd3, 0x7d, 0xbb, 0x23, 0x47, 0x50, 0x1a, 0xe2, 0x9d, 0xe3, 0x56, 0x4b, 0x4e, 0xa1,
+	0x14, 0xc4, 0xd4, 0x4e, 0x5f, 0x96, 0x50, 0x06, 0x12, 0xb7, 0x5a, 0xdd, 0x5a, 0x5f, 0x8e, 0xb2,
+	0xcf, 0xfa, 0xbb, 0xfd, 0x66, 0x4f, 0x8e, 0xa1, 0x4d, 0x58, 0x57, 0x9a, 0x2d, 0xb5, 0xad, 0xf6,
+	0x9b, 0x8a, 0xee, 0x1b, 0xd3, 0x0c, 0xdd, 0x57, 0xdb, 0x4d, 0x39, 0xce, 0x48, 0x95, 0x66, 0x43,
+	0x6d, 0xd7, 0x5a, 0x72, 0x02, 0x6d, 0xc1, 0xc6, 0x22, 0x36, 0x30, 0x67, 0x50, 0x0e, 0xd2, 0xca,
+	0xb1, 0x56, 0xeb, 0xab, 0xdd, 0x8e, 0x9c, 0x64, 0xdc, 0xfd, 0xe3, 0xa3, 0x56, 0x53, 0x06, 0xb4,
+	0x06, 0xc0, 0x68, 0x7a, 0x4d, 0x4d, 0x6d, 0xf6, 0x64, 0x73, 0xef, 0x2d, 0xd8, 0x58, 0x1a, 0x92,
+	0xd0, 0x3a, 0x64, 0x6b, 0x8a, 0xa2, 0x6b, 0xcd, 0xa3, 0x96, 0xda, 0xa8, 0xc9, 0x11, 0x84, 0x60,
+	0x4d, 0x6b, 0xb6, 0xbb, 0xf7, 0x9a, 0x73, 0x9b, 0xb4, 0x1d, 0x7f, 0xfc, 0x59, 0x31, 0xb2, 0x57,
+	0x87, 0x8d, 0x25, 0x39, 0xb3, 0x0c, 0x8f, 0x9a, 0x1d, 0x45, 0xed, 0xdc, 0x96, 0x23, 0x28, 0x0f,
+	0x99, 0x46, 0xb7, 0xdd, 0x56, 0xfb, 0xfd, 0xa6, 0x22, 0x4b, 0xcc, 0x57, 0xab, 0x77, 0x35, 0xf6,
+	0x23, 0xea, 0x73, 0xd4, 0xff, 0xf9, 0xf4, 0xa7, 0x62, 0xe4, 0xe9, 0x45, 0x51, 0x7a, 0x76, 0x51,
+	0x94, 0xbe, 0xbd, 0x28, 0x4a, 0x3f, 0x5e, 0x14, 0xa5, 0x0f, 0x7f, 0x2e, 0x46, 0xee, 0xa7, 0x84,
+	0xc6, 0xde, 0x89, 0xfd, 0x1a, 0x00, 0x00, 0xff, 0xff, 0x02, 0x7f, 0x42, 0x06, 0x00, 0x0e, 0x00,
+	0x00,
 }

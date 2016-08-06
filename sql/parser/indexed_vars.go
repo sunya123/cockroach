@@ -24,7 +24,7 @@ import (
 // IndexedVarContainer provides the implementation of TypeCheck, Eval, and
 // String for IndexedVars.
 type IndexedVarContainer interface {
-	IndexedVarEval(idx int, ctx EvalContext) (Datum, error)
+	IndexedVarEval(idx int, ctx *EvalContext) (Datum, error)
 	IndexedVarReturnType(idx int) Datum
 	IndexedVarString(idx int) string
 }
@@ -49,12 +49,12 @@ func (v *IndexedVar) Walk(_ Visitor) Expr {
 }
 
 // TypeCheck is part of the Expr interface.
-func (v *IndexedVar) TypeCheck(args MapArgs, desired Datum) (TypedExpr, error) {
+func (v *IndexedVar) TypeCheck(_ *SemaContext, desired Datum) (TypedExpr, error) {
 	return v, nil
 }
 
 // Eval is part of the TypedExpr interface.
-func (v *IndexedVar) Eval(ctx EvalContext) (Datum, error) {
+func (v *IndexedVar) Eval(ctx *EvalContext) (Datum, error) {
 	return v.container.IndexedVarEval(v.Idx, ctx)
 }
 

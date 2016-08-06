@@ -20,19 +20,21 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/cockroachdb/cockroach/util/hlc"
 )
 
 // SetActiveTimestamp sets the correct timestamp at which the request is to be
 // carried out. For transactional requests, ba.Timestamp must be zero initially
 // and it will be set to txn.OrigTimestamp. For non-transactional requests, if
 // no timestamp is specified, nowFn is used to create and set one.
-func (ba *BatchRequest) SetActiveTimestamp(nowFn func() Timestamp) error {
+func (ba *BatchRequest) SetActiveTimestamp(nowFn func() hlc.Timestamp) error {
 	if ba.Txn == nil {
 		// When not transactional, allow empty timestamp and  use nowFn instead.
-		if ba.Timestamp.Equal(ZeroTimestamp) {
+		if ba.Timestamp.Equal(hlc.ZeroTimestamp) {
 			ba.Timestamp.Forward(nowFn())
 		}
-	} else if !ba.Timestamp.Equal(ZeroTimestamp) {
+	} else if !ba.Timestamp.Equal(hlc.ZeroTimestamp) {
 		return errors.New("transactional request must not set batch timestamp")
 	} else {
 		// Always use the original timestamp for reads and writes, even
@@ -43,36 +45,64 @@ func (ba *BatchRequest) SetActiveTimestamp(nowFn func() Timestamp) error {
 	return nil
 }
 
+// IsFreeze returns whether the batch consists of a single ChangeFrozen request.
+func (ba *BatchRequest) IsFreeze() bool {
+	if len(ba.Requests) != 1 {
+		return false
+	}
+	_, ok := ba.GetArg(ChangeFrozen)
+	return ok
+}
+
+// IsLease returns whether the batch consists of a single RequestLease request.
+func (ba *BatchRequest) IsLease() bool {
+	if len(ba.Requests) != 1 {
+		return false
+	}
+	_, ok := ba.GetArg(RequestLease)
+	return ok
+}
+
 // IsAdmin returns true iff the BatchRequest contains an admin request.
 func (ba *BatchRequest) IsAdmin() bool {
-	return ba.flags()&isAdmin != 0
+	return ba.hasFlag(isAdmin)
 }
 
 // IsWrite returns true iff the BatchRequest contains a write.
 func (ba *BatchRequest) IsWrite() bool {
-	return (ba.flags() & isWrite) != 0
+	return ba.hasFlag(isWrite)
 }
 
 // IsReadOnly returns true if all requests within are read-only.
 func (ba *BatchRequest) IsReadOnly() bool {
-	flags := ba.flags()
-	return (flags&isRead) != 0 && (flags&isWrite) == 0
+	return len(ba.Requests) > 0 && !ba.hasFlag(isWrite|isAdmin)
 }
 
 // IsReverse returns true iff the BatchRequest contains a reverse request.
 func (ba *BatchRequest) IsReverse() bool {
-	return (ba.flags() & isReverse) != 0
+	return ba.hasFlag(isReverse)
 }
 
 // IsPossibleTransaction returns true iff the BatchRequest contains
 // requests that can be part of a transaction.
 func (ba *BatchRequest) IsPossibleTransaction() bool {
-	return (ba.flags() & isTxn) != 0
+	return ba.hasFlag(isTxn)
 }
 
 // IsTransactionWrite returns true iff the BatchRequest contains a txn write.
 func (ba *BatchRequest) IsTransactionWrite() bool {
-	return (ba.flags() & isTxnWrite) != 0
+	return ba.hasFlag(isTxnWrite)
+}
+
+// hasFlag returns true iff one of the requests within the batch contains the
+// specified flag.
+func (ba *BatchRequest) hasFlag(flag int) bool {
+	for _, union := range ba.Requests {
+		if (union.GetInner().flags() & flag) != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // GetArg returns a request of the given type if one is contained in the
@@ -203,7 +233,8 @@ func (ba *BatchRequest) CreateReply() *BatchResponse {
 		resolveIntentRange int
 		merge              int
 		truncateLog        int
-		leaderLease        int
+		lease              int
+		leaseTransfer      int
 		reverseScan        int
 		computeChecksum    int
 		verifyChecksum     int
@@ -253,8 +284,10 @@ func (ba *BatchRequest) CreateReply() *BatchResponse {
 			counts.merge++
 		case *TruncateLogRequest:
 			counts.truncateLog++
-		case *LeaderLeaseRequest:
-			counts.leaderLease++
+		case *RequestLeaseRequest:
+			counts.lease++
+		case *TransferLeaseRequest:
+			counts.leaseTransfer++
 		case *ReverseScanRequest:
 			counts.reverseScan++
 		case *ComputeChecksumRequest:
@@ -293,7 +326,8 @@ func (ba *BatchRequest) CreateReply() *BatchResponse {
 		resolveIntentRange []ResolveIntentRangeResponse
 		merge              []MergeResponse
 		truncateLog        []TruncateLogResponse
-		leaderLease        []LeaderLeaseResponse
+		lease              []RequestLeaseResponse
+		leaseTransfer      []RequestLeaseResponse
 		reverseScan        []ReverseScanResponse
 		computeChecksum    []ComputeChecksumResponse
 		verifyChecksum     []VerifyChecksumResponse
@@ -404,11 +438,16 @@ func (ba *BatchRequest) CreateReply() *BatchResponse {
 				bufs.truncateLog = make([]TruncateLogResponse, counts.truncateLog)
 			}
 			reply, bufs.truncateLog = &bufs.truncateLog[0], bufs.truncateLog[1:]
-		case *LeaderLeaseRequest:
-			if bufs.leaderLease == nil {
-				bufs.leaderLease = make([]LeaderLeaseResponse, counts.leaderLease)
+		case *RequestLeaseRequest:
+			if bufs.lease == nil {
+				bufs.lease = make([]RequestLeaseResponse, counts.lease)
 			}
-			reply, bufs.leaderLease = &bufs.leaderLease[0], bufs.leaderLease[1:]
+			reply, bufs.lease = &bufs.lease[0], bufs.lease[1:]
+		case *TransferLeaseRequest:
+			if bufs.leaseTransfer == nil {
+				bufs.leaseTransfer = make([]RequestLeaseResponse, counts.leaseTransfer)
+			}
+			reply, bufs.leaseTransfer = &bufs.leaseTransfer[0], bufs.leaseTransfer[1:]
 		case *ReverseScanRequest:
 			if bufs.reverseScan == nil {
 				bufs.reverseScan = make([]ReverseScanResponse, counts.reverseScan)
@@ -445,14 +484,6 @@ func (ba *BatchRequest) CreateReply() *BatchResponse {
 		br.Responses[i].MustSetInner(reply)
 	}
 	return br
-}
-
-func (ba *BatchRequest) flags() int {
-	var flags int
-	for _, union := range ba.Requests {
-		flags |= union.GetInner().flags()
-	}
-	return flags
 }
 
 // Split separates the requests contained in a batch so that each subset of

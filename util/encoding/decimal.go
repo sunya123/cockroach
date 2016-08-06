@@ -22,14 +22,15 @@ package encoding
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 	"strconv"
 	"unsafe"
 
 	"gopkg.in/inf.v0"
 
-	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/decimal"
+	"github.com/pkg/errors"
 )
 
 // EncodeDecimalAscending returns the resulting byte slice with the encoded decimal
@@ -261,9 +262,9 @@ func decodeDecimal(buf []byte, tmp []byte, invert bool) ([]byte, *inf.Dec, error
 	// Handle the simplistic cases first.
 	switch buf[0] {
 	case decimalNaN, decimalNaNDesc:
-		return nil, nil, util.Errorf("decimal does not support NaN values: %q", buf)
+		return nil, nil, errors.Errorf("decimal does not support NaN values: %q", buf)
 	case decimalInfinity, decimalNegativeInfinity:
-		return nil, nil, util.Errorf("decimal does not support infinite values: %q", buf)
+		return nil, nil, errors.Errorf("decimal does not support infinite values: %q", buf)
 	case decimalZero:
 		return buf[1:], inf.NewDec(0, 0), nil
 	}
@@ -312,7 +313,7 @@ func decodeDecimal(buf []byte, tmp []byte, invert bool) ([]byte, *inf.Dec, error
 		}
 		return r, makeDecimalFromMandE(invert, e, m, tmp2), nil
 	default:
-		return nil, nil, util.Errorf("unknown prefix of the encoded byte slice: %q", buf)
+		return nil, nil, errors.Errorf("unknown prefix of the encoded byte slice: %q", buf)
 	}
 }
 
@@ -392,7 +393,7 @@ func findDecimalTerminator(buf []byte) (int, error) {
 			return i, nil
 		}
 	}
-	return -1, util.Errorf("did not find terminator %#x in buffer %#x", decimalTerminator, buf)
+	return -1, errors.Errorf("did not find terminator %#x in buffer %#x", decimalTerminator, buf)
 }
 
 func decodeSmallNumber(negative bool, buf []byte, tmp []byte) (e int, m []byte, rest []byte, newTmp []byte, err error) {
@@ -587,7 +588,7 @@ func EncodeNonsortingDecimal(b []byte, d *inf.Dec) []byte {
 
 // encodeNonsortingDecimalValue encodes the absolute value of a decimal's
 // exponent and slice of digit bytes into buf, returning the populated buffer
-// after encoding. The function first encodes the the absolute value of a
+// after encoding. The function first encodes the absolute value of a
 // decimal's exponent as an unsigned varint. Following this, it copies the
 // decimal's big-endian digits themselves into the buffer.
 func encodeNonsortingDecimalValue(exp uint64, digits []big.Word, buf []byte) []byte {
@@ -673,7 +674,7 @@ func DecodeNonsortingDecimal(buf []byte, tmp []byte) (*inf.Dec, error) {
 		}
 		return dec, nil
 	default:
-		return nil, util.Errorf("unknown prefix of the encoded byte slice: %q", buf)
+		return nil, errors.Errorf("unknown prefix of the encoded byte slice: %q", buf)
 	}
 }
 
@@ -714,6 +715,23 @@ func UpperBoundNonsortingDecimalSize(d *inf.Dec) int {
 	// - maxVarintSize for the exponent
 	// - wordLen for the big.Int bytes
 	return 1 + maxVarintSize + wordLen(d.UnscaledBig().Bits())
+}
+
+// upperBoundNonsortingDecimalUnscaledSize is the same as
+// UpperBoundNonsortingDecimalSize but for a decimal with the given unscaled
+// length. The upper bound here may not be as tight as the one returned by
+// UpperBoundNonsortingDecimalSize.
+func upperBoundNonsortingDecimalUnscaledSize(unscaledLen int) int {
+	// The number of digits needed to represent a base 10 number of length
+	// unscaledLen in base 2.
+	unscaledLenBase2 := float64(unscaledLen) * math.Log2(10)
+	unscaledLenBase2Words := math.Ceil(unscaledLenBase2 / 8 / float64(bigWordSize))
+	unscaledLenWordRounded := int(unscaledLenBase2Words) * bigWordSize
+	// Makeup of upper bound size:
+	// - 1 byte for the prefix
+	// - maxVarintSize for the exponent
+	// - unscaledLenWordRounded for the big.Int bytes
+	return 1 + maxVarintSize + unscaledLenWordRounded
 }
 
 // Taken from math/big/arith.go.

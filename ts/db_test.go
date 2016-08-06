@@ -19,6 +19,7 @@ package ts
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"reflect"
 	"sync"
 	"testing"
@@ -32,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/testutils"
 	"github.com/cockroachdb/cockroach/testutils/localtestcluster"
+	"github.com/cockroachdb/cockroach/ts/tspb"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/stop"
 	"github.com/gogo/protobuf/proto"
@@ -84,7 +86,7 @@ func (tm *testModel) getActualData() map[string]roachpb.Value {
 	// Scan over all TS Keys stored in the engine
 	startKey := keys.TimeseriesPrefix
 	endKey := startKey.PrefixEnd()
-	keyValues, _, err := engine.MVCCScan(context.Background(), tm.Eng, startKey, endKey, 0, tm.Clock.Now(), true, nil)
+	keyValues, _, err := engine.MVCCScan(context.Background(), tm.Eng, startKey, endKey, math.MaxInt64, tm.Clock.Now(), true, nil)
 	if err != nil {
 		tm.t.Fatalf("error scanning TS data from engine: %s", err.Error())
 	}
@@ -158,7 +160,7 @@ func (tm *testModel) assertKeyCount(expected int) {
 	}
 }
 
-func (tm *testModel) storeInModel(r Resolution, data TimeSeriesData) {
+func (tm *testModel) storeInModel(r Resolution, data tspb.TimeSeriesData) {
 	// Note the source, used to construct keys for model queries.
 	tm.seenSources[data.Source] = struct{}{}
 
@@ -199,7 +201,7 @@ func (tm *testModel) storeInModel(r Resolution, data TimeSeriesData) {
 
 // storeTimeSeriesData instructs the model to store the given time series data
 // in both the model and the system under test.
-func (tm *testModel) storeTimeSeriesData(r Resolution, data []TimeSeriesData) {
+func (tm *testModel) storeTimeSeriesData(r Resolution, data []tspb.TimeSeriesData) {
 	// Store data in the system under test.
 	if err := tm.DB.StoreData(r, data); err != nil {
 		tm.t.Fatalf("error storing time series data: %s", err.Error())
@@ -217,7 +219,7 @@ func (tm *testModel) storeTimeSeriesData(r Resolution, data []TimeSeriesData) {
 // sets are exhausted, at which point the supplied stop.Stopper is stopped.
 type modelDataSource struct {
 	model       testModel
-	datasets    [][]TimeSeriesData
+	datasets    [][]tspb.TimeSeriesData
 	r           Resolution
 	stopper     *stop.Stopper
 	calledCount int
@@ -228,7 +230,7 @@ type modelDataSource struct {
 // set of TimeSeriesData to subsequent calls. It stores each TimeSeriesData
 // object in the test model before returning it. If all TimeSeriesData objects
 // have been returned, this method will stop the provided Stopper.
-func (mds *modelDataSource) GetTimeSeriesData() []TimeSeriesData {
+func (mds *modelDataSource) GetTimeSeriesData() []tspb.TimeSeriesData {
 	if len(mds.datasets) == 0 {
 		// Stop on goroutine to prevent deadlock.
 		go mds.once.Do(mds.stopper.Stop)
@@ -245,8 +247,8 @@ func (mds *modelDataSource) GetTimeSeriesData() []TimeSeriesData {
 }
 
 // datapoint quickly generates a time series datapoint.
-func datapoint(timestamp int64, val float64) TimeSeriesDatapoint {
-	return TimeSeriesDatapoint{
+func datapoint(timestamp int64, val float64) tspb.TimeSeriesDatapoint {
+	return tspb.TimeSeriesDatapoint{
 		TimestampNanos: timestamp,
 		Value:          val,
 	}
@@ -261,10 +263,10 @@ func TestStoreTimeSeries(t *testing.T) {
 	defer tm.Stop()
 
 	// Basic storage operation: one data point.
-	tm.storeTimeSeriesData(Resolution10s, []TimeSeriesData{
+	tm.storeTimeSeriesData(Resolution10s, []tspb.TimeSeriesData{
 		{
 			Name: "test.metric",
-			Datapoints: []TimeSeriesDatapoint{
+			Datapoints: []tspb.TimeSeriesDatapoint{
 				datapoint(-446061360000000000, 100),
 			},
 		},
@@ -274,22 +276,22 @@ func TestStoreTimeSeries(t *testing.T) {
 
 	// Store data with different sources, and with multiple data points that
 	// aggregate into the same key.
-	tm.storeTimeSeriesData(Resolution10s, []TimeSeriesData{
+	tm.storeTimeSeriesData(Resolution10s, []tspb.TimeSeriesData{
 		{
 			Name:   "test.metric.float",
 			Source: "cpu01",
-			Datapoints: []TimeSeriesDatapoint{
+			Datapoints: []tspb.TimeSeriesDatapoint{
 				datapoint(1428713843000000000, 100.0),
 				datapoint(1428713843000000001, 50.2),
 				datapoint(1428713843000000002, 90.9),
 			},
 		},
 	})
-	tm.storeTimeSeriesData(Resolution10s, []TimeSeriesData{
+	tm.storeTimeSeriesData(Resolution10s, []tspb.TimeSeriesData{
 		{
 			Name:   "test.metric.float",
 			Source: "cpu02",
-			Datapoints: []TimeSeriesDatapoint{
+			Datapoints: []tspb.TimeSeriesDatapoint{
 				datapoint(1428713843000000000, 900.8),
 				datapoint(1428713843000000001, 30.12),
 				datapoint(1428713843000000002, 72.324),
@@ -301,10 +303,10 @@ func TestStoreTimeSeries(t *testing.T) {
 
 	// A single storage operation that stores to multiple keys, including an
 	// existing key.
-	tm.storeTimeSeriesData(Resolution10s, []TimeSeriesData{
+	tm.storeTimeSeriesData(Resolution10s, []tspb.TimeSeriesData{
 		{
 			Name: "test.metric",
-			Datapoints: []TimeSeriesDatapoint{
+			Datapoints: []tspb.TimeSeriesDatapoint{
 				datapoint(-446061360000000001, 200),
 				datapoint(450000000000000000, 1),
 				datapoint(460000000000000000, 777),
@@ -318,7 +320,6 @@ func TestStoreTimeSeries(t *testing.T) {
 // TestPollSource verifies that polled data sources are called as expected.
 func TestPollSource(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	t.Skip("#3692")
 	tm := newTestModel(t)
 	tm.Start()
 	defer tm.Stop()
@@ -327,12 +328,12 @@ func TestPollSource(t *testing.T) {
 		model:   tm,
 		r:       Resolution10s,
 		stopper: stop.NewStopper(),
-		datasets: [][]TimeSeriesData{
+		datasets: [][]tspb.TimeSeriesData{
 			{
 				{
 					Name:   "test.metric.float",
 					Source: "cpu01",
-					Datapoints: []TimeSeriesDatapoint{
+					Datapoints: []tspb.TimeSeriesDatapoint{
 						datapoint(1428713843000000000, 100.0),
 						datapoint(1428713843000000001, 50.2),
 						datapoint(1428713843000000002, 90.9),
@@ -341,7 +342,7 @@ func TestPollSource(t *testing.T) {
 				{
 					Name:   "test.metric.float",
 					Source: "cpu02",
-					Datapoints: []TimeSeriesDatapoint{
+					Datapoints: []tspb.TimeSeriesDatapoint{
 						datapoint(1428713843000000000, 900.8),
 						datapoint(1428713843000000001, 30.12),
 						datapoint(1428713843000000002, 72.324),
@@ -351,7 +352,7 @@ func TestPollSource(t *testing.T) {
 			{
 				{
 					Name: "test.metric",
-					Datapoints: []TimeSeriesDatapoint{
+					Datapoints: []tspb.TimeSeriesDatapoint{
 						datapoint(-446061360000000000, 100),
 					},
 				},

@@ -23,9 +23,19 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/storage/engine"
+	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
+// initialStats are the stats for a Replica which has been created through
+// bootstrapRangeOnly. These stats are not empty because we call
+// writeInitialState().
+func initialStats() enginepb.MVCCStats {
+	return enginepb.MVCCStats{
+		SysBytes: 151,
+		SysCount: 5,
+	}
+}
 func TestRangeStatsEmpty(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{
@@ -34,9 +44,9 @@ func TestRangeStatsEmpty(t *testing.T) {
 	tc.Start(t)
 	defer tc.Stop()
 
-	s := tc.rng.stats
-	if !reflect.DeepEqual(s.mvccStats, engine.MVCCStats{}) {
-		t.Errorf("expected empty stats; got %+v", s.mvccStats)
+	ms := tc.rng.GetMVCCStats()
+	if exp := initialStats(); !reflect.DeepEqual(ms, exp) {
+		t.Errorf("expected stats %+v; got %+v", exp, ms)
 	}
 }
 
@@ -45,7 +55,7 @@ func TestRangeStatsInit(t *testing.T) {
 	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
-	ms := engine.MVCCStats{
+	ms := enginepb.MVCCStats{
 		LiveBytes:       1,
 		KeyBytes:        2,
 		ValBytes:        3,
@@ -61,69 +71,11 @@ func TestRangeStatsInit(t *testing.T) {
 	if err := engine.MVCCSetRangeStats(context.Background(), tc.engine, 1, &ms); err != nil {
 		t.Fatal(err)
 	}
-	s, err := newRangeStats(1, tc.engine)
+	loadMS, err := loadMVCCStats(context.Background(), tc.engine, tc.rng.RangeID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(ms, s.mvccStats) {
-		t.Errorf("mvcc stats mismatch %+v != %+v", ms, s.mvccStats)
-	}
-}
-
-func TestRangeStatsMerge(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	tc := testContext{
-		bootstrapMode: bootstrapRangeOnly,
-	}
-	tc.Start(t)
-	defer tc.Stop()
-	initialMS := engine.MVCCStats{
-		LiveBytes:       1,
-		KeyBytes:        2,
-		ValBytes:        2,
-		IntentBytes:     1,
-		LiveCount:       1,
-		KeyCount:        1,
-		ValCount:        1,
-		IntentCount:     1,
-		IntentAge:       1,
-		GCBytesAge:      1,
-		LastUpdateNanos: 1 * 1E9,
-	}
-
-	ms := initialMS
-	ms.AgeTo(10 * 1E9)
-	if err := tc.rng.stats.MergeMVCCStats(tc.engine, ms); err != nil {
-		t.Fatal(err)
-	}
-	// Expect those stats to be forwarded to 10s and added to an empty stats
-	// object (the latter of which is a noop). Everything will be equal but
-	// the intent and gc bytes age, which will have increased.
-	expMS := ms
-	expMS.AgeTo(10 * 1E9)
-
-	if err := engine.MVCCGetRangeStats(context.Background(), tc.engine, 1, &initialMS); err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(ms, expMS) {
-		t.Errorf("expected:\n%+v\ngot:\n%+v\n", expMS, ms)
-	}
-
-	// Merge again, but with 10 more s and an incoming stat which has been
-	// created at 20s. This needs to age the existing stat and add the new one.
-	ms = initialMS
-	ms.LastUpdateNanos = 20 * 1E9
-	if err := tc.rng.stats.MergeMVCCStats(tc.engine, ms); err != nil {
-		t.Fatal(err)
-	}
-	expMS.Add(ms)
-	if err := engine.MVCCGetRangeStats(context.Background(), tc.engine, 1, &ms); err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(ms, expMS) {
-		t.Errorf("expected %+v; got %+v", expMS, ms)
-	}
-	if !reflect.DeepEqual(tc.rng.stats.mvccStats, expMS) {
-		t.Errorf("expected %+v; got %+v", expMS, tc.rng.stats.mvccStats)
+	if !reflect.DeepEqual(ms, loadMS) {
+		t.Errorf("mvcc stats mismatch %+v != %+v", ms, loadMS)
 	}
 }

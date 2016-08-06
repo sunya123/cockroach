@@ -29,16 +29,22 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/security/securitytest"
 	"github.com/cockroachdb/cockroach/server"
+	"github.com/cockroachdb/cockroach/server/serverpb"
 	"github.com/cockroachdb/cockroach/sql/pgwire"
 	"github.com/cockroachdb/cockroach/testutils"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/pq"
+	"github.com/pkg/errors"
 )
 
 func trivialQuery(pgURL url.URL) error {
@@ -77,20 +83,20 @@ func TestPGWire(t *testing.T) {
 	tempKeyPath := securitytest.RestrictedCopy(t, keyPath, tempDir, "key")
 
 	for _, insecure := range [...]bool{true, false} {
-		ctx, _ := createTestServerContext()
-		ctx.Insecure = insecure
-		s := setupTestServerWithContext(t, ctx)
+		params, _ := createTestServerParams()
+		params.Insecure = insecure
+		s, _, _ := serverutils.StartServer(t, params)
 
 		host, port, err := net.SplitHostPort(s.ServingAddr())
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		basePgUrl := url.URL{
+		pgBaseURL := url.URL{
 			Scheme: "postgres",
 			Host:   net.JoinHostPort(host, port),
 		}
-		if err := trivialQuery(basePgUrl); err != nil {
+		if err := trivialQuery(pgBaseURL); err != nil {
 			if insecure {
 				if err != pq.ErrSSLNotSupported {
 					t.Error(err)
@@ -103,9 +109,9 @@ func TestPGWire(t *testing.T) {
 		}
 
 		{
-			disablePgUrl := basePgUrl
-			disablePgUrl.RawQuery = "sslmode=disable"
-			err := trivialQuery(disablePgUrl)
+			pgDisableURL := pgBaseURL
+			pgDisableURL.RawQuery = "sslmode=disable"
+			err := trivialQuery(pgDisableURL)
 			if insecure {
 				if err != nil {
 					t.Error(err)
@@ -118,9 +124,9 @@ func TestPGWire(t *testing.T) {
 		}
 
 		{
-			requirePgUrlNoCert := basePgUrl
-			requirePgUrlNoCert.RawQuery = "sslmode=require"
-			err := trivialQuery(requirePgUrlNoCert)
+			pgNoCertRequireURL := pgBaseURL
+			pgNoCertRequireURL.RawQuery = "sslmode=require"
+			err := trivialQuery(pgNoCertRequireURL)
 			if insecure {
 				if err != pq.ErrSSLNotSupported {
 					t.Error(err)
@@ -134,13 +140,13 @@ func TestPGWire(t *testing.T) {
 
 		{
 			for _, optUser := range []string{server.TestUser, security.RootUser} {
-				requirePgUrlWithCert := basePgUrl
-				requirePgUrlWithCert.User = url.User(optUser)
-				requirePgUrlWithCert.RawQuery = fmt.Sprintf("sslmode=require&sslcert=%s&sslkey=%s",
+				pgWithCertRequireURL := pgBaseURL
+				pgWithCertRequireURL.User = url.User(optUser)
+				pgWithCertRequireURL.RawQuery = fmt.Sprintf("sslmode=require&sslcert=%s&sslkey=%s",
 					url.QueryEscape(tempCertPath),
 					url.QueryEscape(tempKeyPath),
 				)
-				err := trivialQuery(requirePgUrlWithCert)
+				err := trivialQuery(pgWithCertRequireURL)
 				if insecure {
 					if err != pq.ErrSSLNotSupported {
 						t.Error(err)
@@ -159,7 +165,7 @@ func TestPGWire(t *testing.T) {
 			}
 		}
 
-		cleanupTestServer(s)
+		s.Stopper().Stop()
 	}
 }
 
@@ -167,37 +173,37 @@ func TestPGWire(t *testing.T) {
 // it's in draining mode.
 func TestPGWireDrainClient(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	ctx, _ := createTestServerContext()
-	ctx.Insecure = true
-
-	s := setupTestServerWithContext(t, ctx)
-	defer cleanupTestServer(s)
+	params, _ := createTestServerParams()
+	params.Insecure = true
+	s, _, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop()
 
 	host, port, err := net.SplitHostPort(s.ServingAddr())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	basePgUrl := url.URL{
+	pgBaseURL := url.URL{
 		Scheme:   "postgres",
 		Host:     net.JoinHostPort(host, port),
 		RawQuery: "sslmode=disable",
 	}
 
-	on := []server.DrainMode{server.DrainMode_CLIENT}
+	on := []serverpb.DrainMode{serverpb.DrainMode_CLIENT}
 
-	if now, err := s.Drain(on); err != nil {
+	if now, err := s.(*server.TestServer).Drain(on); err != nil {
 		t.Fatal(err)
 	} else if !reflect.DeepEqual(on, now) {
 		t.Fatalf("expected drain modes %v, got %v", on, now)
 	}
-	if err := trivialQuery(basePgUrl); !testutils.IsError(err, pgwire.ErrDraining) {
+	if err := trivialQuery(pgBaseURL); !testutils.IsError(err, pgwire.ErrDraining) {
 		t.Fatal(err)
 	}
-	if now := s.Undrain([]server.DrainMode{server.DrainMode_CLIENT}); len(now) != 0 {
+	if now := s.(*server.TestServer).Undrain(
+		[]serverpb.DrainMode{serverpb.DrainMode_CLIENT}); len(now) != 0 {
 		t.Fatalf("unexpected active drain modes: %v", now)
 	}
-	if err := trivialQuery(basePgUrl); err != nil {
+	if err := trivialQuery(pgBaseURL); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -205,8 +211,8 @@ func TestPGWireDrainClient(t *testing.T) {
 func TestPGWireDBName(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), security.RootUser, "TestPGWireDBName")
 	pgURL.Path = "foo"
@@ -240,8 +246,8 @@ func TestPGWireDBName(t *testing.T) {
 func TestPGPrepareFail(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), security.RootUser, "TestPGPrepareFail")
 	defer cleanupFn()
@@ -253,20 +259,20 @@ func TestPGPrepareFail(t *testing.T) {
 	defer db.Close()
 
 	testFailures := map[string]string{
-		"SELECT $1 = $1":                            "pq: could not determine data type of parameter $1",
-		"SELECT $1":                                 "pq: could not determine data type of parameter $1",
-		"SELECT $1 + $1":                            "pq: could not determine data type of parameter $1",
-		"SELECT CASE WHEN TRUE THEN $1 END":         "pq: could not determine data type of parameter $1",
-		"SELECT CASE WHEN TRUE THEN $1 ELSE $2 END": "pq: could not determine data type of parameter $1",
+		"SELECT $1 = $1":                            "pq: could not determine data type of placeholder $1",
+		"SELECT $1":                                 "pq: could not determine data type of placeholder $1",
+		"SELECT $1 + $1":                            "pq: could not determine data type of placeholder $1",
+		"SELECT CASE WHEN TRUE THEN $1 END":         "pq: could not determine data type of placeholder $1",
+		"SELECT CASE WHEN TRUE THEN $1 ELSE $2 END": "pq: could not determine data type of placeholder $1",
 		"SELECT $1 > 0 AND NOT $1":                  "pq: incompatible NOT argument type: int",
 		"CREATE TABLE $1 (id INT)":                  "pq: syntax error at or near \"1\"\nCREATE TABLE $1 (id INT)\n             ^\n",
-		"UPDATE d.t SET s = i + $1":                 "pq: unsupported binary operator: <int> + <parameter> (desired <string>)",
-		"SELECT $0 > 0":                             "pq: there is no parameter $0",
-		"SELECT $2 > 0":                             "pq: could not determine data type of parameter $1",
-		"SELECT 3 + CASE (4) WHEN 4 THEN $1 END":    "pq: could not determine data type of parameter $1",
-		"SELECT ($1 + $1) + CURRENT_DATE()":         "pq: could not determine data type of parameter $1",
-		"SELECT $1 + $2, $2::FLOAT":                 "pq: could not determine data type of parameter $1",
-		"SELECT ($1 + 2) + ($1 + 2.5)":              "pq: unsupported binary operator: <int> + <decimal>",
+		"UPDATE d.t SET s = i + $1":                 "pq: unsupported binary operator: <int> + <placeholder> (desired <string>)",
+		"SELECT $0 > 0":                             "pq: invalid placeholder name: $0",
+		"SELECT $2 > 0":                             "pq: could not determine data type of placeholder $1",
+		"SELECT 3 + CASE (4) WHEN 4 THEN $1 END":    "pq: could not determine data type of placeholder $1",
+		"SELECT ($1 + $1) + CURRENT_DATE()":         "pq: could not determine data type of placeholder $1",
+		"SELECT $1 + $2, $2::FLOAT":                 "pq: could not determine data type of placeholder $1",
+		"SELECT ($1 + 2) + ($1 + 2.5::FLOAT)":       "pq: unsupported binary operator: <int> + <float>",
 	}
 
 	if _, err := db.Exec(`CREATE DATABASE d; CREATE TABLE d.t (i INT, s STRING, d INT)`); err != nil {
@@ -280,20 +286,20 @@ func TestPGPrepareFail(t *testing.T) {
 				t.Fatal(err)
 			}
 		} else if err.Error() != reason {
-			t.Errorf("%s: unexpected error: %s", query, err)
+			t.Errorf(`%s: got: %q, expected: %q`, query, err, reason)
 		}
 	}
 }
 
 type preparedQueryTest struct {
-	params  []interface{}
+	qargs   []interface{}
 	results [][]interface{}
 	others  int
 	error   string
 }
 
-func (p preparedQueryTest) Params(v ...interface{}) preparedQueryTest {
-	p.params = v
+func (p preparedQueryTest) SetArgs(v ...interface{}) preparedQueryTest {
+	p.qargs = v
 	return p
 }
 
@@ -314,118 +320,126 @@ func (p preparedQueryTest) Error(err string) preparedQueryTest {
 
 func TestPGPreparedQuery(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	var base preparedQueryTest
+	var baseTest preparedQueryTest
 
 	queryTests := map[string][]preparedQueryTest{
 		"SELECT $1 > 0": {
-			base.Params(1).Results(true),
-			base.Params("1").Results(true),
-			base.Params(1.1).Error(`pq: param $1: strconv.ParseInt: parsing "1.1": invalid syntax`).Results(true),
-			base.Params("1.0").Error(`pq: param $1: strconv.ParseInt: parsing "1.0": invalid syntax`),
-			base.Params(true).Error(`pq: param $1: strconv.ParseInt: parsing "true": invalid syntax`),
+			baseTest.SetArgs(1).Results(true),
+			baseTest.SetArgs("1").Results(true),
+			baseTest.SetArgs(1.1).Error(`pq: error in argument for $1: strconv.ParseInt: parsing "1.1": invalid syntax`).Results(true),
+			baseTest.SetArgs("1.0").Error(`pq: error in argument for $1: strconv.ParseInt: parsing "1.0": invalid syntax`),
+			baseTest.SetArgs(true).Error(`pq: error in argument for $1: strconv.ParseInt: parsing "true": invalid syntax`),
+		},
+		"SELECT ($1) > 0": {
+			baseTest.SetArgs(1).Results(true),
+			baseTest.SetArgs(-1).Results(false),
+		},
+		"SELECT ((($1))) > 0": {
+			baseTest.SetArgs(1).Results(true),
+			baseTest.SetArgs(-1).Results(false),
 		},
 		"SELECT TRUE AND $1": {
-			base.Params(true).Results(true),
-			base.Params(false).Results(false),
-			base.Params(1).Results(true),
-			base.Params("").Error(`pq: param $1: strconv.ParseBool: parsing "": invalid syntax`),
+			baseTest.SetArgs(true).Results(true),
+			baseTest.SetArgs(false).Results(false),
+			baseTest.SetArgs(1).Results(true),
+			baseTest.SetArgs("").Error(`pq: error in argument for $1: strconv.ParseBool: parsing "": invalid syntax`),
 			// Make sure we can run another after a failure.
-			base.Params(true).Results(true),
+			baseTest.SetArgs(true).Results(true),
 		},
 		"SELECT $1::bool": {
-			base.Params(true).Results(true),
-			base.Params("true").Results(true),
-			base.Params("false").Results(false),
-			base.Params("1").Results(true),
-			base.Params(2).Error(`pq: param $1: strconv.ParseBool: parsing "2": invalid syntax`),
-			base.Params(3.1).Error(`pq: param $1: strconv.ParseBool: parsing "3.1": invalid syntax`),
-			base.Params("").Error(`pq: param $1: strconv.ParseBool: parsing "": invalid syntax`),
+			baseTest.SetArgs(true).Results(true),
+			baseTest.SetArgs("true").Results(true),
+			baseTest.SetArgs("false").Results(false),
+			baseTest.SetArgs("1").Results(true),
+			baseTest.SetArgs(2).Error(`pq: error in argument for $1: strconv.ParseBool: parsing "2": invalid syntax`),
+			baseTest.SetArgs(3.1).Error(`pq: error in argument for $1: strconv.ParseBool: parsing "3.1": invalid syntax`),
+			baseTest.SetArgs("").Error(`pq: error in argument for $1: strconv.ParseBool: parsing "": invalid syntax`),
 		},
 		"SELECT $1::int > $2::float": {
-			base.Params(2, 1).Results(true),
-			base.Params("2", 1).Results(true),
-			base.Params(1, "2").Results(false),
-			base.Params("2", "1.0").Results(true),
-			base.Params("2.0", "1").Error(`pq: param $1: strconv.ParseInt: parsing "2.0": invalid syntax`),
-			base.Params(2.1, 1).Error(`pq: param $1: strconv.ParseInt: parsing "2.1": invalid syntax`),
+			baseTest.SetArgs(2, 1).Results(true),
+			baseTest.SetArgs("2", 1).Results(true),
+			baseTest.SetArgs(1, "2").Results(false),
+			baseTest.SetArgs("2", "1.0").Results(true),
+			baseTest.SetArgs("2.0", "1").Error(`pq: error in argument for $1: strconv.ParseInt: parsing "2.0": invalid syntax`),
+			baseTest.SetArgs(2.1, 1).Error(`pq: error in argument for $1: strconv.ParseInt: parsing "2.1": invalid syntax`),
 		},
 		"SELECT GREATEST($1, 0, $2), $2": {
-			base.Params(1, -1).Results(1, -1),
-			base.Params(-1, 10).Results(10, 10),
-			base.Params("-2", "-1").Results(0, -1),
-			base.Params(1, 2.1).Error(`pq: param $2: strconv.ParseInt: parsing "2.1": invalid syntax`),
+			baseTest.SetArgs(1, -1).Results(1, -1),
+			baseTest.SetArgs(-1, 10).Results(10, 10),
+			baseTest.SetArgs("-2", "-1").Results(0, -1),
+			baseTest.SetArgs(1, 2.1).Error(`pq: error in argument for $2: strconv.ParseInt: parsing "2.1": invalid syntax`),
 		},
 		"SELECT $1::int, $1::float": {
-			base.Params(1).Results(1, 1.0),
-			base.Params("1").Results(1, 1.0),
+			baseTest.SetArgs(1).Results(1, 1.0),
+			baseTest.SetArgs("1").Results(1, 1.0),
 		},
 		"SELECT 3 + $1, $1 + $2": {
-			base.Params("1", "2").Results(4, 3),
-			base.Params(3, "4").Results(6, 7),
-			base.Params(0, "a").Error(`pq: param $2: strconv.ParseInt: parsing "a": invalid syntax`),
+			baseTest.SetArgs("1", "2").Results(4, 3),
+			baseTest.SetArgs(3, "4").Results(6, 7),
+			baseTest.SetArgs(0, "a").Error(`pq: error in argument for $2: strconv.ParseInt: parsing "a": invalid syntax`),
 		},
 		// Check for QualifiedName resolution.
 		"SELECT COUNT(*)": {
-			base.Results(1),
+			baseTest.Results(1),
 		},
 		"SELECT CASE WHEN $1 THEN 1-$3 WHEN $2 THEN 1+$3 END": {
-			base.Params(true, false, 2).Results(-1),
-			base.Params(false, true, 3).Results(4),
-			base.Params(false, false, 2).Results(gosql.NullBool{}),
+			baseTest.SetArgs(true, false, 2).Results(-1),
+			baseTest.SetArgs(false, true, 3).Results(4),
+			baseTest.SetArgs(false, false, 2).Results(gosql.NullBool{}),
 		},
 		"SELECT CASE 1 WHEN $1 THEN $2 ELSE 2 END": {
-			base.Params(1, 3).Results(3),
-			base.Params(2, 3).Results(2),
-			base.Params(true, 0).Error(`pq: param $1: strconv.ParseInt: parsing "true": invalid syntax`),
+			baseTest.SetArgs(1, 3).Results(3),
+			baseTest.SetArgs(2, 3).Results(2),
+			baseTest.SetArgs(true, 0).Error(`pq: error in argument for $1: strconv.ParseInt: parsing "true": invalid syntax`),
 		},
-		"SHOW database": {
-			base.Results(""),
+		"SHOW DATABASE": {
+			baseTest.Results(""),
 		},
 		"SELECT descriptor FROM system.descriptor WHERE descriptor != $1 LIMIT 1": {
-			base.Params([]byte("abc")).Results([]byte("\x12\x16\n\x06system\x10\x01\x1a\n\n\b\n\x04root\x100")),
+			baseTest.SetArgs([]byte("abc")).Results([]byte("\x12\x16\n\x06system\x10\x01\x1a\n\n\b\n\x04root\x100")),
 		},
 		"SHOW COLUMNS FROM system.users": {
-			base.
+			baseTest.
 				Results("username", "STRING", false, gosql.NullBool{}).
 				Results("hashedPassword", "BYTES", true, gosql.NullBool{}),
 		},
 		"SHOW DATABASES": {
-			base.Results("d").Results("system"),
+			baseTest.Results("information_schema").Results("d").Results("system"),
 		},
 		"SHOW GRANTS ON system.users": {
-			base.Results("users", security.RootUser, "DELETE,GRANT,INSERT,SELECT,UPDATE"),
+			baseTest.Results("users", security.RootUser, "DELETE,GRANT,INSERT,SELECT,UPDATE"),
 		},
 		"SHOW INDEXES FROM system.users": {
-			base.Results("users", "primary", true, 1, "username", "ASC", false),
+			baseTest.Results("users", "primary", true, 1, "username", "ASC", false),
 		},
 		"SHOW TABLES FROM system": {
-			base.Results("descriptor").Others(7),
+			baseTest.Results("descriptor").Others(7),
 		},
 		"SHOW TIME ZONE": {
-			base.Results("UTC"),
+			baseTest.Results("UTC"),
 		},
 		"SELECT (SELECT 1+$1)": {
-			base.Params(1).Results(2),
+			baseTest.SetArgs(1).Results(2),
 		},
 		"SELECT CASE WHEN $1 THEN $2 ELSE 3 END": {
-			base.Params(true, 2).Results(2),
-			base.Params(false, 2).Results(3),
+			baseTest.SetArgs(true, 2).Results(2),
+			baseTest.SetArgs(false, 2).Results(3),
 		},
 		"SELECT CASE WHEN TRUE THEN 1 ELSE $1 END": {
-			base.Params(2).Results(1),
+			baseTest.SetArgs(2).Results(1),
 		},
 		"SELECT CASE $1 WHEN 1 THEN 1 END": {
-			base.Params(1).Results(1),
-			base.Params(2).Results(gosql.NullInt64{}),
+			baseTest.SetArgs(1).Results(1),
+			baseTest.SetArgs(2).Results(gosql.NullInt64{}),
 		},
 		"SELECT $1::timestamp, $2::date": {
-			base.Params("2001-01-02 03:04:05", "2006-07-08").Results(
+			baseTest.SetArgs("2001-01-02 03:04:05", "2006-07-08").Results(
 				time.Date(2001, 1, 2, 3, 4, 5, 0, time.FixedZone("", 0)),
 				time.Date(2006, 7, 8, 0, 0, 0, 0, time.FixedZone("", 0)),
 			),
 		},
 		"SELECT $1::date, $2::timestamp": {
-			base.Params(
+			baseTest.SetArgs(
 				time.Date(2006, 7, 8, 0, 0, 0, 9, time.FixedZone("", 0)),
 				time.Date(2001, 1, 2, 3, 4, 5, 6000, time.FixedZone("", 0)),
 			).Results(
@@ -434,97 +448,103 @@ func TestPGPreparedQuery(t *testing.T) {
 			),
 		},
 		"SELECT (CASE a WHEN 10 THEN 'one' WHEN 11 THEN (CASE 'en' WHEN 'en' THEN $1 END) END) AS ret FROM d.T ORDER BY ret DESC LIMIT 2": {
-			base.Params("hello").Results("one").Results("hello"),
+			baseTest.SetArgs("hello").Results("one").Results("hello"),
 		},
 		"INSERT INTO d.ts VALUES($1, $2) RETURNING *": {
-			base.Params("2001-01-02 03:04:05", "2006-07-08").Results(
+			baseTest.SetArgs("2001-01-02 03:04:05", "2006-07-08").Results(
 				time.Date(2001, 1, 2, 3, 4, 5, 0, time.FixedZone("", 0)),
 				time.Date(2006, 7, 8, 0, 0, 0, 0, time.FixedZone("", 0)),
 			),
 		},
 		"INSERT INTO d.ts VALUES(CURRENT_TIMESTAMP(), $1) RETURNING b": {
-			base.Params("2006-07-08").Results(
+			baseTest.SetArgs("2006-07-08").Results(
 				time.Date(2006, 7, 8, 0, 0, 0, 0, time.FixedZone("", 0)),
 			),
 		},
 		"INSERT INTO d.ts VALUES(STATEMENT_TIMESTAMP(), $1) RETURNING b": {
-			base.Params("2006-07-08").Results(
+			baseTest.SetArgs("2006-07-08").Results(
 				time.Date(2006, 7, 8, 0, 0, 0, 0, time.FixedZone("", 0)),
 			),
 		},
 		"INSERT INTO d.ts (a) VALUES ($1) RETURNING a": {
-			base.Params(
+			baseTest.SetArgs(
 				time.Date(2006, 7, 8, 0, 0, 0, 123000, time.FixedZone("", 0)),
 			).Results(
 				time.Date(2006, 7, 8, 0, 0, 0, 123000, time.FixedZone("", 0)),
 			),
 		},
 		"INSERT INTO d.T VALUES ($1) RETURNING 1": {
-			base.Params(1).Results(1),
-			base.Params(nil).Results(1),
+			baseTest.SetArgs(1).Results(1),
+			baseTest.SetArgs(nil).Results(1),
 		},
 		"INSERT INTO d.T VALUES ($1::INT) RETURNING 1": {
-			base.Params(1).Results(1),
+			baseTest.SetArgs(1).Results(1),
 		},
 		"INSERT INTO d.T VALUES ($1) RETURNING $1": {
-			base.Params(1).Results(1),
-			base.Params(3).Results(3),
+			baseTest.SetArgs(1).Results(1),
+			baseTest.SetArgs(3).Results(3),
 		},
 		"INSERT INTO d.T VALUES ($1) RETURNING $1, 1 + $1": {
-			base.Params(1).Results(1, 2),
-			base.Params(3).Results(3, 4),
+			baseTest.SetArgs(1).Results(1, 2),
+			baseTest.SetArgs(3).Results(3, 4),
 		},
 		"INSERT INTO d.T VALUES (GREATEST(42, $1)) RETURNING a": {
-			base.Params(40).Results(42),
-			base.Params(45).Results(45),
+			baseTest.SetArgs(40).Results(42),
+			baseTest.SetArgs(45).Results(45),
 		},
 		"SELECT a FROM d.T WHERE a = $1 AND (SELECT a >= $2 FROM d.T WHERE a = $1)": {
-			base.Params(10, 5).Results(10),
+			baseTest.SetArgs(10, 5).Results(10),
 		},
 		"SELECT * FROM (VALUES (1), (2), (3), (4)) AS foo (a) LIMIT $1 OFFSET $2": {
-			base.Params(1, 0).Results(1),
-			base.Params(1, 1).Results(2),
-			base.Params(1, 2).Results(3),
+			baseTest.SetArgs(1, 0).Results(1),
+			baseTest.SetArgs(1, 1).Results(2),
+			baseTest.SetArgs(1, 2).Results(3),
 		},
 		"SELECT 3 + CASE (4) WHEN 4 THEN $1 ELSE 42 END": {
-			base.Params(12).Results(15),
-			base.Params(-12).Results(-9),
+			baseTest.SetArgs(12).Results(15),
+			baseTest.SetArgs(-12).Results(-9),
 		},
 		"SELECT DATE '2001-01-02' + ($1 + $1)": {
-			base.Params(12).Results("2001-01-26T00:00:00Z"),
+			baseTest.SetArgs(12).Results("2001-01-26T00:00:00Z"),
 		},
 		"SELECT TO_HEX(~(~$1))": {
-			base.Params(12).Results("c"),
+			baseTest.SetArgs(12).Results("c"),
 		},
 		"SELECT $1::INT": {
-			base.Params(12).Results(12),
+			baseTest.SetArgs(12).Results(12),
+		},
+		"SELECT ANNOTATE_TYPE($1, int)": {
+			baseTest.SetArgs(12).Results(12),
+		},
+		"SELECT $1 + $2, ANNOTATE_TYPE($2, float)": {
+			baseTest.SetArgs(12, 23).Results(35, 23),
 		},
 		"INSERT INTO d.T VALUES ($1 + 1) RETURNING a": {
-			base.Params(1).Results(2),
-			base.Params(11).Results(12),
+			baseTest.SetArgs(1).Results(2),
+			baseTest.SetArgs(11).Results(12),
 		},
 		"INSERT INTO d.T VALUES (-$1) RETURNING a": {
-			base.Params(1).Results(-1),
-			base.Params(-999).Results(999),
+			baseTest.SetArgs(1).Results(-1),
+			baseTest.SetArgs(-999).Results(999),
 		},
 		"INSERT INTO d.two (a, b) VALUES (~$1, $1 + $2) RETURNING a, b": {
-			base.Params(5, 6).Results(-6, 11),
+			baseTest.SetArgs(5, 6).Results(-6, 11),
 		},
 		"INSERT INTO d.str (s) VALUES (LEFT($1, 3)) RETURNING s": {
-			base.Params("abcdef").Results("abc"),
-			base.Params("123456").Results("123"),
+			baseTest.SetArgs("abcdef").Results("abc"),
+			baseTest.SetArgs("123456").Results("123"),
 		},
 		"INSERT INTO d.str (b) VALUES (COALESCE($1, 'strLit')) RETURNING b": {
-			base.Params(nil).Results("strLit"),
-			base.Params("123456").Results("123456"),
+			baseTest.SetArgs(nil).Results("strLit"),
+			baseTest.SetArgs("123456").Results("123456"),
 		},
 		"INSERT INTO d.intStr VALUES ($1, 'hello ' || $1::TEXT) RETURNING *": {
-			base.Params(123).Results(123, "hello 123"),
+			baseTest.SetArgs(123).Results(123, "hello 123"),
 		},
 	}
 
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), security.RootUser, "TestPGPreparedQuery")
 	defer cleanupFn()
@@ -538,27 +558,27 @@ func TestPGPreparedQuery(t *testing.T) {
 	runTests := func(query string, tests []preparedQueryTest, queryFunc func(...interface{}) (*gosql.Rows, error)) {
 		for _, test := range tests {
 			if testing.Verbose() || log.V(1) {
-				log.Infof("query: %s", query)
+				log.Infof(context.Background(), "query: %s", query)
 			}
-			rows, err := queryFunc(test.params...)
+			rows, err := queryFunc(test.qargs...)
 			if err != nil {
 				if test.error == "" {
-					t.Errorf("%s: %v: unexpected error: %s", query, test.params, err)
+					t.Errorf("%s: %v: unexpected error: %s", query, test.qargs, err)
 				} else if err.Error() != test.error {
-					t.Errorf("%s: %v: expected error: %s, got %s", query, test.params, test.error, err)
+					t.Errorf("%s: %v: expected error: %s, got %s", query, test.qargs, test.error, err)
 				}
 				continue
 			}
 			defer rows.Close()
 
 			if test.error != "" {
-				t.Errorf("expected error: %s: %v", query, test.params)
+				t.Errorf("expected error: %s: %v", query, test.qargs)
 				continue
 			}
 
 			for _, expected := range test.results {
 				if !rows.Next() {
-					t.Errorf("expected row: %s: %v", query, test.params)
+					t.Errorf("expected row: %s: %v", query, test.qargs)
 					continue
 				}
 				dst := make([]interface{}, len(expected))
@@ -572,7 +592,7 @@ func TestPGPreparedQuery(t *testing.T) {
 					dst[i] = reflect.Indirect(reflect.ValueOf(d)).Interface()
 				}
 				if !reflect.DeepEqual(dst, expected) {
-					t.Errorf("%s: %v: expected %v, got %v", query, test.params, expected, dst)
+					t.Errorf("%s: %v: expected %v, got %v", query, test.qargs, expected, dst)
 				}
 			}
 			for rows.Next() {
@@ -640,13 +660,13 @@ CREATE TABLE d.str (s STRING, b BYTES);`
 }
 
 type preparedExecTest struct {
-	params       []interface{}
+	qargs        []interface{}
 	rowsAffected int64
 	error        string
 }
 
-func (p preparedExecTest) Params(v ...interface{}) preparedExecTest {
-	p.params = v
+func (p preparedExecTest) SetArgs(v ...interface{}) preparedExecTest {
+	p.qargs = v
 	return p
 }
 
@@ -662,7 +682,7 @@ func (p preparedExecTest) Error(err string) preparedExecTest {
 
 func TestPGPreparedExec(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	var base preparedExecTest
+	var baseTest preparedExecTest
 	execTests := []struct {
 		query string
 		tests []preparedExecTest
@@ -670,94 +690,117 @@ func TestPGPreparedExec(t *testing.T) {
 		{
 			"CREATE DATABASE d",
 			[]preparedExecTest{
-				base,
+				baseTest,
 			},
 		},
 		{
 			"CREATE TABLE d.t (i INT, s STRING, d INT)",
 			[]preparedExecTest{
-				base,
-				base.Error(`pq: table "t" already exists`),
+				baseTest,
+				baseTest.Error(`pq: table "t" already exists`),
 			},
 		},
 		{
 			"INSERT INTO d.t VALUES ($1, $2, $3)",
 			[]preparedExecTest{
-				base.Params(1, "one", 2).RowsAffected(1),
-				base.Params("two", 2, 2).Error(`pq: param $1: strconv.ParseInt: parsing "two": invalid syntax`),
+				baseTest.SetArgs(1, "one", 2).RowsAffected(1),
+				baseTest.SetArgs("two", 2, 2).Error(`pq: error in argument for $1: strconv.ParseInt: parsing "two": invalid syntax`),
 			},
 		},
 		{
 			"UPDATE d.t SET s = $1, i = i + $2, d = 1 + $3 WHERE i = $4",
 			[]preparedExecTest{
-				base.Params(4, 3, 2, 1).RowsAffected(1),
+				baseTest.SetArgs(4, 3, 2, 1).RowsAffected(1),
 			},
 		},
 		{
 			"UPDATE d.t SET i = $1 WHERE (i, s) = ($2, $3)",
 			[]preparedExecTest{
-				base.Params(8, 4, "4").RowsAffected(1),
+				baseTest.SetArgs(8, 4, "4").RowsAffected(1),
 			},
 		},
 		{
 			"DELETE FROM d.t WHERE s = $1 and i = $2 and d = 2 + $3",
 			[]preparedExecTest{
-				base.Params(1, 2, 3).RowsAffected(0),
+				baseTest.SetArgs(1, 2, 3).RowsAffected(0),
 			},
 		},
 		{
 			"INSERT INTO d.t VALUES ($1), ($2)",
 			[]preparedExecTest{
-				base.Params(1, 2).RowsAffected(2),
+				baseTest.SetArgs(1, 2).RowsAffected(2),
 			},
 		},
 		{
 			"INSERT INTO d.t VALUES ($1), ($2) RETURNING $3 + 1",
 			[]preparedExecTest{
-				base.Params(3, 4, 5).RowsAffected(2),
+				baseTest.SetArgs(3, 4, 5).RowsAffected(2),
 			},
 		},
 		{
 			"UPDATE d.t SET i = CASE WHEN $1 THEN i-$3 WHEN $2 THEN i+$3 END",
 			[]preparedExecTest{
-				base.Params(true, true, 3).RowsAffected(5),
+				baseTest.SetArgs(true, true, 3).RowsAffected(5),
 			},
 		},
 		{
 			"UPDATE d.t SET i = CASE i WHEN $1 THEN i-$3 WHEN $2 THEN i+$3 END",
 			[]preparedExecTest{
-				base.Params(1, 2, 3).RowsAffected(5),
+				baseTest.SetArgs(1, 2, 3).RowsAffected(5),
 			},
 		},
 		{
 			"UPDATE d.t SET d = CASE WHEN TRUE THEN $1 END",
 			[]preparedExecTest{
-				base.Params(2).RowsAffected(5),
+				baseTest.SetArgs(2).RowsAffected(5),
 			},
 		},
 		{
 			"DELETE FROM d.t RETURNING $1+1",
 			[]preparedExecTest{
-				base.Params(1).RowsAffected(5),
+				baseTest.SetArgs(1).RowsAffected(5),
 			},
 		},
 		{
 			"DROP TABLE d.t",
 			[]preparedExecTest{
-				base,
-				base.Error(`pq: table "d.t" does not exist`),
+				baseTest,
+				baseTest.Error(`pq: table "d.t" does not exist`),
+			},
+		},
+		{
+			"CREATE TABLE d.types (i int, f float, s string, b bytes, d date, m timestamp, z timestamp with time zone, n interval, o bool, e decimal)",
+			[]preparedExecTest{
+				baseTest,
+			},
+		},
+		{
+			"INSERT INTO d.types VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+			[]preparedExecTest{
+				baseTest.RowsAffected(1).SetArgs(
+					int64(0),
+					float64(0),
+					"",
+					[]byte{},
+					time.Time{}, // date
+					time.Time{}, // timestamp
+					time.Time{}, // timestamptz
+					time.Hour.String(),
+					true,
+					"0.0", // decimal
+				),
 			},
 		},
 		{
 			"DROP DATABASE d",
 			[]preparedExecTest{
-				base,
+				baseTest,
 			},
 		},
 	}
 
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), security.RootUser, "TestPGPreparedExec")
 	defer cleanupFn()
@@ -771,19 +814,19 @@ func TestPGPreparedExec(t *testing.T) {
 	runTests := func(query string, tests []preparedExecTest, execFunc func(...interface{}) (gosql.Result, error)) {
 		for _, test := range tests {
 			if testing.Verbose() || log.V(1) {
-				log.Infof("exec: %s", query)
+				log.Infof(context.Background(), "exec: %s", query)
 			}
-			if result, err := execFunc(test.params...); err != nil {
+			if result, err := execFunc(test.qargs...); err != nil {
 				if test.error == "" {
-					t.Errorf("%s: %v: unexpected error: %s", query, test.params, err)
+					t.Errorf("%s: %v: unexpected error: %s", query, test.qargs, err)
 				} else if err.Error() != test.error {
-					t.Errorf("%s: %v: expected error: %s, got %s", query, test.params, test.error, err)
+					t.Errorf("%s: %v: expected error: %s, got %s", query, test.qargs, test.error, err)
 				}
 			} else {
 				if rowsAffected, err := result.RowsAffected(); err != nil {
-					t.Errorf("%s: %v: unexpected error: %s", query, test.params, err)
+					t.Errorf("%s: %v: unexpected error: %s", query, test.qargs, err)
 				} else if rowsAffected != test.rowsAffected {
-					t.Errorf("%s: %v: expected %v, got %v", query, test.params, test.rowsAffected, rowsAffected)
+					t.Errorf("%s: %v: expected %v, got %v", query, test.qargs, test.rowsAffected, rowsAffected)
 				}
 			}
 		}
@@ -797,7 +840,7 @@ func TestPGPreparedExec(t *testing.T) {
 
 	for _, execTest := range execTests {
 		if testing.Verbose() || log.V(1) {
-			log.Infof("prepare: %s", execTest.query)
+			log.Infof(context.Background(), "prepare: %s", execTest.query)
 		}
 		if stmt, err := db.Prepare(execTest.query); err != nil {
 			t.Errorf("%s: prepare error: %s", execTest.query, err)
@@ -815,8 +858,8 @@ func TestPGPreparedExec(t *testing.T) {
 // was given in the connection string.
 func TestPGPrepareNameQual(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), security.RootUser, "TestPGPrepareNameQual")
 	defer cleanupFn()
@@ -865,8 +908,8 @@ func TestPGPrepareNameQual(t *testing.T) {
 // A DDL should return "CommandComplete", not "EmptyQuery" Response.
 func TestCmdCompleteVsEmptyStatements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), security.RootUser,
 		"TestCmdCompleteVsEmptyStatements")
@@ -907,8 +950,8 @@ func TestCmdCompleteVsEmptyStatements(t *testing.T) {
 // the methods where it depends on their values (Begin, Commit, RowsAffected for INSERTs).
 func TestPGCommandTags(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), security.RootUser, "TestPGCommandTags")
 	defer cleanupFn()
@@ -1001,7 +1044,10 @@ func TestPGCommandTags(t *testing.T) {
 
 // checkSQLNetworkMetrics returns the server's pgwire bytesIn/bytesOut and an
 // error if the bytesIn/bytesOut don't satisfy the given minimums and maximums.
-func checkSQLNetworkMetrics(s *server.TestServer, minBytesIn, minBytesOut, maxBytesIn, maxBytesOut int64) (int64, int64, error) {
+func checkSQLNetworkMetrics(
+	s serverutils.TestServerInterface,
+	minBytesIn, minBytesOut, maxBytesIn, maxBytesOut int64,
+) (int64, int64, error) {
 	if err := s.WriteSummaries(); err != nil {
 		return -1, -1, err
 	}
@@ -1009,16 +1055,16 @@ func checkSQLNetworkMetrics(s *server.TestServer, minBytesIn, minBytesOut, maxBy
 	bytesIn := s.MustGetSQLNetworkCounter("bytesin")
 	bytesOut := s.MustGetSQLNetworkCounter("bytesout")
 	if a, min := bytesIn, minBytesIn; a < min {
-		return bytesIn, bytesOut, util.Errorf("bytesin %d < expected min %d", a, min)
+		return bytesIn, bytesOut, errors.Errorf("bytesin %d < expected min %d", a, min)
 	}
 	if a, min := bytesOut, minBytesOut; a < min {
-		return bytesIn, bytesOut, util.Errorf("bytesout %d < expected min %d", a, min)
+		return bytesIn, bytesOut, errors.Errorf("bytesout %d < expected min %d", a, min)
 	}
 	if a, max := bytesIn, maxBytesIn; a > max {
-		return bytesIn, bytesOut, util.Errorf("bytesin %d > expected max %d", a, max)
+		return bytesIn, bytesOut, errors.Errorf("bytesin %d > expected max %d", a, max)
 	}
 	if a, max := bytesOut, maxBytesOut; a > max {
-		return bytesIn, bytesOut, util.Errorf("bytesout %d > expected max %d", a, max)
+		return bytesIn, bytesOut, errors.Errorf("bytesout %d > expected max %d", a, max)
 	}
 	return bytesIn, bytesOut, nil
 }
@@ -1026,8 +1072,8 @@ func checkSQLNetworkMetrics(s *server.TestServer, minBytesIn, minBytesOut, maxBy
 func TestSQLNetworkMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	// Setup pgwire client.
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), security.RootUser,
@@ -1063,7 +1109,7 @@ func TestSQLNetworkMetrics(t *testing.T) {
 	expectConns := func(n int) {
 		util.SucceedsSoon(t, func() error {
 			if conns := s.MustGetSQLNetworkCounter("conns"); conns != int64(n) {
-				return util.Errorf("connections %d != expected %d", conns, n)
+				return errors.Errorf("connections %d != expected %d", conns, n)
 			}
 			return nil
 		})
@@ -1094,8 +1140,8 @@ func TestSQLNetworkMetrics(t *testing.T) {
 func TestPrepareSyntax(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	s := server.StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
 
 	pgURL, cleanupFn := sqlutils.PGUrl(t, s.ServingAddr(), security.RootUser, "TestPrepareSyntax")
 	defer cleanupFn()
@@ -1145,11 +1191,11 @@ func TestPGWireOverUnixSocket(t *testing.T) {
 
 	socketFile := filepath.Join(tempDir, ".s.PGSQL.123456")
 
-	ctx, _ := createTestServerContext()
-	ctx.Insecure = true
-	ctx.SocketFile = socketFile
-	s := setupTestServerWithContext(t, ctx)
-	defer s.Stop()
+	params, _ := createTestServerParams()
+	params.Insecure = true
+	params.SocketFile = socketFile
+	s, _, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop()
 
 	// We can't pass socket paths as url.Host to libpq, use ?host=/... instead.
 	options := url.Values{

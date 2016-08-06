@@ -49,6 +49,14 @@ const (
 	// Rows indicates that the statement returns the affected rows after
 	// the statement was applied.
 	Rows
+	// Unknown indicates that the statement does not have a known
+	// return style at the time of parsing. This is not first in the
+	// enumeration because it is more convenient to have Ack as a zero
+	// value, and because the use of Unknown should be an explicit choice.
+	// The primary example of this statement type is EXECUTE, where the
+	// statement type depends on the statement type of the prepared statement
+	// being executed.
+	Unknown
 )
 
 // Statement represents a statement.
@@ -101,6 +109,18 @@ func (*CreateTable) StatementType() StatementType { return DDL }
 func (*CreateTable) StatementTag() string { return "CREATE TABLE" }
 
 // StatementType implements the Statement interface.
+func (*Deallocate) StatementType() StatementType { return Ack }
+
+// StatementTag returns a short string identifying the type of statement.
+func (n *Deallocate) StatementTag() string {
+	// Postgres distinguishes the command tags for these two cases of Deallocate statements.
+	if n.Name == "" {
+		return "DEALLOCATE ALL"
+	}
+	return "DEALLOCATE"
+}
+
+// StatementType implements the Statement interface.
 func (n *Delete) StatementType() StatementType { return n.Returning.StatementType() }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -125,6 +145,12 @@ func (*DropTable) StatementType() StatementType { return DDL }
 func (*DropTable) StatementTag() string { return "DROP TABLE" }
 
 // StatementType implements the Statement interface.
+func (*Execute) StatementType() StatementType { return Unknown }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*Execute) StatementTag() string { return "EXECUTE" }
+
+// StatementType implements the Statement interface.
 func (*Explain) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -147,6 +173,18 @@ func (*ParenSelect) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*ParenSelect) StatementTag() string { return "SELECT" }
+
+// StatementType implements the Statement interface.
+func (*Prepare) StatementType() StatementType { return Ack }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*Prepare) StatementTag() string { return "PREPARE" }
+
+// StatementType implements the Statement interface.
+func (*ReleaseSavepoint) StatementType() StatementType { return Ack }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ReleaseSavepoint) StatementTag() string { return "RELEASE" }
 
 // StatementType implements the Statement interface.
 func (*RenameColumn) StatementType() StatementType { return DDL }
@@ -176,19 +214,13 @@ func (*RenameTable) StatementTag() string { return "RENAME TABLE" }
 func (*Revoke) StatementType() StatementType { return DDL }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*ReleaseSavepoint) StatementTag() string { return "RELEASE" }
-
-// StatementType implements the Statement interface.
-func (*ReleaseSavepoint) StatementType() StatementType { return Ack }
-
-// StatementTag returns a short string identifying the type of statement.
-func (*RollbackToSavepoint) StatementTag() string { return "ROLLBACK" }
+func (*Revoke) StatementTag() string { return "REVOKE" }
 
 // StatementType implements the Statement interface.
 func (*RollbackToSavepoint) StatementType() StatementType { return Ack }
 
 // StatementTag returns a short string identifying the type of statement.
-func (*Revoke) StatementTag() string { return "REVOKE" }
+func (*RollbackToSavepoint) StatementTag() string { return "ROLLBACK" }
 
 // StatementType implements the Statement interface.
 func (*RollbackTransaction) StatementType() StatementType { return Ack }
@@ -196,11 +228,11 @@ func (*RollbackTransaction) StatementType() StatementType { return Ack }
 // StatementTag returns a short string identifying the type of statement.
 func (*RollbackTransaction) StatementTag() string { return "ROLLBACK" }
 
-// StatementTag returns a short string identifying the type of statement.
-func (*Savepoint) StatementTag() string { return "SAVEPOINT" }
-
 // StatementType implements the Statement interface.
 func (*Savepoint) StatementType() StatementType { return Ack }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*Savepoint) StatementTag() string { return "SAVEPOINT" }
 
 // StatementType implements the Statement interface.
 func (*Select) StatementType() StatementType { return Rows }
@@ -275,6 +307,12 @@ func (*ShowIndex) StatementType() StatementType { return Rows }
 func (*ShowIndex) StatementTag() string { return "SHOW INDEX" }
 
 // StatementType implements the Statement interface.
+func (*ShowConstraints) StatementType() StatementType { return Rows }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowConstraints) StatementTag() string { return "SHOW CONSTRAINTS" }
+
+// StatementType implements the Statement interface.
 func (*ShowTables) StatementType() StatementType { return Rows }
 
 // StatementTag returns a short string identifying the type of statement.
@@ -317,14 +355,17 @@ func (n *CommitTransaction) String() string        { return AsString(n) }
 func (n *CreateDatabase) String() string           { return AsString(n) }
 func (n *CreateIndex) String() string              { return AsString(n) }
 func (n *CreateTable) String() string              { return AsString(n) }
+func (n *Deallocate) String() string               { return AsString(n) }
 func (n *Delete) String() string                   { return AsString(n) }
 func (n *DropDatabase) String() string             { return AsString(n) }
 func (n *DropIndex) String() string                { return AsString(n) }
 func (n *DropTable) String() string                { return AsString(n) }
+func (n *Execute) String() string                  { return AsString(n) }
 func (n *Explain) String() string                  { return AsString(n) }
 func (n *Grant) String() string                    { return AsString(n) }
 func (n *Insert) String() string                   { return AsString(n) }
 func (n *ParenSelect) String() string              { return AsString(n) }
+func (n *Prepare) String() string                  { return AsString(n) }
 func (n *ReleaseSavepoint) String() string         { return AsString(n) }
 func (n *RenameColumn) String() string             { return AsString(n) }
 func (n *RenameDatabase) String() string           { return AsString(n) }
@@ -346,6 +387,7 @@ func (n *ShowCreateTable) String() string          { return AsString(n) }
 func (n *ShowDatabases) String() string            { return AsString(n) }
 func (n *ShowGrants) String() string               { return AsString(n) }
 func (n *ShowIndex) String() string                { return AsString(n) }
+func (n *ShowConstraints) String() string          { return AsString(n) }
 func (n *ShowTables) String() string               { return AsString(n) }
 func (l StatementList) String() string             { return AsString(l) }
 func (n *Truncate) String() string                 { return AsString(n) }

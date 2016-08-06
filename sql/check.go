@@ -34,25 +34,22 @@ func (c *checkHelper) init(p *planner, tableDesc *sqlbase.TableDescriptor) error
 
 	c.qvals = make(qvalMap)
 	c.cols = tableDesc.Columns
-	table := tableInfo{
-		columns: makeResultColumns(tableDesc.Columns),
-	}
+	sourceInfo := newSourceInfoForSingleTable(tableDesc.Name, makeResultColumns(tableDesc.Columns))
 
 	c.exprs = make([]parser.TypedExpr, len(tableDesc.Checks))
+	exprStrings := make([]string, len(tableDesc.Checks))
 	for i, check := range tableDesc.Checks {
-		raw, err := parser.ParseExprTraditional(check.Expr)
+		exprStrings[i] = check.Expr
+	}
+	exprs, err := parser.ParseExprsTraditional(exprStrings)
+	if err != nil {
+		return err
+	}
+
+	for i, raw := range exprs {
+		typedExpr, err := p.analyzeExpr(raw, multiSourceInfo{sourceInfo}, c.qvals,
+			parser.TypeBool, false, "")
 		if err != nil {
-			return err
-		}
-		resolved, err := resolveQNames(raw, []*tableInfo{&table}, c.qvals, &p.qnameVisitor)
-		if err != nil {
-			return err
-		}
-		typedExpr, err := parser.TypeCheck(resolved, nil, parser.TypeBool)
-		if err != nil {
-			return err
-		}
-		if typedExpr, err = p.parser.NormalizeExpr(p.evalCtx, typedExpr); err != nil {
 			return err
 		}
 		c.exprs[i] = typedExpr
@@ -79,7 +76,7 @@ func (c *checkHelper) loadRow(colIdx map[sqlbase.ColumnID]int, row parser.DTuple
 	}
 }
 
-func (c *checkHelper) check(ctx parser.EvalContext) error {
+func (c *checkHelper) check(ctx *parser.EvalContext) error {
 	for _, expr := range c.exprs {
 		if d, err := expr.Eval(ctx); err != nil {
 			return err

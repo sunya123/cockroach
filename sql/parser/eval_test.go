@@ -21,8 +21,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/testutils"
+	"github.com/cockroachdb/cockroach/util/hlc"
 )
 
 func TestEval(t *testing.T) {
@@ -38,34 +38,59 @@ func TestEval(t *testing.T) {
 		{`1 + 1`, `2`},
 		{`1 - 2`, `-1`},
 		{`3 * 4`, `12`},
+		{`9 // 2`, `4`},
+		{`-5 // 3`, `-1`},
+		{`4.5 // 2`, `2`},
+		{`-4.5 // 1.2`, `-3`},
 		{`3.1 % 2.0`, `1.1`},
 		{`5 % 3`, `2`},
 		{`1 + NULL`, `NULL`},
+		// TODO(nvanbenschoten) These should all be changed to test float, now that decimal
+		// is the default non-int numeric type.
 		{`1.1::decimal + 2.4::decimal`, `3.5`},
 		{`1.1::decimal - 2.4::decimal`, `-1.3`},
 		{`1.1::decimal * 2.4::decimal`, `2.64`},
 		{`1.1::decimal % 2.4::decimal`, `1.1`},
+		{`4.1::decimal // 2.4::decimal`, `1`},
+		{`-4.5::float // 1.2::float`, `-3.0`},
+		// Heterogeneous int/decimal arithmetic is valid.
+		{`1.1::decimal + 2::int`, `3.1`},
+		{`1.1::decimal - 2::int`, `-0.9`},
+		{`1.1::decimal * 2::int`, `2.2`},
+		{`1.1::decimal % 2::int`, `1.1`},
+		{`4.1::decimal // 2::int`, `2`},
+		{`2::int +  2.1::decimal`, `4.1`},
+		{`2::int -  2.1::decimal`, `-0.1`},
+		{`2::int *  2.1::decimal`, `4.2`},
+		{`2::int %  2.1::decimal`, `2.0`},
+		{`4::int // 2.1::decimal`, `1`},
 		// Division is always done on floats or decimals.
 		{`4 / 5`, `0.8000000000000000`},
 		{`1.1::decimal / 2.2::decimal`, `0.5000000000000000`},
+		{`1::int / 2.2::decimal`, `0.4545454545454545`},
+		{`1.1::decimal / 2::int`, `0.5500000000000000`},
 		// Only floats support infinity.
 		{`1.0::float / 0.0`, `+Inf`},
-		{`-1.0 * (1.0::float / 0.0)`, `-Inf`},
+		{`-1.0::float * (1.0::float / 0.0)`, `-Inf`},
 		// Grouping
 		{`1 + 2 + (3 * 4)`, `15`},
 		// Unary operators.
 		{`-3`, `-3`},
-		{`-4.1`, `-4.1000000000000000`},
+		{`-4.1`, `-4.1`},
 		{`-6.1::float`, `-6.1`},
 		// Ones complement operates on signed integers.
 		{`~0`, `-1`},
 		{`~0 - 1`, `-2`},
 		// Hexadecimal numbers.
 		{`0xa`, `10`},
+		{`0xcafe1111`, `3405648145`},
+		// Hexadecimal string literals.
+		{`x'636174'`, `'cat'`},
+		{`X'636174'`, `'cat'`},
 		// String concatenation.
 		{`'a' || 'b'`, `'ab'`},
 		{`'a' || (1 + 2)::char`, `'a3'`},
-		{`'hello' || b'world'`, `'helloworld'`},
+		{`b'hello' || 'world'`, `b'helloworld'`},
 		// Bit shift operators.
 		{`1 << 2`, `4`},
 		{`4 >> 2`, `1`},
@@ -128,6 +153,9 @@ func TestEval(t *testing.T) {
 		{`1.1::decimal > 1.2::decimal`, `false`},
 		{`1.1::decimal >= 1.2::decimal`, `false`},
 		{`'2015-10-01'::date = '2015-10-02'::date`, `false`},
+		{`'2015-10-01'::date = '2015-10-01'::date`, `true`},
+		{`'2016-07-19 +0:0:0'::date = '2016-07-19'::date`, `true`},
+		{`'2016-7-19 +0:0:0'::date = '2016-07-19'::date`, `true`},
 		{`'2015-10-01'::date != '2015-10-02'::date`, `true`},
 		{`'2015-10-01'::date < '2015-10-02'::date`, `true`},
 		{`'2015-10-01'::date <= '2015-10-02'::date`, `true`},
@@ -164,8 +192,10 @@ func TestEval(t *testing.T) {
 		{`NULL = NULL`, `NULL`},
 		// LIKE and NOT LIKE
 		{`'TEST' LIKE 'TEST'`, `true`},
+		{`'TEST' LIKE 'test'`, `false`},
 		{`'TEST' LIKE 'TE%'`, `true`},
 		{`'TEST' LIKE '%E%'`, `true`},
+		{`'TEST' LIKE '%e%'`, `false`},
 		{`'TEST' LIKE 'TES_'`, `true`},
 		{`'TEST' LIKE 'TE_%'`, `true`},
 		{`'TEST' LIKE 'TE_'`, `false`},
@@ -178,7 +208,29 @@ func TestEval(t *testing.T) {
 		{`'TE' LIKE '_'`, `false`},
 		{`'TEST' NOT LIKE '%E%'`, `false`},
 		{`'TEST' NOT LIKE 'TES_'`, `false`},
+		{`'TEST' NOT LIKE 'TeS_'`, `true`},
 		{`'TEST' NOT LIKE 'TE_'`, `true`},
+		// ILIKE and NOT ILIKE
+		{`'TEST' ILIKE 'TEST'`, `true`},
+		{`'TEST' ILIKE 'test'`, `true`},
+		{`'TEST' ILIKE 'TE%'`, `true`},
+		{`'TEST' ILIKE '%E%'`, `true`},
+		{`'TEST' ILIKE '%e%'`, `true`},
+		{`'TEST' ILIKE 'TES_'`, `true`},
+		{`'TEST' ILIKE 'TE_%'`, `true`},
+		{`'TEST' ILIKE 'TE_'`, `false`},
+		{`'TEST' ILIKE '%'`, `true`},
+		{`'TEST' ILIKE '%R'`, `false`},
+		{`'TEST' ILIKE 'TESTER'`, `false`},
+		{`'TEST' ILIKE 'tester'`, `false`},
+		{`'TEST' ILIKE ''`, `false`},
+		{`'' ILIKE ''`, `true`},
+		{`'T' ILIKE '_'`, `true`},
+		{`'TE' ILIKE '_'`, `false`},
+		{`'TEST' NOT ILIKE '%E%'`, `false`},
+		{`'TEST' NOT ILIKE 'TES_'`, `false`},
+		{`'TEST' NOT ILIKE 'TeS_'`, `false`},
+		{`'TEST' NOT ILIKE 'TE_'`, `true`},
 		// SIMILAR TO and NOT SIMILAR TO
 		{`'abc' SIMILAR TO 'abc'`, `true`},
 		{`'abc' SIMILAR TO 'a'`, `false`},
@@ -186,6 +238,62 @@ func TestEval(t *testing.T) {
 		{`'abc' SIMILAR TO '(b|c)%'`, `false`},
 		{`'abc' NOT SIMILAR TO '%(b|d)%'`, `false`},
 		{`'abc' NOT SIMILAR TO '(b|c)%'`, `true`},
+		// ~ and !~
+		{`'TEST' ~ 'TEST'`, `true`},
+		{`'TEST' ~ 'test'`, `false`},
+		{`'TEST' ~ 'TE.*'`, `true`},
+		{`'TEST' ~ '.*E.*'`, `true`},
+		{`'TEST' ~ '.*e.*'`, `false`},
+		{`'TEST' ~ 'TES.'`, `true`},
+		{`'TEST' ~ '^TE[a-z]{2}$'`, `false`},
+		{`'TEST' ~ 'TE.+'`, `true`},
+		{`'TEST' ~ 'TE.$'`, `false`},
+		{`'TEST' ~ '.*'`, `true`},
+		{`'TEST' ~ '.+'`, `true`},
+		{`'' ~ '.+'`, `false`},
+		{`'TEST' ~ '.*R'`, `false`},
+		{`'TEST' ~ 'TESTER'`, `false`},
+		{`'TEST' ~ ''`, `true`},
+		{`'TEST' ~ '^$'`, `false`},
+		{`'' ~ ''`, `true`},
+		{`'T' ~ '^.$'`, `true`},
+		{`'TE' ~ '^.$'`, `false`},
+		{`'T' ~ '^.*$'`, `true`},
+		{`'TE' ~ '^.*$'`, `true`},
+		{`'T' ~ '[a-z]'`, `false`},
+		{`'T' ~ '[a-zA-Z]'`, `true`},
+		{`'TEST' !~ '.E.{2}'`, `false`},
+		{`'TEST' !~ '.e.{2}'`, `true`},
+		{`'TEST' !~ 'TES.'`, `false`},
+		{`'TEST' !~ 'TeST'`, `true`},
+		{`'TEST' !~ 'TESV'`, `true`},
+		{`'TEST' !~ 'TE.'`, `false`},
+		// ~* and !~*
+		{`'TEST' ~* 'TEST'`, `true`},
+		{`'TEST' ~* 'test'`, `true`},
+		{`'TEST' ~* 'Te'`, `true`},
+		{`'TEST' ~* '^Te$'`, `false`},
+		{`'TEST' ~* '^Te.*$'`, `true`},
+		{`'TEST' ~* '.*E.*'`, `true`},
+		{`'TEST' ~* '.*e.*'`, `true`},
+		{`'TEST' ~* 'TES'`, `true`},
+		{`'TEST' ~* '^TE[a-z]{2}$'`, `true`},
+		{`'TEST' ~* '.*'`, `true`},
+		{`'TEST' ~* '.*R'`, `false`},
+		{`'TEST' ~* 'TESTER'`, `false`},
+		{`'TEST' ~* 'tester'`, `false`},
+		{`'TEST' ~* ''`, `true`},
+		{`'TEST' ~* '^$'`, `false`},
+		{`'' ~* ''`, `true`},
+		{`'T' ~* '[a-z]'`, `true`},
+		{`'T' ~* '[a-zA-Z]'`, `true`},
+		{`'TE' ~* '.'`, `true`},
+		{`'TEST' !~* '.E.{2}'`, `false`},
+		{`'TEST' !~* '.e.{2}'`, `false`},
+		{`'TEST' !~* 'TES.'`, `false`},
+		{`'TEST' !~* 'TeST'`, `false`},
+		{`'TEST' !~* 'TESV'`, `true`},
+		{`'TEST' !~* 'TE.'`, `false`},
 		// IS DISTINCT FROM can be used to compare NULLs "safely".
 		{`0 IS DISTINCT FROM 0`, `false`},
 		{`0 IS DISTINCT FROM 1`, `true`},
@@ -259,6 +367,8 @@ func TestEval(t *testing.T) {
 		// IN and NOT IN expressions.
 		{`1 NOT IN (2, 3, 4)`, `true`},
 		{`1+1 IN (2, 3, 4)`, `true`},
+		{`2.2 IN (2.1, 2.2, 2.3)`, `true`},
+		{`2.0 IN (2.1, 2.2, 2.3)`, `false`},
 		{`'a0' IN ('a'||0::char, 'b'||1::char, 'c'||2::char)`, `true`},
 		{`'2012-09-21'::date IN ('2012-09-21'::date)`, `true`},
 		{`'2010-09-28 12:00:00.1'::timestamp IN ('2010-09-28 12:00:00.1'::timestamp)`, `true`},
@@ -362,6 +472,26 @@ func TestEval(t *testing.T) {
 		{`'2010-09-28 12:00:00.1-04:00'::timestamp - '12 hours 2 minutes'::interval`, `2010-09-28 03:58:00.1+00:00`},
 		{`'2010-09-28 12:00:00.1-04:00'::timestamp - 'PT12H2M'::interval`, `2010-09-28 03:58:00.1+00:00`},
 		{`'2010-09-28 12:00:00.1-04:00'::timestamp - '2010-09-28 12:00:00.1+00:00'::timestamp`, `4h0m0s`},
+		// Type annotation expressions.
+		{`ANNOTATE_TYPE('s', string)`, `'s'`},
+		{`ANNOTATE_TYPE('s', bytes)`, `b's'`},
+		{`ANNOTATE_TYPE('2010-09-28', date)`, `2010-09-28`},
+		{`ANNOTATE_TYPE('PT12H2M', interval)`, `12h2m0s`},
+		{`ANNOTATE_TYPE('2010-09-28', timestamp)`, `2010-09-28 00:00:00+00:00`},
+		{`ANNOTATE_TYPE('2010-09-28', timestamptz)`, `2010-09-28 00:00:00+00:00`},
+		{`ANNOTATE_TYPE(123, int) + 1`, `124`},
+		{`ANNOTATE_TYPE(123, float) + 1`, `124.0`},
+		{`ANNOTATE_TYPE(123, decimal) + 1`, `124`},
+		{`ANNOTATE_TYPE(123.5, float) + 1`, `124.5`},
+		{`ANNOTATE_TYPE(123.5, decimal) + 1`, `124.5`},
+		{`ANNOTATE_TYPE(NULL, int)`, `NULL`},
+		{`ANNOTATE_TYPE(NULL, string)`, `NULL`},
+		{`ANNOTATE_TYPE(NULL, timestamp)`, `NULL`},
+		// TODO(nvanbenschoten) introduce a shorthand type annotation notation.
+		// {`123!int + 1`, `124`},
+		// {`123!float + 1`, `124.0`},
+		// {`(123 + 1)!int`, `124`},
+		// {`(123 + 1)!float`, `124.0`},
 		// Need two interval ops to verify the return type matches the return struct type.
 		{`'2010-09-28 12:00:00.1-04:00'::timestamptz - '0s'::interval - '0s'::interval`, `2010-09-28 16:00:00.1+00:00`},
 		{`'12h2m1s23ms'::interval + '1h'::interval`, `13h2m1.023s`},
@@ -415,14 +545,16 @@ func TestEval(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", d.expr, err)
 		}
-		typedExpr, err := TypeCheck(expr, nil, NoTypePreference)
+		// expr.TypeCheck to avoid constant folding.
+		typedExpr, err := expr.TypeCheck(nil, NoTypePreference)
 		if err != nil {
 			t.Fatalf("%s: %v", d.expr, err)
 		}
-		if typedExpr, err = defaultContext.NormalizeExpr(typedExpr); err != nil {
+		ctx := &EvalContext{}
+		if typedExpr, err = ctx.NormalizeExpr(typedExpr); err != nil {
 			t.Fatalf("%s: %v", d.expr, err)
 		}
-		r, err := typedExpr.Eval(defaultContext)
+		r, err := typedExpr.Eval(ctx)
 		if err != nil {
 			t.Fatalf("%s: %v", d.expr, err)
 		}
@@ -439,11 +571,27 @@ func TestEvalError(t *testing.T) {
 	}{
 		{`1 % 0`, `zero modulus`},
 		{`1 / 0`, `division by zero`},
-		{`'2010-09-28 12:00:00.1'::date`,
-			`could not parse '2010-09-28 12:00:00.1' in any supported date format`},
-		{`'2010-09-28 12:00.1 MST'::timestamp`,
-			`could not parse '2010-09-28 12:00.1 MST' in any supported timestamp format`},
+		{`1 // 0`, `division by zero`},
+		{`1.5 / 0`, `division by zero`},
 		{`'11h2m'::interval / 0`, `division by zero`},
+		{`'???'::bool`,
+			`could not parse '???' as type bool: strconv.ParseBool: parsing "???": invalid syntax`},
+		{`'foo'::int`,
+			`could not parse 'foo' as type int: strconv.ParseInt: parsing "foo": invalid syntax`},
+		{`'bar'::float`,
+			`could not parse 'bar' as type float: strconv.ParseFloat: parsing "bar": invalid syntax`},
+		{`'baz'::decimal`,
+			`could not parse 'baz' as type decimal`},
+		{`'2010-09-28 12:00:00.1'::date`,
+			`could not parse '2010-09-28 12:00:00.1' as type date`},
+		{`'2010-09-28 12:00.1 MST'::timestamp`,
+			`could not parse '2010-09-28 12:00.1 MST' as type timestamp`},
+		{`'abcd'::interval`,
+			`could not parse 'abcd' as type interval: time: invalid duration abcd`},
+		{`ANNOTATE_TYPE('a', int)`,
+			`incompatible type assertion for 'a' as int, found type: string`},
+		{`ANNOTATE_TYPE(ANNOTATE_TYPE(1, int), decimal)`,
+			`incompatible type assertion for ANNOTATE_TYPE(1, INT) as decimal, found type: int`},
 		{`b'\xff\xfe\xfd'::string`, `invalid utf8: "\xff\xfe\xfd"`},
 		{`'' LIKE ` + string([]byte{0x27, 0xc2, 0x30, 0x7a, 0xd5, 0x25, 0x30, 0x27}),
 			`LIKE regexp compilation failed: error parsing regexp: invalid UTF-8: .*`},
@@ -457,7 +605,7 @@ func TestEvalError(t *testing.T) {
 		}
 		typedExpr, err := TypeCheck(expr, nil, NoTypePreference)
 		if err == nil {
-			_, err = typedExpr.Eval(defaultContext)
+			_, err = typedExpr.Eval(&EvalContext{})
 		}
 		if !testutils.IsError(err, strings.Replace(regexp.QuoteMeta(d.expected), `\.\*`, `.*`, -1)) {
 			t.Errorf("%s: expected %s, but found %v", d.expr, d.expected, err)
@@ -477,9 +625,17 @@ func TestEvalComparisonExprCaching(t *testing.T) {
 		// LIKE and NOT LIKE
 		{Like, `TEST`, `T%T`, 1},
 		{NotLike, `TEST`, `%E%T`, 1},
+		// ILIKE and NOT ILIKE
+		{ILike, `TEST`, `T%T`, 1},
+		{NotILike, `TEST`, `%E%T`, 1},
 		// SIMILAR TO and NOT SIMILAR TO
 		{SimilarTo, `abc`, `(b|c)%`, 1},
 		{NotSimilarTo, `abc`, `%(b|d)%`, 1},
+		// ~, !~, ~*, and !~*
+		{RegMatch, `abc`, `(b|c).`, 1},
+		{NotRegMatch, `abc`, `(b|c).`, 1},
+		{RegIMatch, `abc`, `(b|c).`, 1},
+		{NotRegIMatch, `abc`, `(b|c).`, 1},
 	}
 	for _, d := range testExprs {
 		expr := &ComparisonExpr{
@@ -487,7 +643,7 @@ func TestEvalComparisonExprCaching(t *testing.T) {
 			Left:     NewDString(d.left),
 			Right:    NewDString(d.right),
 		}
-		ctx := defaultContext
+		ctx := &EvalContext{}
 		ctx.ReCache = NewRegexpCache(8)
 		typedExpr, err := TypeCheck(expr, nil, NoTypePreference)
 		if err != nil {
@@ -541,10 +697,10 @@ func TestClusterTimestampConversion(t *testing.T) {
 		{9223372036854775807, 2147483647, "9223372036854775807.2147483647"},
 	}
 
-	ctx := defaultContext
+	ctx := &EvalContext{}
 	ctx.PrepareOnly = true
 	for _, d := range testData {
-		ts := roachpb.Timestamp{WallTime: d.walltime, Logical: d.logical}
+		ts := hlc.Timestamp{WallTime: d.walltime, Logical: d.logical}
 		ctx.SetClusterTimestamp(ts)
 		dec := ctx.GetClusterTimestamp()
 		final := dec.String()
@@ -566,8 +722,12 @@ var benchmarkLikePatterns = []string{
 	`also\%`,
 }
 
-func benchmarkLike(b *testing.B, ctx EvalContext) {
-	likeFn, _ := CmpOps[Like].lookupImpl(TypeString, TypeString)
+func benchmarkLike(b *testing.B, ctx *EvalContext, caseInsensitive bool) {
+	op := Like
+	if caseInsensitive {
+		op = ILike
+	}
+	likeFn, _ := CmpOps[op].lookupImpl(TypeString, TypeString)
 	iter := func() {
 		for _, p := range benchmarkLikePatterns {
 			if _, err := likeFn.fn(ctx, NewDString("test"), NewDString(p)); err != nil {
@@ -584,9 +744,17 @@ func benchmarkLike(b *testing.B, ctx EvalContext) {
 }
 
 func BenchmarkLikeWithCache(b *testing.B) {
-	benchmarkLike(b, EvalContext{ReCache: NewRegexpCache(len(benchmarkLikePatterns))})
+	benchmarkLike(b, &EvalContext{ReCache: NewRegexpCache(len(benchmarkLikePatterns))}, false)
 }
 
 func BenchmarkLikeWithoutCache(b *testing.B) {
-	benchmarkLike(b, EvalContext{})
+	benchmarkLike(b, &EvalContext{}, false)
+}
+
+func BenchmarkILikeWithCache(b *testing.B) {
+	benchmarkLike(b, &EvalContext{ReCache: NewRegexpCache(len(benchmarkLikePatterns))}, true)
+}
+
+func BenchmarkILikeWithoutCache(b *testing.B) {
+	benchmarkLike(b, &EvalContext{}, true)
 }

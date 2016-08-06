@@ -19,8 +19,11 @@ package ts
 import (
 	"time"
 
-	"github.com/cockroachdb/cockroach/client"
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/ts/tspb"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/stop"
 )
@@ -54,7 +57,7 @@ func (db *DB) PollSource(source DataSource, frequency time.Duration, r Resolutio
 
 // A DataSource can be queryied for a slice of time series data.
 type DataSource interface {
-	GetTimeSeriesData() []TimeSeriesData
+	GetTimeSeriesData() []tspb.TimeSeriesData
 }
 
 // poller maintains information for a polling process started by PollSource().
@@ -88,21 +91,23 @@ func (p *poller) start() {
 // poll retrieves data from the underlying DataSource a single time, storing any
 // returned time series data on the server.
 func (p *poller) poll() {
-	p.stopper.RunTask(func() {
+	if err := p.stopper.RunTask(func() {
 		data := p.source.GetTimeSeriesData()
 		if len(data) == 0 {
 			return
 		}
 
 		if err := p.db.StoreData(p.r, data); err != nil {
-			log.Warningf("error writing time series data: %s", err)
+			log.Warningf(context.TODO(), "error writing time series data: %s", err)
 		}
-	})
+	}); err != nil {
+		log.Warning(context.TODO(), err)
+	}
 }
 
 // StoreData writes the supplied time series data to the cockroach server.
 // Stored data will be sampled at the supplied resolution.
-func (db *DB) StoreData(r Resolution, data []TimeSeriesData) error {
+func (db *DB) StoreData(r Resolution, data []tspb.TimeSeriesData) error {
 	var kvs []roachpb.KeyValue
 
 	// Process data collection: data is converted to internal format, and a key

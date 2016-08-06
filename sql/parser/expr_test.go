@@ -76,6 +76,8 @@ func TestNormalizeTableName(t *testing.T) {
 		{`test.foo.bar`, ``, ``, `invalid table name: test.foo.bar`},
 		{`test.foo[bar]`, ``, ``, `invalid table name: test.foo\[bar\]`},
 		{`test.foo.bar[blah]`, ``, ``, `invalid table name: test.foo.bar\[blah\]`},
+		{`test.*`, ``, ``, `invalid table name: test.*`},
+		{`test[blah]`, ``, ``, `invalid table name: test\[blah\]`},
 	}
 
 	for _, tc := range testCases {
@@ -83,7 +85,7 @@ func TestNormalizeTableName(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", tc.in, err)
 		}
-		ate := stmt.(*Select).Select.(*SelectClause).From[0].(*AliasedTableExpr)
+		ate := stmt.(*Select).Select.(*SelectClause).From.Tables[0].(*AliasedTableExpr)
 		err = ate.Expr.(*QualifiedName).NormalizeTableName(tc.db)
 		if tc.err != "" {
 			if !testutils.IsError(err, tc.err) {
@@ -121,11 +123,15 @@ func TestNormalizeColumnName(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		q, err := ParseExprTraditional(tc.in)
+		stmt, err := ParseOneTraditional("SELECT " + tc.in)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.in, err)
 		}
-		err = q.(*QualifiedName).NormalizeColumnName()
+		q, ok := stmt.(*Select).Select.(*SelectClause).Exprs[0].Expr.(*QualifiedName)
+		if !ok {
+			t.Fatalf("%s does not parse to a QualifiedName", tc.in)
+		}
+		err = q.NormalizeColumnName()
 		if tc.err != "" {
 			if !testutils.IsError(err, tc.err) {
 				t.Fatalf("%s: expected %s, but found %s", tc.in, tc.err, err)
@@ -135,7 +141,7 @@ func TestNormalizeColumnName(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: expected success, but found %v", tc.in, err)
 		}
-		q.(*QualifiedName).ClearString()
+		q.ClearString()
 		if out := q.String(); tc.out != out {
 			t.Errorf("%s: expected %s, but found %s", tc.in, tc.out, out)
 		}
@@ -188,7 +194,7 @@ func TestExprString(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", exprStr, err)
 		}
-		typedExpr, err := TypeCheck(expr, nil, nil)
+		typedExpr, err := TypeCheck(expr, nil, NoTypePreference)
 		if err != nil {
 			t.Fatalf("%s: %v", expr, err)
 		}
@@ -198,7 +204,7 @@ func TestExprString(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", exprStr, err)
 		}
-		typedExpr2, err := TypeCheck(expr2, nil, nil)
+		typedExpr2, err := TypeCheck(expr2, nil, NoTypePreference)
 		if err != nil {
 			t.Fatalf("%s: %v", expr2, err)
 		}
@@ -209,11 +215,12 @@ func TestExprString(t *testing.T) {
 			t.Errorf("Print/parse/print cycle changes the string: `%s` vs `%s`", str, str2)
 		}
 		// Compare the normalized expressions.
-		normalized, err := defaultContext.NormalizeExpr(typedExpr)
+		ctx := &EvalContext{}
+		normalized, err := ctx.NormalizeExpr(typedExpr)
 		if err != nil {
 			t.Fatalf("%s: %v", exprStr, err)
 		}
-		normalized2, err := defaultContext.NormalizeExpr(typedExpr2)
+		normalized2, err := ctx.NormalizeExpr(typedExpr2)
 		if err != nil {
 			t.Fatalf("%s: %v", exprStr, err)
 		}
@@ -223,6 +230,28 @@ func TestExprString(t *testing.T) {
 				"intermediate: %s\n"+
 				"before: %#v\n"+
 				"after:  %#v", exprStr, str, normalized, normalized2)
+		}
+	}
+}
+
+func TestStripParens(t *testing.T) {
+	testExprs := []struct {
+		in, out string
+	}{
+		{`1`, `1`},
+		{`(1)`, `1`},
+		{`((1))`, `1`},
+		{`(1) + (2)`, `(1) + (2)`},
+		{`((1) + (2))`, `(1) + (2)`},
+	}
+	for i, test := range testExprs {
+		expr, err := ParseExprTraditional(test.in)
+		if err != nil {
+			t.Fatalf("%d: %v", i, err)
+		}
+		stripped := StripParens(expr)
+		if str := stripped.String(); str != test.out {
+			t.Fatalf("%d: expected StripParens(%s) = %s, but found %s", i, test.in, test.out, str)
 		}
 	}
 }

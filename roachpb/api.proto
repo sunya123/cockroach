@@ -22,7 +22,9 @@ import "cockroach/roachpb/data.proto";
 import "cockroach/roachpb/errors.proto";
 import "cockroach/roachpb/internal_raft.proto";
 import "cockroach/roachpb/metadata.proto";
+import "cockroach/storage/engine/enginepb/mvcc.proto";
 import "cockroach/util/tracing/span.proto";
+import "cockroach/util/hlc/timestamp.proto";
 import weak "gogoproto/gogo.proto";
 
 // ReadConsistencyType specifies what type of consistency is observed
@@ -156,9 +158,8 @@ message DeleteResponse {
 // specifies the range of keys to delete.
 message DeleteRangeRequest {
   optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-  // If 0, *all* entries between key (inclusive) and end_key
-  // (exclusive) are deleted. Must be >= 0.
-  optional int64 max_entries_to_delete = 2 [(gogoproto.nullable) = false];
+  reserved 2;
+  // return the keys that are deleted in the response.
   optional bool return_keys = 3 [(gogoproto.nullable) = false];
 }
 
@@ -166,17 +167,17 @@ message DeleteRangeRequest {
 // method.
 message DeleteRangeResponse {
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-  // Number of entries removed.
+  // All the deleted keys if return_keys is set.
   repeated bytes keys = 2 [(gogoproto.casttype) = "Key"];
 }
 
 // A ScanRequest is the argument to the Scan() method. It specifies the
 // start and end keys for an ascending scan of [start,end) and the maximum
-// number of results.
+// number of results (unbounded if zero).
 message ScanRequest {
+  reserved 2;
+
   optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-  // If 0, there is no limit on the number of retrieved entries. Must be >= 0.
-  optional int64 max_results = 2 [(gogoproto.nullable) = false];
 }
 
 // A ScanResponse is the return value from the Scan() method.
@@ -188,11 +189,11 @@ message ScanResponse {
 
 // A ReverseScanRequest is the argument to the ReverseScan() method. It specifies the
 // start and end keys for a descending scan of [start,end) and the maximum
-// number of results.
+// number of results (unbounded if zero).
 message ReverseScanRequest {
+  reserved 2;
+
   optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-  // If 0, there is no limit on the number of retrieved entries. Must be >= 0.
-  optional int64 max_results = 2 [(gogoproto.nullable) = false];
 }
 
 // A ReverseScanResponse is the return value from the ReverseScan() method.
@@ -213,7 +214,7 @@ message CheckConsistencyRequest {
 }
 
 // A CheckConsistencyResponse is the return value from the CheckConsistency() method.
-// If a replica finds itself to be inconsistent with its leader it will panic.
+// If a replica finds itself to be inconsistent with its lease holder it will panic.
 message CheckConsistencyResponse {
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 }
@@ -247,8 +248,6 @@ message ChangeFrozenResponse {
       (gogoproto.castkey) = "StoreID", (gogoproto.castvalue) = "NodeID" ];
 }
 
-
-
 // A BeginTransactionRequest is the argument to the BeginTransaction() method.
 message BeginTransactionRequest {
   optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
@@ -266,7 +265,7 @@ message EndTransactionRequest {
   // False to abort and rollback.
   optional bool commit = 2 [(gogoproto.nullable) = false];
   // The deadline by which the transaction must commit, if present.
-  optional Timestamp deadline = 3;
+  optional util.hlc.Timestamp deadline = 3;
   // Optional commit triggers. Note that commit triggers are for
   // internal use only and will cause an error if requested through the
   // external-facing KV API.
@@ -347,6 +346,19 @@ message AdminMergeResponse {
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 }
 
+// An AdminTransferLeaseRequest is the argument to the AdminTransferLease()
+// method. A lease transfer allows an external entity to control the lease
+// holder for a range. The target of the lease transfer needs to be a valid
+// replica of the range.
+message AdminTransferLeaseRequest {
+  optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  optional int32 target = 2 [(gogoproto.nullable) = false, (gogoproto.casttype) = "StoreID"];
+}
+
+message AdminTransferLeaseResponse {
+  optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
 // A RangeLookupRequest is arguments to the RangeLookup() method. A
 // forward lookup request returns a range containing the requested
 // key. A reverse lookup request returns a range containing the
@@ -389,7 +401,7 @@ message RangeLookupResponse {
 // gossip protocol.
 message HeartbeatTxnRequest {
   optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-  optional Timestamp now = 2 [(gogoproto.nullable) = false];
+  optional util.hlc.Timestamp now = 2 [(gogoproto.nullable) = false];
 }
 
 // A HeartbeatTxnResponse is the return value from the HeartbeatTxn()
@@ -401,15 +413,17 @@ message HeartbeatTxnResponse {
 }
 
 // A GCRequest is arguments to the GC() method. It's sent by range
-// leaders after scanning range data to find expired MVCC values.
+// lease holders after scanning range data to find expired MVCC values.
 message GCRequest {
   optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 
   message GCKey {
     optional bytes key = 1 [(gogoproto.casttype) = "Key"];
-    optional Timestamp timestamp = 2 [(gogoproto.nullable) = false];
+    optional util.hlc.Timestamp timestamp = 2 [(gogoproto.nullable) = false];
   }
   repeated GCKey keys = 3 [(gogoproto.nullable) = false];
+  // Threshold is the expiration timestamp.
+  optional util.hlc.Timestamp threshold = 4 [(gogoproto.nullable) = false];
 }
 
 // A GCResponse is the return value from the GC() method.
@@ -457,16 +471,16 @@ message PushTxnRequest {
   // the push transaction request. Note that this may not be the most
   // up-to-date value of the transaction record, but will be set or
   // merged as appropriate.
-  optional TxnMeta pushee_txn = 3 [(gogoproto.nullable) = false];
+  optional storage.engine.enginepb.TxnMeta pushee_txn = 3 [(gogoproto.nullable) = false];
   // PushTo is the timestamp just after which PusheeTxn is attempted to be
   // pushed. During conflict resolution, it should be set to the timestamp
   // of the its conflicting write.
-  optional Timestamp push_to = 4 [(gogoproto.nullable) = false];
+  optional util.hlc.Timestamp push_to = 4 [(gogoproto.nullable) = false];
   // Now holds the timestamp used to compare the last heartbeat of the pushee
   // against. This is necessary since the request header's timestamp does not
   // necessarily advance with the node clock across retries and hence cannot
   // detect abandoned transactions.
-  optional Timestamp now = 5 [(gogoproto.nullable) = false];
+  optional util.hlc.Timestamp now = 5 [(gogoproto.nullable) = false];
   // Readers set this to PUSH_TIMESTAMP to move pushee_txn's provisional
   // commit timestamp forward. Writers set this to PUSH_ABORT to request
   // that pushee_txn be aborted if possible. Inconsistent readers set
@@ -496,7 +510,7 @@ message PushTxnResponse {
 message ResolveIntentRequest {
   optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   // The transaction whose intent is being resolved.
-  optional TxnMeta intent_txn = 2 [(gogoproto.nullable) = false];
+  optional storage.engine.enginepb.TxnMeta intent_txn = 2 [(gogoproto.nullable) = false];
   // The status of the transaction.
   optional TransactionStatus status = 3 [(gogoproto.nullable) = false];
   // Optionally poison the sequence cache for the transaction the intent's
@@ -517,7 +531,7 @@ message ResolveIntentResponse {
 message ResolveIntentRangeRequest {
   optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   // The transaction whose intents are being resolved.
-  optional TxnMeta intent_txn = 2 [(gogoproto.nullable) = false];
+  optional storage.engine.enginepb.TxnMeta intent_txn = 2 [(gogoproto.nullable) = false];
   // The status of the transaction.
   optional TransactionStatus status = 3 [(gogoproto.nullable) = false];
   // Optionally poison the sequence cache for the transaction on all ranges
@@ -574,17 +588,34 @@ message TruncateLogResponse {
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 }
 
-// A LeaderLeaseRequest is arguments to the LeaderLease()
+// A RequestLeaseRequest is arguments to the RequestLease()
 // method. It is sent by the store on behalf of one of its ranges upon receipt
-// of a leader election event for that range.
-message LeaderLeaseRequest {
+// of a command requiring a lease when none is found.
+message RequestLeaseRequest {
   optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   optional Lease lease = 2[(gogoproto.nullable) = false];
 }
 
-// A LeaderLeaseResponse is the response to a LeaderLease()
+// A TransferLeaseRequest represents the arguments to the TransferLease()
+// method. It is sent by a replica that currently holds the range lease and
+// wants to transfer it away.
+//
+// Like a RequestLeaseRequest, this request has the effect of instituting a new
+// lease. The difference is that the new lease is allowed to overlap the
+// existing one. It is a separate request because the LeaderLeaseRequest is
+// special - it's not subject to the same replay protection restrictions as
+// other requests, instead being protected from replays by the fact that leases
+// are not generally allowed to overlap. The TransferLeaseRequest is not
+// special in this respect (for example, the proposer of this command is
+// checked to have been holding the lease when the proposal was made).
+message TransferLeaseRequest {
+  optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  optional Lease lease = 2 [(gogoproto.nullable) = false];
+}
+
+// A RequestLeaseResponse is the response to a RequestLease() or TransferLease()
 // operation.
-message LeaderLeaseResponse{
+message RequestLeaseResponse{
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 }
 
@@ -613,7 +644,7 @@ message ComputeChecksumResponse {
 }
 
 // A VerifyChecksumRequest is arguments to the VerifyChecksum() method, to
-// verify the checksum computed on the leader against the one requested
+// verify the checksum computed on the lease holder against the one requested
 // earlier through a ComputeChecksumRequest with the same checksum_id.
 message VerifyChecksumRequest {
   optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
@@ -649,6 +680,7 @@ message RequestUnion {
   optional EndTransactionRequest end_transaction = 9;
   optional AdminSplitRequest admin_split = 10;
   optional AdminMergeRequest admin_merge = 11;
+  optional AdminTransferLeaseRequest admin_transfer_lease = 29;
   optional HeartbeatTxnRequest heartbeat_txn = 12;
   optional GCRequest gc = 13;
   optional PushTxnRequest push_txn = 14;
@@ -657,7 +689,7 @@ message RequestUnion {
   optional ResolveIntentRangeRequest resolve_intent_range = 17;
   optional MergeRequest merge = 18;
   optional TruncateLogRequest truncate_log = 19;
-  optional LeaderLeaseRequest leader_lease = 20;
+  optional RequestLeaseRequest request_lease = 20;
   optional ReverseScanRequest reverse_scan = 21;
   optional ComputeChecksumRequest compute_checksum = 22;
   optional VerifyChecksumRequest verify_checksum = 23;
@@ -665,6 +697,7 @@ message RequestUnion {
   optional NoopRequest noop = 25;
   optional InitPutRequest init_put = 26;
   optional ChangeFrozenRequest change_frozen = 27;
+  optional TransferLeaseRequest transfer_lease = 28;
 }
 
 // A ResponseUnion contains exactly one of the optional responses.
@@ -683,6 +716,7 @@ message ResponseUnion {
   optional EndTransactionResponse end_transaction = 9;
   optional AdminSplitResponse admin_split = 10;
   optional AdminMergeResponse admin_merge = 11;
+  optional AdminTransferLeaseResponse admin_transfer_lease = 29;
   optional HeartbeatTxnResponse heartbeat_txn = 12;
   optional GCResponse gc = 13;
   optional PushTxnResponse push_txn = 14;
@@ -691,7 +725,7 @@ message ResponseUnion {
   optional ResolveIntentRangeResponse resolve_intent_range = 17;
   optional MergeResponse merge = 18;
   optional TruncateLogResponse truncate_log = 19;
-  optional LeaderLeaseResponse leader_lease = 20;
+  optional RequestLeaseResponse request_lease = 20;
   optional ReverseScanResponse reverse_scan = 21;
   optional ComputeChecksumResponse compute_checksum = 22;
   optional VerifyChecksumResponse verify_checksum = 23;
@@ -699,6 +733,7 @@ message ResponseUnion {
   optional NoopResponse noop = 25;
   optional InitPutResponse init_put = 26;
   optional ChangeFrozenResponse change_frozen = 27;
+  reserved 28; // TransferLease and RequestLease both use RequestLeaseResponse
 }
 
 // A Header is attached to a BatchRequest, encapsulating routing and auxiliary
@@ -707,7 +742,7 @@ message Header {
   // timestamp specifies time at which read or writes should be
   // performed. If the timestamp is set to zero value, its value
   // is initialized to the wall time of the receiving node.
-  optional Timestamp timestamp = 1 [(gogoproto.nullable) = false];
+  optional util.hlc.Timestamp timestamp = 1 [(gogoproto.nullable) = false];
   // replica specifies the destination of the request.
   optional ReplicaDescriptor replica = 2 [(gogoproto.nullable) = false];
   // range_id specifies the ID of the Raft consensus group which the key
@@ -738,9 +773,17 @@ message Header {
   optional ReadConsistencyType read_consistency = 6 [(gogoproto.nullable) = false];
   // trace, if set, is the active span of an OpenTracing distributed trace.
   optional util.tracing.Span trace = 7;
-  // if set to a non-zero value, limits the total number of results for
-  // Scan/ReverseScan requests in the batch.
-  optional int64 max_scan_results = 8 [(gogoproto.nullable) = false];
+  // If set to a non-zero value, it limits the total number of keys touched
+  // by span requests in the batch. Span requests are requests like
+  // Scan, ReverseScan, and DelRange. If two requests touch the
+  // same key it is double counted.
+  optional int64 max_span_request_keys = 8 [(gogoproto.nullable) = false];
+  // if set, all of the spans in the batch are distinct. Note that the
+  // calculation of distinct spans does not include intents in an
+  // EndTransactionRequest. Currently set conservatively: a request
+  // might be composed of distinct spans yet have this field set to
+  // false.
+  optional bool distinct_spans = 9 [(gogoproto.nullable) = false];
 }
 
 
@@ -767,7 +810,7 @@ message BatchResponse {
     // timestamp is set only for non-transactional responses and denotes the
     // highest timestamp at which a command from the batch executed. At the
     // time of writing, it is used solely for informational purposes and tests.
-    optional Timestamp Timestamp = 2 [(gogoproto.nullable) = false];
+    optional util.hlc.Timestamp Timestamp = 2 [(gogoproto.nullable) = false];
     // txn is non-nil if the request specified a non-nil
     // transaction. The transaction timestamp and/or priority may have
     // been updated, depending on the outcome of the request.
@@ -777,7 +820,7 @@ message BatchResponse {
     repeated bytes collected_spans = 4;
     // now is the current time at the node sending the response,
     // which can be used by the receiver to update its local HLC.
-    optional Timestamp now = 5 [(gogoproto.nullable) = false];
+    optional util.hlc.Timestamp now = 5 [(gogoproto.nullable) = false];
   }
   optional Header header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   repeated ResponseUnion responses = 2 [(gogoproto.nullable) = false];
@@ -790,6 +833,40 @@ message RaftCommand {
       (gogoproto.customname) = "RangeID", (gogoproto.casttype) = "RangeID"];
   optional ReplicaDescriptor origin_replica = 2 [(gogoproto.nullable) = false];
   optional BatchRequest cmd = 3 [(gogoproto.nullable) = false];
+  // When the command is applied, its result is an error if the lease log
+  // counter has already reached (or exceeded) max_lease_index.
+  //
+  // The lease index is a replay protection mechanism. Similar to the Raft
+  // applied index, it is strictly increasing, but may have gaps. A command
+  // will only apply successfully if its max_lease_index has not been surpassed
+  // by the Range's applied lease index (in which case the command may need to
+  // be 'refurbished', that is, regenerated with a higher max_lease_index).
+  // When the command applies, the new lease index will increase to
+  // max_lease_index (so a potential later replay will fail).
+  //
+  // Refurbishment is conditional on whether there is a difference between the
+  // local pending and the applying version of the command - if the local copy
+  // has a different max_lease_index, an earlier incarnation of the command has
+  // already been refurbished, and no repeated refurbishment takes place.
+  //
+  // This mechanism was introduced as a simpler alternative to using the Raft
+  // applied index, which is fraught with complexity due to the need to predict
+  // exactly the log position at which a command will apply, even when the Raft
+  // leader is not colocated with the lease holder (which usually proposes all
+  // commands).
+  //
+  // Pinning the lease-index to the assigned slot (as opposed to allowing gaps
+  // as we do now) is an interesting venue to explore from the standpoint of
+  // parallelization: One could hope to enforce command ordering in that way
+  // (without recourse to a higher-level locking primitive such as the command
+  // queue). This is a hard problem: First of all, managing the pending
+  // commands gets more involved; a command must not be removed if others have
+  // been added after it, and on removal, the assignment counters must be
+  // updated accordingly. Even worse though, refurbishments must be avoided at
+  // all costs (since a refurbished command is likely to order after one that
+  // it originally preceded (and which may well commit successfully without
+  // a refurbishment).
+  optional uint64 max_lease_index = 4 [(gogoproto.nullable) = false];
 }
 
 // StoreRequestHeader locates a Store on a Node.
@@ -800,16 +877,41 @@ message StoreRequestHeader {
       (gogoproto.customname) = "StoreID", (gogoproto.casttype) = "StoreID"];
 }
 
-// A PollFrozenRequest asks addressed Store for counts of its frozen and
-// unfrozen replicas.
+// A PollFrozenRequest asks the addressed Store for its frozen or thawed
+// Replicas.
 message PollFrozenRequest {
   optional StoreRequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  // When true, collect the frozen Replicas, and the thawed ones otherwise.
+  optional bool collect_frozen = 2 [(gogoproto.nullable) = false];
 }
 
 // A PollFrozenResponse is the response returned from a PollFrozenRequest.
 message PollFrozenResponse {
-  optional int64 num_frozen = 1 [(gogoproto.nullable) = false];
-  optional int64 num_thawed = 2 [(gogoproto.nullable) = false];
+  repeated ReplicaDescriptor results = 1 [(gogoproto.nullable) = false];
+}
+
+// A ReservationRequest asks the addressed Store to reserve the space for a new
+// replica for the Range of RangeID reserving RangeSize bytes.
+message ReservationRequest {
+  optional StoreRequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  optional int32 from_node_id = 2 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "FromNodeID", (gogoproto.casttype) = "NodeID"];
+  optional int32 from_store_id = 3 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "FromStoreID", (gogoproto.casttype) = "StoreID"];
+  optional int64 range_id = 4 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "RangeID", (gogoproto.casttype) = "RangeID"];
+  optional int64 range_size = 5 [(gogoproto.nullable) = false];
+}
+
+// A ReservationResponse is the repoonse returned from a ReservationRequest.
+message ReservationResponse {
+  optional bool reserved = 1 [(gogoproto.nullable) = false];
+  // The current number of ranges and reservations on the target
+  // store. This is returned even if the reservation isn't filled.
+  //
+  // NB: Nullable so we can detect if the field isn't set as will be
+  // the case when talking to older servers.
+  optional int32 range_count = 2;
 }
 
 // The two Batch services below are identical, except that some internal
@@ -819,9 +921,21 @@ message PollFrozenResponse {
 
 service Internal {
   rpc Batch (BatchRequest) returns (BatchResponse) {}
+
+  // TODO(wiz): These methods have been split out into the InternalStores
+  // service, but remain here until we determine that a breaking RPC change is
+  // acceptable.
   rpc PollFrozen (PollFrozenRequest) returns (PollFrozenResponse) {}
+  rpc Reserve(ReservationRequest) returns (ReservationResponse) {}
 }
 
 service External {
   rpc Batch (BatchRequest) returns (BatchResponse) {}
+}
+
+// InternalStores is a wrapper for internal RPCs that operate only on the stores
+// of a node.
+service InternalStores {
+  rpc PollFrozen (PollFrozenRequest) returns (PollFrozenResponse) {}
+  rpc Reserve(ReservationRequest) returns (ReservationResponse) {}
 }

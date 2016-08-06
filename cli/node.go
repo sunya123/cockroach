@@ -22,11 +22,11 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
-	"github.com/cockroachdb/cockroach/server"
+	"github.com/cockroachdb/cockroach/server/serverpb"
 	"github.com/cockroachdb/cockroach/server/status"
-	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/stop"
 )
 
@@ -60,7 +60,7 @@ func runLsNodes(cmd *cobra.Command, args []string) error {
 	}
 	defer stopper.Stop()
 
-	nodeStatuses, err := c.Nodes(stopperContext(stopper), &server.NodesRequest{})
+	nodeStatuses, err := c.Nodes(stopperContext(stopper), &serverpb.NodesRequest{})
 	if err != nil {
 		return err
 	}
@@ -72,7 +72,7 @@ func runLsNodes(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	printQueryOutput(os.Stdout, lsNodesColumnHeaders, rows, "")
+	printQueryOutput(os.Stdout, lsNodesColumnHeaders, rows, "", cliCtx.prettyFmt)
 	return nil
 }
 
@@ -115,7 +115,7 @@ func runStatusNode(cmd *cobra.Command, args []string) error {
 	switch len(args) {
 	case 0:
 		// Show status for all nodes.
-		nodes, err := c.Nodes(stopperContext(stopper), &server.NodesRequest{})
+		nodes, err := c.Nodes(stopperContext(stopper), &serverpb.NodesRequest{})
 		if err != nil {
 			return err
 		}
@@ -123,7 +123,7 @@ func runStatusNode(cmd *cobra.Command, args []string) error {
 
 	case 1:
 		nodeID := args[0]
-		nodeStatus, err := c.Node(stopperContext(stopper), &server.NodeRequest{NodeId: nodeID})
+		nodeStatus, err := c.Node(stopperContext(stopper), &serverpb.NodeRequest{NodeId: nodeID})
 		if err != nil {
 			return err
 		}
@@ -138,10 +138,10 @@ func runStatusNode(cmd *cobra.Command, args []string) error {
 
 	default:
 		mustUsage(cmd)
-		return util.Errorf("expected no arguments or a single node ID")
+		return errors.Errorf("expected no arguments or a single node ID")
 	}
 
-	printQueryOutput(os.Stdout, nodesColumnHeaders, nodeStatusesToRows(nodeStatuses), "")
+	printQueryOutput(os.Stdout, nodesColumnHeaders, nodeStatusesToRows(nodeStatuses), "", cliCtx.prettyFmt)
 	return nil
 }
 
@@ -192,7 +192,7 @@ var nodeCmds = []*cobra.Command{
 
 var nodeCmd = &cobra.Command{
 	Use:   "node [command]",
-	Short: "list nodes and show their status\n",
+	Short: "list nodes and show their status",
 	Long:  "List nodes and show their status.",
 	Run: func(cmd *cobra.Command, args []string) {
 		mustUsage(cmd)
@@ -203,10 +203,10 @@ func init() {
 	nodeCmd.AddCommand(nodeCmds...)
 }
 
-func getStatusClient() (server.StatusClient, *stop.Stopper, error) {
+func getStatusClient() (serverpb.StatusClient, *stop.Stopper, error) {
 	conn, stopper, err := getGRPCConn()
 	if err != nil {
 		return nil, nil, err
 	}
-	return server.NewStatusClient(conn), stopper, nil
+	return serverpb.NewStatusClient(conn), stopper, nil
 }

@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/acceptance/cluster"
-	"github.com/cockroachdb/cockroach/server"
+	"github.com/cockroachdb/cockroach/server/serverpb"
 	"github.com/cockroachdb/cockroach/util"
 )
 
@@ -32,17 +32,17 @@ func TestBuildInfo(t *testing.T) {
 func testBuildInfoInner(t *testing.T, c cluster.Cluster, cfg cluster.TestConfig) {
 	checkGossip(t, c, 20*time.Second, hasPeers(c.NumNodes()))
 
-	var r server.DetailsResponse
+	var details serverpb.DetailsResponse
 	util.SucceedsSoon(t, func() error {
 		select {
 		case <-stopper:
 			t.Fatalf("interrupted")
 		default:
 		}
-		return getJSON(c.URL(0), "/_status/details/local", &r)
+		return util.GetJSON(cluster.HTTPClient, c.URL(0)+"/_status/details/local", &details)
 	})
 
-	bi := r.BuildInfo
+	bi := details.BuildInfo
 	testData := map[string]string{
 		"go_version":   bi.GoVersion,
 		"tag":          bi.Tag,

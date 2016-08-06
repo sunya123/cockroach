@@ -28,10 +28,13 @@ import (
 	"github.com/cockroachdb/cockroach/config"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/server"
 	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/storage/engine"
+	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/util/encoding"
 	"github.com/cockroachdb/cockroach/util/envutil"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/stop"
 	"github.com/cockroachdb/cockroach/util/timeutil"
 	"github.com/coreos/etcd/raft/raftpb"
@@ -60,11 +63,22 @@ func parseRangeID(arg string) (roachpb.RangeID, error) {
 	return roachpb.RangeID(rangeIDInt), nil
 }
 
-func openStore(cmd *cobra.Command, dir string, stopper *stop.Stopper) (engine.Engine, error) {
-	setDefaultCacheSize(&cliContext.Context)
-
-	db := engine.NewRocksDB(roachpb.Attributes{}, dir,
-		cliContext.CacheSize, cliContext.MemtableBudget, 0, stopper)
+func openStore(cmd *cobra.Command, dir string, stopper *stop.Stopper) (*engine.RocksDB, error) {
+	cache := engine.NewRocksDBCache(512 << 20)
+	defer cache.Release()
+	maxOpenFiles, err := server.SetOpenFileLimitForOneStore()
+	if err != nil {
+		return nil, err
+	}
+	db := engine.NewRocksDB(
+		roachpb.Attributes{},
+		dir,
+		cache,
+		10<<20,
+		0,
+		maxOpenFiles,
+		stopper,
+	)
 	if err := db.Open(); err != nil {
 		return nil, err
 	}
@@ -72,18 +86,31 @@ func openStore(cmd *cobra.Command, dir string, stopper *stop.Stopper) (engine.En
 }
 
 func printKey(kv engine.MVCCKeyValue) (bool, error) {
-	fmt.Printf("%q\n", kv.Key)
-
+	fmt.Printf("%s", kv.Key)
+	if debugCtx.sizes {
+		fmt.Printf(" %d %d", len(kv.Key.Key), len(kv.Value))
+	}
+	fmt.Printf("\n")
 	return false, nil
 }
 
 func printKeyValue(kv engine.MVCCKeyValue) (bool, error) {
-	if kv.Key.Timestamp != roachpb.ZeroTimestamp {
-		fmt.Printf("%s %q: ", kv.Key.Timestamp, kv.Key.Key)
+	if kv.Key.Timestamp != hlc.ZeroTimestamp {
+		fmt.Printf("%s %s: ", kv.Key.Timestamp, kv.Key.Key)
 	} else {
-		fmt.Printf("%q: ", kv.Key.Key)
+		fmt.Printf("%s: ", kv.Key.Key)
 	}
-	for _, decoder := range []func(kv engine.MVCCKeyValue) (string, error){tryRaftLogEntry, tryRangeDescriptor, tryMeta, tryAbort, tryTxn} {
+	if debugCtx.sizes {
+		fmt.Printf("%d %d: ", len(kv.Key.Key), len(kv.Value))
+	}
+	decoders := []func(kv engine.MVCCKeyValue) (string, error){
+		tryRaftLogEntry,
+		tryRangeDescriptor,
+		tryMeta,
+		tryTxn,
+		tryRangeIDKey,
+	}
+	for _, decoder := range decoders {
 		out, err := decoder(kv)
 		if err != nil {
 			continue
@@ -101,7 +128,7 @@ func runDebugKeys(cmd *cobra.Command, args []string) error {
 	defer stopper.Stop()
 
 	if len(args) != 1 {
-		return errors.New("one argument is required")
+		return errors.New("one argument required: dir")
 	}
 
 	db, err := openStore(cmd, args[0], stopper)
@@ -109,101 +136,61 @@ func runDebugKeys(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	d := cliContext.debug
-
-	from := engine.NilKey
-	to := engine.MVCCKeyMax
-	if d.raw {
-		if len(d.startKey) > 0 {
-			from = engine.MakeMVCCMetadataKey(roachpb.Key(d.startKey))
-		}
-		if len(d.endKey) > 0 {
-			to = engine.MakeMVCCMetadataKey(roachpb.Key(d.endKey))
-		}
-	} else {
-		if len(d.startKey) > 0 {
-			startKey, err := keys.UglyPrint(d.startKey)
-			if err != nil {
-				return err
-			}
-			from = engine.MakeMVCCMetadataKey(startKey)
-		}
-		if len(d.endKey) > 0 {
-			endKey, err := keys.UglyPrint(d.endKey)
-			if err != nil {
-				return err
-			}
-			to = engine.MakeMVCCMetadataKey(endKey)
-		}
-	}
-
 	printer := printKey
-	if d.values {
+	if debugCtx.values {
 		printer = printKeyValue
 	}
 
-	if err := db.Iterate(from, to, printer); err != nil {
+	if err := db.Iterate(debugCtx.startKey, debugCtx.endKey, printer); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-var debugSplitKeyCmd = &cobra.Command{
-	Use:   "split-key [directory] [rangeid]",
-	Short: "Compute a split key for the given key range",
+var debugRangeDataCmd = &cobra.Command{
+	Use:   "range-data [directory] range-id",
+	Short: "dump all the data in a range",
 	Long: `
-Runs MVCCFindSplitKey on the given key range and prints debug information
-and the obtained split key.
+Pretty-prints all keys and values in a range. This includes all data covered
+by the consistency checker.
 `,
-	RunE: runDebugSplitKey,
+	RunE: runDebugRangeData,
 }
 
-func runDebugSplitKey(cmd *cobra.Command, args []string) error {
+func runDebugRangeData(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 
 	if len(args) != 2 {
-		return errors.New("store and rangeID must be specified")
+		return errors.New("two arguments required: dir range_id")
 	}
 
 	db, err := openStore(cmd, args[0], stopper)
 	if err != nil {
 		return err
 	}
+
 	rangeID, err := parseRangeID(args[1])
 	if err != nil {
 		return err
 	}
 
-	snap := db.NewSnapshot()
-	defer snap.Close()
-
-	var desc roachpb.RangeDescriptor
-	if err := storage.IterateRangeDescriptors(snap, func(descInside roachpb.RangeDescriptor) (bool, error) {
-		if descInside.RangeID == rangeID {
-			desc = descInside
-			return true, nil
-		}
-		return false, nil
-	}); err != nil {
+	desc, err := loadRangeDescriptor(db, rangeID)
+	if err != nil {
 		return err
 	}
 
-	if desc.RangeID != rangeID {
-		return fmt.Errorf("range %d not found", rangeID)
-	}
-
-	if splitKey, err := engine.MVCCFindSplitKey(context.Background(), snap, rangeID,
-		desc.StartKey, desc.EndKey, func(msg string, args ...interface{}) {
-			fmt.Printf(msg+"\n", args...)
+	iter := storage.NewReplicaDataIterator(&desc, db, true)
+	for ; iter.Valid(); iter.Next() {
+		if _, err := printKeyValue(engine.MVCCKeyValue{
+			Key:   iter.Key(),
+			Value: iter.Value(),
 		}); err != nil {
-		fmt.Println("No SplitKey found:", err)
-	} else {
-		fmt.Println("Computed SplitKey:", splitKey)
+			return err
+		}
 	}
-
-	return nil
+	return iter.Error()
 }
 
 var debugRangeDescriptorsCmd = &cobra.Command{
@@ -236,7 +223,7 @@ func tryMeta(kv engine.MVCCKeyValue) (string, error) {
 }
 
 func maybeUnmarshalInline(v []byte, dest proto.Message) error {
-	var meta engine.MVCCMetadata
+	var meta enginepb.MVCCMetadata
 	if err := meta.Unmarshal(v); err != nil {
 		return err
 	}
@@ -254,34 +241,103 @@ func tryTxn(kv engine.MVCCKeyValue) (string, error) {
 	return txn.String() + "\n", nil
 }
 
-func tryAbort(kv engine.MVCCKeyValue) (string, error) {
-	if kv.Key.Timestamp != roachpb.ZeroTimestamp {
-		return "", errors.New("not an abort cache key")
+func tryRangeIDKey(kv engine.MVCCKeyValue) (string, error) {
+	if kv.Key.Timestamp != hlc.ZeroTimestamp {
+		return "", fmt.Errorf("range ID keys shouldn't have timestamps: %s", kv.Key)
 	}
-	_, err := keys.DecodeAbortCacheKey(kv.Key.Key, nil)
+	_, _, suffix, _, err := keys.DecodeRangeIDKey(kv.Key.Key)
 	if err != nil {
 		return "", err
 	}
-	var dest roachpb.AbortCacheEntry
-	if err := maybeUnmarshalInline(kv.Value, &dest); err != nil {
+
+	// All range ID keys are stored inline on the metadata.
+	var meta enginepb.MVCCMetadata
+	if err := meta.Unmarshal(kv.Value); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("key=%q, pri=%d\n", dest.Key, dest.Priority), nil
+	value := roachpb.Value{RawBytes: meta.RawBytes}
+
+	// Values encoded as protobufs set msg and continue outside the
+	// switch. Other types are handled inside the switch and return.
+	var msg proto.Message
+	switch {
+	case bytes.Equal(suffix, keys.LocalLeaseAppliedIndexSuffix):
+		fallthrough
+	case bytes.Equal(suffix, keys.LocalRaftAppliedIndexSuffix):
+		i, err := value.GetInt()
+		if err != nil {
+			return "", err
+		}
+		return strconv.FormatInt(i, 10), nil
+
+	case bytes.Equal(suffix, keys.LocalRangeFrozenStatusSuffix):
+		b, err := value.GetBool()
+		if err != nil {
+			return "", err
+		}
+		return strconv.FormatBool(b), nil
+
+	case bytes.Equal(suffix, keys.LocalAbortCacheSuffix):
+		msg = &roachpb.AbortCacheEntry{}
+
+	case bytes.Equal(suffix, keys.LocalRangeLastGCSuffix):
+		msg = &hlc.Timestamp{}
+
+	case bytes.Equal(suffix, keys.LocalRaftTombstoneSuffix):
+		msg = &roachpb.RaftTombstone{}
+
+	case bytes.Equal(suffix, keys.LocalRaftTruncatedStateSuffix):
+		msg = &roachpb.RaftTruncatedState{}
+
+	case bytes.Equal(suffix, keys.LocalRangeLeaseSuffix):
+		msg = &roachpb.Lease{}
+
+	case bytes.Equal(suffix, keys.LocalRangeStatsSuffix):
+		msg = &enginepb.MVCCStats{}
+
+	case bytes.Equal(suffix, keys.LocalRaftHardStateSuffix):
+		msg = &raftpb.HardState{}
+
+	case bytes.Equal(suffix, keys.LocalRaftLastIndexSuffix):
+		i, err := value.GetInt()
+		if err != nil {
+			return "", err
+		}
+		return strconv.FormatInt(i, 10), nil
+
+	case bytes.Equal(suffix, keys.LocalRangeLastVerificationTimestampSuffix):
+		msg = &hlc.Timestamp{}
+
+	case bytes.Equal(suffix, keys.LocalRangeLastReplicaGCTimestampSuffix):
+		msg = &hlc.Timestamp{}
+
+	default:
+		return "", fmt.Errorf("unknown raft id key %s", suffix)
+	}
+
+	if err := value.GetProto(msg); err != nil {
+		return "", err
+	}
+	return msg.String(), nil
+}
+
+func checkRangeDescriptorKey(key engine.MVCCKey) error {
+	_, suffix, _, err := keys.DecodeRangeKey(key.Key)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(suffix, keys.LocalRangeDescriptorSuffix) {
+		return fmt.Errorf("wrong suffix: %s", suffix)
+	}
+	return nil
 }
 
 func tryRangeDescriptor(kv engine.MVCCKeyValue) (string, error) {
-	_, suffix, _, err := keys.DecodeRangeKey(kv.Key.Key)
-	if err != nil {
+	if err := checkRangeDescriptorKey(kv.Key); err != nil {
 		return "", err
 	}
-	if !bytes.Equal(suffix, keys.LocalRangeDescriptorSuffix) {
-		return "", fmt.Errorf("wrong suffix: %s", suffix)
-	}
-	value := roachpb.Value{
-		RawBytes: kv.Value,
-	}
 	var desc roachpb.RangeDescriptor
-	if err := value.GetProto(&desc); err != nil {
+	if err := getProtoValue(kv.Value, &desc); err != nil {
 		return "", err
 	}
 	return descStr(desc), nil
@@ -294,12 +350,53 @@ func printRangeDescriptor(kv engine.MVCCKeyValue) (bool, error) {
 	return false, nil
 }
 
+func getProtoValue(data []byte, msg proto.Message) error {
+	value := roachpb.Value{
+		RawBytes: data,
+	}
+	return value.GetProto(msg)
+}
+
+func loadRangeDescriptor(
+	db engine.Engine, rangeID roachpb.RangeID,
+) (roachpb.RangeDescriptor, error) {
+	var desc roachpb.RangeDescriptor
+	handleKV := func(kv engine.MVCCKeyValue) (bool, error) {
+		if kv.Key.Timestamp == hlc.ZeroTimestamp {
+			// We only want values, not MVCCMetadata.
+			return false, nil
+		}
+		if err := checkRangeDescriptorKey(kv.Key); err != nil {
+			// Range descriptor keys are interleaved with others, so if it
+			// doesn't parse as a range descriptor just skip it.
+			return false, nil
+		}
+		if err := getProtoValue(kv.Value, &desc); err != nil {
+			return false, err
+		}
+		return desc.RangeID == rangeID, nil
+	}
+
+	// Range descriptors are stored by key, so we have to scan over the
+	// range-local data to find the one for this RangeID.
+	start := engine.MakeMVCCMetadataKey(keys.LocalRangePrefix)
+	end := engine.MakeMVCCMetadataKey(keys.LocalRangeMax)
+
+	if err := db.Iterate(start, end, handleKV); err != nil {
+		return roachpb.RangeDescriptor{}, err
+	}
+	if desc.RangeID == rangeID {
+		return desc, nil
+	}
+	return roachpb.RangeDescriptor{}, fmt.Errorf("range descriptor %d not found", rangeID)
+}
+
 func runDebugRangeDescriptors(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 
 	if len(args) != 1 {
-		return errors.New("one argument is required")
+		return errors.New("one argument required: dir")
 	}
 
 	db, err := openStore(cmd, args[0], stopper)
@@ -310,10 +407,7 @@ func runDebugRangeDescriptors(cmd *cobra.Command, args []string) error {
 	start := engine.MakeMVCCMetadataKey(keys.LocalRangePrefix)
 	end := engine.MakeMVCCMetadataKey(keys.LocalRangeMax)
 
-	if err := db.Iterate(start, end, printRangeDescriptor); err != nil {
-		return err
-	}
-	return nil
+	return db.Iterate(start, end, printRangeDescriptor)
 }
 
 var debugRaftLogCmd = &cobra.Command{
@@ -374,7 +468,7 @@ func runDebugRaftLog(cmd *cobra.Command, args []string) error {
 	defer stopper.Stop()
 
 	if len(args) != 2 {
-		return errors.New("required arguments: dir range_id")
+		return errors.New("two arguments required: dir range_id")
 	}
 
 	db, err := openStore(cmd, args[0], stopper)
@@ -390,10 +484,7 @@ func runDebugRaftLog(cmd *cobra.Command, args []string) error {
 	start := engine.MakeMVCCMetadataKey(keys.RaftLogPrefix(rangeID))
 	end := engine.MakeMVCCMetadataKey(keys.RaftLogPrefix(rangeID).PrefixEnd())
 
-	if err := db.Iterate(start, end, printRaftLogEntry); err != nil {
-		return err
-	}
-	return nil
+	return db.Iterate(start, end, printRaftLogEntry)
 }
 
 var debugGCCmd = &cobra.Command{
@@ -416,7 +507,7 @@ func runDebugGCCmd(cmd *cobra.Command, args []string) error {
 	defer stopper.Stop()
 
 	if len(args) != 1 {
-		return errors.New("required arguments: dir")
+		return errors.New("one argument required: dir")
 	}
 
 	var rangeID roachpb.RangeID
@@ -437,7 +528,7 @@ func runDebugGCCmd(cmd *cobra.Command, args []string) error {
 
 	var descs []roachpb.RangeDescriptor
 
-	if _, err := engine.MVCCIterate(context.Background(), db, start, end, roachpb.MaxTimestamp,
+	if _, err := engine.MVCCIterate(context.Background(), db, start, end, hlc.MaxTimestamp,
 		false /* !consistent */, nil, /* txn */
 		false /* !reverse */, func(kv roachpb.KeyValue) (bool, error) {
 			var desc roachpb.RangeDescriptor
@@ -466,8 +557,8 @@ func runDebugGCCmd(cmd *cobra.Command, args []string) error {
 	for _, desc := range descs {
 		snap := db.NewSnapshot()
 		defer snap.Close()
-		_, info, err := storage.RunGC(context.Background(), &desc, snap, roachpb.Timestamp{WallTime: timeutil.Now().UnixNano()},
-			config.GCPolicy{TTLSeconds: 24 * 60 * 60 /* 1 day */}, func(_ roachpb.Timestamp, _ *roachpb.Transaction, _ roachpb.PushTxnType) {
+		_, info, err := storage.RunGC(context.Background(), &desc, snap, hlc.Timestamp{WallTime: timeutil.Now().UnixNano()},
+			config.GCPolicy{TTLSeconds: 24 * 60 * 60 /* 1 day */}, func(_ hlc.Timestamp, _ *roachpb.Transaction, _ roachpb.PushTxnType) {
 			}, func(_ []roachpb.Intent, _, _ bool) error { return nil })
 		if err != nil {
 			return err
@@ -502,7 +593,7 @@ func runDebugCheckStoreCmd(cmd *cobra.Command, args []string) error {
 	defer stopper.Stop()
 
 	if len(args) != 1 {
-		return errors.New("required arguments: dir")
+		return errors.New("one required argument: dir")
 	}
 
 	db, err := openStore(cmd, args[0], stopper)
@@ -523,7 +614,7 @@ func runDebugCheckStoreCmd(cmd *cobra.Command, args []string) error {
 		return replicaInfo[rangeID]
 	}
 
-	if _, err := engine.MVCCIterate(context.Background(), db, start, end, roachpb.MaxTimestamp,
+	if _, err := engine.MVCCIterate(context.Background(), db, start, end, hlc.MaxTimestamp,
 		false /* !consistent */, nil, /* txn */
 		false /* !reverse */, func(kv roachpb.KeyValue) (bool, error) {
 			rangeID, _, suffix, detail, err := keys.DecodeRangeIDKey(kv.Key)
@@ -593,17 +684,88 @@ Output environment variables that influence configuration.
 	},
 }
 
+var debugCompactCmd = &cobra.Command{
+	Use:   "compact [directory]",
+	Short: "compact the sstables in a store",
+	Long: `
+Compact the sstables in a store.
+`,
+	RunE: runDebugCompact,
+}
+
+func runDebugCompact(cmd *cobra.Command, args []string) error {
+	stopper := stop.NewStopper()
+	defer stopper.Stop()
+
+	if len(args) != 1 {
+		return errors.New("one argument is required")
+	}
+
+	db, err := openStore(cmd, args[0], stopper)
+	if err != nil {
+		return err
+	}
+
+	return db.Compact()
+}
+
+var debugSSTablesCmd = &cobra.Command{
+	Use:   "sstables [directory]",
+	Short: "list the sstables in a store",
+	Long: `
+
+List the sstables in a store. The output format is 1 or more lines of:
+
+  level [ total size #files ]: file sizes
+
+Only non-empty levels are shown. For levels greater than 0, the files span
+non-overlapping ranges of the key space. Level-0 is special in that sstables
+are created there by flushing the mem-table, thus every level-0 sstable must be
+consulted to see if it contains a particular key. Within a level, the file
+sizes are displayed in decreasing order and bucketed by the number of files of
+that size. The following example shows 3-level output. In Level-3, there are 19
+total files and 14 files that are 129 MiB in size.
+
+  1 [   8M  3 ]: 7M 1M 63K
+  2 [ 110M  7 ]: 31M 30M 13M[2] 10M 8M 5M
+  3 [   2G 19 ]: 129M[14] 122M 93M 24M 18M 9M
+
+The suffixes K, M, G and T are used for terseness to represent KiB, MiB, GiB
+and TiB.
+`,
+	RunE: runDebugSSTables,
+}
+
+func runDebugSSTables(cmd *cobra.Command, args []string) error {
+	stopper := stop.NewStopper()
+	defer stopper.Stop()
+
+	if len(args) != 1 {
+		return errors.New("one argument is required")
+	}
+
+	db, err := openStore(cmd, args[0], stopper)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("%s", db.GetSSTables())
+	return nil
+}
+
 func init() {
 	debugCmd.AddCommand(debugCmds...)
 }
 
 var debugCmds = []*cobra.Command{
 	debugKeysCmd,
+	debugRangeDataCmd,
 	debugRangeDescriptorsCmd,
 	debugRaftLogCmd,
 	debugGCCmd,
-	debugSplitKeyCmd,
 	debugCheckStoreCmd,
+	debugCompactCmd,
+	debugSSTablesCmd,
 	kvCmd,
 	rangeCmd,
 	debugEnvCmd,

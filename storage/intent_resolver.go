@@ -18,18 +18,19 @@
 package storage
 
 import (
-	"fmt"
 	"sync"
 
 	"github.com/cockroachdb/cockroach/base"
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/syncutil"
 	"github.com/cockroachdb/cockroach/util/tracing"
 	"github.com/cockroachdb/cockroach/util/uuid"
 	"github.com/opentracing/opentracing-go"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
 
@@ -48,7 +49,7 @@ type intentResolver struct {
 	sem chan struct{} // Semaphore to limit async goroutines.
 
 	mu struct {
-		sync.Mutex
+		syncutil.Mutex
 		// Maps transaction ids to a refcount.
 		inFlight map[uuid.UUID]int
 	}
@@ -82,7 +83,7 @@ func (ir *intentResolver) processWriteIntentError(ctx context.Context,
 	}
 
 	if log.V(6) {
-		log.Infoc(ctx, "resolving write intent %s", wiErr)
+		log.Infof(ctx, "resolving write intent %s", wiErr)
 	}
 
 	method := args.Method()
@@ -96,12 +97,18 @@ func (ir *intentResolver) processWriteIntentError(ctx context.Context,
 		// usually be returned here, although there are some cases
 		// when they may be (especially when a test cluster is in
 		// the process of shutting down).
-		log.Warningf("asynchronous resolveIntents failed: %s", resErr)
+		log.Warningf(ctx, "asynchronous resolveIntents failed: %s", resErr)
 	}
 
 	if pushErr != nil {
 		if log.V(1) {
-			log.Infoc(ctx, "on %s: %s", method, pushErr)
+			log.Infof(ctx, "on %s: %s", method, pushErr)
+		}
+
+		if _, isExpected := pushErr.GetDetail().(*roachpb.TransactionPushError); !isExpected {
+			// If an unexpected error occurred, make sure it bubbles up to the
+			// client. Examples are timeouts and logic errors.
+			return pushErr
 		}
 
 		// For write/write conflicts within a transaction, propagate the
@@ -163,7 +170,7 @@ func (ir *intentResolver) maybePushTransactions(
 	// txn with only the priority set. This is official usage of PushTxn.
 	if partialPusherTxn == nil {
 		partialPusherTxn = &roachpb.Transaction{
-			TxnMeta: roachpb.TxnMeta{
+			TxnMeta: enginepb.TxnMeta{
 				Priority: roachpb.MakePriority(h.UserPriority),
 			},
 		}
@@ -187,7 +194,7 @@ func (ir *intentResolver) maybePushTransactions(
 			// Another goroutine is working on this transaction so we can
 			// skip it.
 			if log.V(1) {
-				log.Infof("skipping PushTxn for %s; attempt already in flight", intent.Txn.ID)
+				log.Infof(ctx, "skipping PushTxn for %s; attempt already in flight", intent.Txn.ID)
 			}
 			continue
 		} else {
@@ -197,7 +204,7 @@ func (ir *intentResolver) maybePushTransactions(
 	}
 	ir.mu.Unlock()
 	if len(nonPendingIntents) > 0 {
-		return nil, roachpb.NewError(util.Errorf("unexpected aborted/resolved intents: %+v",
+		return nil, roachpb.NewError(errors.Errorf("unexpected aborted/resolved intents: %+v",
 			nonPendingIntents))
 	}
 
@@ -261,12 +268,12 @@ func (ir *intentResolver) processIntentsAsync(r *Replica, intents []intentsWithA
 		return
 	}
 	now := r.store.Clock().Now()
-	ctx := r.context(context.TODO())
+	ctx := context.TODO()
 	stopper := r.store.Stopper()
 
 	for _, item := range intents {
 		if item.args.Method() != roachpb.EndTransaction {
-			stopper.RunLimitedAsyncTask(ir.sem, func() {
+			if err := stopper.RunLimitedAsyncTask(ir.sem, func() {
 				// Everything here is best effort; give up rather than waiting
 				// too long (helps avoid deadlocks during test shutdown,
 				// although this is imperfect due to the use of an
@@ -292,16 +299,19 @@ func (ir *intentResolver) processIntentsAsync(r *Replica, intents []intentsWithA
 				// poison.
 				if err := ir.resolveIntents(ctxWithTimeout, r, resolveIntents,
 					true /* wait */, true /* poison */); err != nil {
-					log.Warningc(ctxWithTimeout, "failed to resolve intents: %s", err)
+					log.Warningf(context.TODO(), "%s: failed to resolve intents: %s", r, err)
 					return
 				}
 				if pushErr != nil {
-					log.Warningc(ctxWithTimeout, "failed to push during intent resolution: %s", pushErr)
+					log.Warningf(context.TODO(), "%s: failed to push during intent resolution: %s", r, pushErr)
 					return
 				}
-			})
+			}); err != nil {
+				log.Warningf(context.TODO(), "failed to resolve intents: %s", err)
+				return
+			}
 		} else { // EndTransaction
-			stopper.RunLimitedAsyncTask(ir.sem, func() {
+			if err := stopper.RunLimitedAsyncTask(ir.sem, func() {
 				ctxWithTimeout, cancel := context.WithTimeout(ctx, base.NetworkTimeout)
 				defer cancel()
 
@@ -315,7 +325,7 @@ func (ir *intentResolver) processIntentsAsync(r *Replica, intents []intentsWithA
 				// not make it back to the client.
 				if err := ir.resolveIntents(ctxWithTimeout, r, item.intents,
 					true /* wait */, false /* !poison */); err != nil {
-					log.Warningc(ctxWithTimeout, "failed to resolve intents: %s", err)
+					log.Warningf(context.TODO(), "%s: failed to resolve intents: %s", r, err)
 					return
 				}
 
@@ -327,8 +337,8 @@ func (ir *intentResolver) processIntentsAsync(r *Replica, intents []intentsWithA
 				txn := item.intents[0].Txn
 				gcArgs := roachpb.GCRequest{
 					Span: roachpb.Span{
-						Key:    r.Desc().StartKey.AsRawKey(),
-						EndKey: r.Desc().EndKey.AsRawKey(),
+						Key:    txn.Key,
+						EndKey: roachpb.Key(txn.Key).Next(),
 					},
 				}
 				gcArgs.Keys = append(gcArgs.Keys, roachpb.GCRequest_GCKey{
@@ -336,9 +346,12 @@ func (ir *intentResolver) processIntentsAsync(r *Replica, intents []intentsWithA
 				})
 				ba.Add(&gcArgs)
 				if _, pErr := r.addWriteCmd(ctxWithTimeout, ba, nil /* nil */); pErr != nil {
-					log.Warningf("could not GC completed transaction: %s", pErr)
+					log.Warningf(context.TODO(), "could not GC completed transaction: %s", pErr)
 				}
-			})
+			}); err != nil {
+				log.Warningf(context.TODO(), "failed to resolve intents: %s", err)
+				return
+			}
 		}
 	}
 }
@@ -360,7 +373,7 @@ func (ir *intentResolver) resolveIntents(ctx context.Context, r *Replica,
 	// We're doing async stuff below; those need new traces.
 	ctx, cleanup := tracing.EnsureContext(ctx, ir.store.Tracer())
 	defer cleanup()
-	log.Trace(ctx, fmt.Sprintf("resolving intents [wait=%t]", wait))
+	log.Tracef(ctx, "resolving intents [wait=%t]", wait)
 
 	var reqsRemote []roachpb.Request
 	baLocal := roachpb.BatchRequest{}
@@ -401,13 +414,7 @@ func (ir *intentResolver) resolveIntents(ctx context.Context, r *Replica,
 	// The local batch goes directly to Raft.
 	var wg sync.WaitGroup
 	if len(baLocal.Requests) > 0 {
-		action := func() error {
-			// Trace this under the ID of the intent owner.
-			// Create a new span though, since we do not want to pass a span
-			// between goroutines or we risk use-after-finish.
-			sp := r.store.Tracer().StartSpan("resolve intents")
-			defer sp.Finish()
-			ctx = opentracing.ContextWithSpan(ctx, sp)
+		action := func(ctx context.Context) error {
 			// Always operate with a timeout when resolving intents: this
 			// prevents rare shutdown timeouts in tests.
 			ctxWithTimeout, cancel := context.WithTimeout(ctx, base.NetworkTimeout)
@@ -416,16 +423,24 @@ func (ir *intentResolver) resolveIntents(ctx context.Context, r *Replica,
 			return pErr.GoError()
 		}
 		wg.Add(1)
-		if wait || !r.store.Stopper().RunLimitedAsyncTask(ir.sem, func() {
-			if err := action(); err != nil {
-				log.Warningf("unable to resolve local intents; %s", err)
+		if wait || r.store.Stopper().RunLimitedAsyncTask(ir.sem, func() {
+			// Trace this under the ID of the intent owner.
+			// Create a new span though, since we do not want to pass a span
+			// between goroutines or we risk use-after-finish.
+			sp := r.store.Tracer().StartSpan("resolve intents")
+			defer sp.Finish()
+			spanCtx := opentracing.ContextWithSpan(ctx, sp)
+
+			if err := action(spanCtx); err != nil {
+				log.Warningf(spanCtx, "unable to resolve local intents; %s", err)
 			}
-		}) {
+		}) != nil {
 			// Still run the task when draining. Our caller already has a task and
 			// going async here again is merely for performance, but some intents
 			// need to be resolved because they might block other tasks. See #1684.
 			// Note that handleSkippedIntents has a TODO in case #1684 comes back.
-			if err := action(); err != nil {
+			// TODO(tschottdorf): This is ripe for removal.
+			if err := action(ctx); err != nil {
 				return err
 			}
 		}
@@ -439,13 +454,14 @@ func (ir *intentResolver) resolveIntents(ctx context.Context, r *Replica,
 			// TODO(tschottdorf): no tracing here yet.
 			return r.store.DB().Run(b)
 		}
-		if wait || !r.store.Stopper().RunLimitedAsyncTask(ir.sem, func() {
+		if wait || r.store.Stopper().RunLimitedAsyncTask(ir.sem, func() {
 			if err := action(); err != nil {
-				log.Warningf("unable to resolve external intents: %s", err)
+				log.Warningf(ctx, "unable to resolve external intents: %s", err)
 			}
-		}) {
+		}) != nil {
 			// As with local intents, try async to not keep the caller waiting, but
 			// when draining just go ahead and do it synchronously. See #1684.
+			// TODO(tschottdorf): This is ripe for removal.
 			if err := action(); err != nil {
 				return err
 			}

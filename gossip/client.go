@@ -19,7 +19,9 @@ package gossip
 import (
 	"fmt"
 	"net"
+	"time"
 
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/roachpb"
@@ -27,16 +29,21 @@ import (
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/grpcutil"
 	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/metric"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 // client is a client-side RPC connection to a gossip peer node.
 type client struct {
+	createdAt             time.Time
 	peerID                roachpb.NodeID           // Peer node ID; 0 until first gossip response
 	addr                  net.Addr                 // Peer node network address
 	forwardAddr           *util.UnresolvedAddr     // Set if disconnected with an alternate addr
 	remoteHighWaterStamps map[roachpb.NodeID]int64 // Remote server's high water timestamps
 	closer                chan struct{}            // Client shutdown channel
+	clientMetrics         metrics
+	nodeMetrics           metrics
 }
 
 // extractKeys returns a string representation of a gossip delta's keys.
@@ -49,18 +56,24 @@ func extractKeys(delta map[string]*Info) string {
 }
 
 // newClient creates and returns a client struct.
-func newClient(addr net.Addr) *client {
+func newClient(addr net.Addr, nodeMetrics metrics) *client {
 	return &client{
-		addr: addr,
+		createdAt: timeutil.Now(),
+		addr:      addr,
 		remoteHighWaterStamps: map[roachpb.NodeID]int64{},
 		closer:                make(chan struct{}),
+		clientMetrics:         makeMetrics(metric.NewRegistry()),
+		nodeMetrics:           nodeMetrics,
 	}
 }
 
 // start dials the remote addr and commences gossip once connected. Upon exit,
 // the client is sent on the disconnected channel. This method starts client
 // processing in a goroutine and returns immediately.
-func (c *client) start(g *Gossip, disconnected chan *client, ctx *rpc.Context, stopper *stop.Stopper) {
+func (c *client) start(g *Gossip, disconnected chan *client, rpcCtx *rpc.Context, stopper *stop.Stopper) {
+	ctx := context.TODO()
+	log.Infof(ctx, "starting client to %s", c.addr)
+
 	stopper.RunWorker(func() {
 		defer func() {
 			disconnected <- c
@@ -70,22 +83,22 @@ func (c *client) start(g *Gossip, disconnected chan *client, ctx *rpc.Context, s
 		// asynchronous from the caller's perspective, so the only effect of
 		// `WithBlock` here is blocking shutdown - at the time of this writing,
 		// that ends ups up making `kv` tests take twice as long.
-		conn, err := ctx.GRPCDial(c.addr.String())
+		conn, err := rpcCtx.GRPCDial(c.addr.String())
 		if err != nil {
-			log.Errorf("failed to dial: %v", err)
+			log.Errorf(ctx, "failed to dial: %s", err)
 			return
 		}
 
 		// Start gossiping.
-		if err := c.gossip(g, NewGossipClient(conn), stopper); err != nil {
+		if err := c.gossip(ctx, g, NewGossipClient(conn), stopper); err != nil {
 			if !grpcutil.IsClosedConnection(err) {
 				g.mu.Lock()
 				peerID := c.peerID
 				g.mu.Unlock()
 				if peerID != 0 {
-					log.Infof("closing client to node %d (%s): %s", peerID, c.addr, err)
+					log.Infof(ctx, "closing client to node %d (%s): %s", peerID, c.addr, err)
 				} else {
-					log.Infof("closing client to %s: %s", c.addr, err)
+					log.Infof(ctx, "closing client to %s: %s", c.addr, err)
 				}
 			}
 		}
@@ -94,7 +107,11 @@ func (c *client) start(g *Gossip, disconnected chan *client, ctx *rpc.Context, s
 
 // close stops the client gossip loop and returns immediately.
 func (c *client) close() {
-	close(c.closer)
+	select {
+	case <-c.closer:
+	default:
+		close(c.closer)
+	}
 }
 
 // requestGossip requests the latest gossip from the remote server by
@@ -108,6 +125,10 @@ func (c *client) requestGossip(g *Gossip, addr util.UnresolvedAddr, stream Gossi
 		HighWaterStamps: g.is.getHighWaterStamps(),
 	}
 	g.mu.Unlock()
+
+	bytesSent := int64(args.Size())
+	c.clientMetrics.bytesSent.Add(bytesSent)
+	c.nodeMetrics.bytesSent.Add(bytesSent)
 
 	return stream.Send(args)
 }
@@ -124,6 +145,17 @@ func (c *client) sendGossip(g *Gossip, addr util.UnresolvedAddr, stream Gossip_G
 			HighWaterStamps: g.is.getHighWaterStamps(),
 		}
 
+		bytesSent := int64(args.Size())
+		infosSent := int64(len(delta))
+		c.clientMetrics.bytesSent.Add(bytesSent)
+		c.clientMetrics.infosSent.Add(infosSent)
+		c.nodeMetrics.bytesSent.Add(bytesSent)
+		c.nodeMetrics.infosSent.Add(infosSent)
+
+		if log.V(1) {
+			log.Infof(context.TODO(), "node %d sending %s", g.is.NodeID, extractKeys(args.Delta))
+		}
+
 		g.mu.Unlock()
 		return stream.Send(&args)
 	}
@@ -137,15 +169,22 @@ func (c *client) handleResponse(g *Gossip, reply *Response) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
+	bytesReceived := int64(reply.Size())
+	infosReceived := int64(len(reply.Delta))
+	c.clientMetrics.bytesReceived.Add(bytesReceived)
+	c.clientMetrics.infosReceived.Add(infosReceived)
+	c.nodeMetrics.bytesReceived.Add(bytesReceived)
+	c.nodeMetrics.infosReceived.Add(infosReceived)
+
 	// Combine remote node's infostore delta with ours.
 	if reply.Delta != nil {
 		freshCount, err := g.is.combine(reply.Delta, reply.NodeID)
 		if err != nil {
-			log.Warningf("node %d failed to fully combine delta from node %d: %s", g.is.NodeID, reply.NodeID, err)
+			log.Warningf(context.TODO(), "node %d failed to fully combine delta from node %d: %s", g.is.NodeID, reply.NodeID, err)
 		}
 		if infoCount := len(reply.Delta); infoCount > 0 {
 			if log.V(1) {
-				log.Infof("node %d received %s from node %d (%d fresh)", g.is.NodeID, extractKeys(reply.Delta), reply.NodeID, freshCount)
+				log.Infof(context.TODO(), "node %d received %s from node %d (%d fresh)", g.is.NodeID, extractKeys(reply.Delta), reply.NodeID, freshCount)
 			}
 		}
 		g.maybeTighten()
@@ -157,17 +196,17 @@ func (c *client) handleResponse(g *Gossip, reply *Response) error {
 	// Handle remote forwarding.
 	if reply.AlternateAddr != nil {
 		if g.hasIncoming(reply.AlternateNodeID) || g.hasOutgoing(reply.AlternateNodeID) {
-			return util.Errorf("received forward from node %d to %d (%s); already have active connection, skipping",
+			return errors.Errorf("received forward from node %d to %d (%s); already have active connection, skipping",
 				reply.NodeID, reply.AlternateNodeID, reply.AlternateAddr)
 		}
 		// We try to resolve the address, but don't actually use the result.
 		// The certificates (if any) may only be valid for the unresolved
 		// address.
 		if _, err := reply.AlternateAddr.Resolve(); err != nil {
-			return util.Errorf("unable to resolve alternate address %s for node %d: %s", reply.AlternateAddr, reply.AlternateNodeID, err)
+			return errors.Errorf("unable to resolve alternate address %s for node %d: %s", reply.AlternateAddr, reply.AlternateNodeID, err)
 		}
 		c.forwardAddr = reply.AlternateAddr
-		return util.Errorf("received forward from node %d to %d (%s)", reply.NodeID, reply.AlternateNodeID, reply.AlternateAddr)
+		return errors.Errorf("received forward from node %d to %d (%s)", reply.NodeID, reply.AlternateNodeID, reply.AlternateAddr)
 	}
 
 	// If we have the sentinel gossip we're considered connected.
@@ -177,11 +216,11 @@ func (c *client) handleResponse(g *Gossip, reply *Response) error {
 	// being done by an incoming client, either because an outgoing
 	// matches an incoming or the client is connecting to itself.
 	if g.is.NodeID == c.peerID {
-		return util.Errorf("stopping outgoing client to node %d (%s); loopback connection", c.peerID, c.addr)
+		return errors.Errorf("stopping outgoing client to node %d (%s); loopback connection", c.peerID, c.addr)
 	} else if g.hasIncoming(c.peerID) && g.is.NodeID < c.peerID {
 		// To avoid mutual shutdown, we only shutdown our client if our
 		// node ID is less than the peer's.
-		return util.Errorf("stopping outgoing client to node %d (%s); already have incoming", c.peerID, c.addr)
+		return errors.Errorf("stopping outgoing client to node %d (%s); already have incoming", c.peerID, c.addr)
 	}
 
 	return nil
@@ -190,14 +229,14 @@ func (c *client) handleResponse(g *Gossip, reply *Response) error {
 // gossip loops, sending deltas of the infostore and receiving deltas
 // in turn. If an alternate is proposed on response, the client addr
 // is modified and method returns for forwarding by caller.
-func (c *client) gossip(g *Gossip, gossipClient GossipClient, stopper *stop.Stopper) error {
+func (c *client) gossip(ctx context.Context, g *Gossip, gossipClient GossipClient, stopper *stop.Stopper) error {
 	// For un-bootstrapped node, g.is.NodeID is 0 when client start gossip,
 	// so it's better to get nodeID from g.is every time.
 	g.mu.Lock()
 	addr := g.is.NodeAddr
 	g.mu.Unlock()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stream, err := gossipClient.Gossip(ctx)
 	if err != nil {
@@ -237,6 +276,8 @@ func (c *client) gossip(g *Gossip, gossipClient GossipClient, stopper *stop.Stop
 
 	for {
 		select {
+		case <-c.closer:
+			return nil
 		case <-stopper.ShouldStop():
 			return nil
 		case err := <-errCh:

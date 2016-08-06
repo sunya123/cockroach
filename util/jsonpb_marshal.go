@@ -18,14 +18,20 @@ package util
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"io"
+	"reflect"
 
-	gwruntime "github.com/gengo/grpc-gateway/runtime"
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
+	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
+	"github.com/pkg/errors"
 )
 
 var _ gwruntime.Marshaler = (*JSONPb)(nil)
+
+var typeProtoMessage = reflect.TypeOf((*proto.Message)(nil)).Elem()
 
 // JSONPb is a gwruntime.Marshaler that uses github.com/gogo/protobuf/jsonpb.
 type JSONPb jsonpb.Marshaler
@@ -37,6 +43,12 @@ func (*JSONPb) ContentType() string {
 
 // Marshal implements gwruntime.Marshaler.
 func (j *JSONPb) Marshal(v interface{}) ([]byte, error) {
+	return j.marshal(v)
+}
+
+// a lower-case version of marshal to allow for a call from
+// marshalNonProtoField without upsetting TestProtoMarshal().
+func (j *JSONPb) marshal(v interface{}) ([]byte, error) {
 	if pb, ok := v.(proto.Message); ok {
 		var buf bytes.Buffer
 		marshalFn := (*jsonpb.Marshaler)(j).Marshal
@@ -45,7 +57,43 @@ func (j *JSONPb) Marshal(v interface{}) ([]byte, error) {
 		}
 		return buf.Bytes(), nil
 	}
-	return nil, Errorf("unexpected type %T does not implement %s", v, typeProtoMessage)
+	return j.marshalNonProtoField(v)
+}
+
+// Cribbed verbatim from grpc-gateway.
+type protoEnum interface {
+	fmt.Stringer
+	EnumDescriptor() ([]byte, []int)
+}
+
+// Cribbed verbatim from grpc-gateway.
+func (j *JSONPb) marshalNonProtoField(v interface{}) ([]byte, error) {
+	rv := reflect.ValueOf(v)
+	for rv.Kind() == reflect.Ptr {
+		if rv.IsNil() {
+			return []byte("null"), nil
+		}
+		rv = rv.Elem()
+	}
+
+	if rv.Kind() == reflect.Map {
+		m := make(map[string]*json.RawMessage)
+		for _, k := range rv.MapKeys() {
+			buf, err := j.marshal(rv.MapIndex(k).Interface())
+			if err != nil {
+				return nil, err
+			}
+			m[fmt.Sprintf("%v", k.Interface())] = (*json.RawMessage)(&buf)
+		}
+		if j.Indent != "" {
+			return json.MarshalIndent(m, "", j.Indent)
+		}
+		return json.Marshal(m)
+	}
+	if enum, ok := rv.Interface().(protoEnum); ok && !j.EnumsAsInts {
+		return json.Marshal(enum.String())
+	}
+	return json.Marshal(rv.Interface())
 }
 
 // Unmarshal implements gwruntime.Marshaler.
@@ -53,7 +101,7 @@ func (j *JSONPb) Unmarshal(data []byte, v interface{}) error {
 	if pb, ok := v.(proto.Message); ok {
 		return jsonpb.Unmarshal(bytes.NewReader(data), pb)
 	}
-	return Errorf("unexpected type %T does not implement %s", v, typeProtoMessage)
+	return errors.Errorf("unexpected type %T does not implement %s", v, typeProtoMessage)
 }
 
 // NewDecoder implements gwruntime.Marshaler.
@@ -62,7 +110,7 @@ func (j *JSONPb) NewDecoder(r io.Reader) gwruntime.Decoder {
 		if pb, ok := v.(proto.Message); ok {
 			return jsonpb.Unmarshal(r, pb)
 		}
-		return Errorf("unexpected type %T does not implement %s", v, typeProtoMessage)
+		return errors.Errorf("unexpected type %T does not implement %s", v, typeProtoMessage)
 	})
 }
 
@@ -73,6 +121,6 @@ func (j *JSONPb) NewEncoder(w io.Writer) gwruntime.Encoder {
 			marshalFn := (*jsonpb.Marshaler)(j).Marshal
 			return marshalFn(w, pb)
 		}
-		return Errorf("unexpected type %T does not implement %s", v, typeProtoMessage)
+		return errors.Errorf("unexpected type %T does not implement %s", v, typeProtoMessage)
 	})
 }

@@ -21,12 +21,13 @@
 package hlc
 
 import (
-	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/roachpb"
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/syncutil"
 	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
@@ -50,8 +51,8 @@ type Clock struct {
 	physicalClock func() int64
 	// Clock contains a mutex used to lock the below
 	// fields while methods operate on them.
-	sync.Mutex
-	state roachpb.Timestamp
+	syncutil.Mutex
+	state Timestamp
 	// MaxOffset specifies how far ahead of the physical
 	// clock (and cluster time) the wall time can be.
 	// See SetMaxOffset.
@@ -139,7 +140,7 @@ func (c *Clock) MaxOffset() time.Duration {
 
 // Timestamp returns a copy of the clock's current timestamp,
 // without performing a clock adjustment.
-func (c *Clock) Timestamp() roachpb.Timestamp {
+func (c *Clock) Timestamp() Timestamp {
 	c.Lock()
 	defer c.Unlock()
 	return c.timestamp()
@@ -147,8 +148,8 @@ func (c *Clock) Timestamp() roachpb.Timestamp {
 
 // timestamp returns the state as a timestamp, without
 // a lock on the clock's state, for internal usage.
-func (c *Clock) timestamp() roachpb.Timestamp {
-	return roachpb.Timestamp{
+func (c *Clock) timestamp() Timestamp {
+	return Timestamp{
 		WallTime: c.state.WallTime,
 		Logical:  c.state.Logical,
 	}
@@ -163,7 +164,7 @@ func (c *Clock) getPhysicalClock() int64 {
 		interval := c.lastPhysicalTime - newTime
 		if interval > int64(c.maxOffset/10) {
 			c.monotonicityErrorsCount++
-			log.Warningf("backward time jump detected (%f seconds)", float64(newTime-c.lastPhysicalTime)/1e9)
+			log.Warningf(context.TODO(), "backward time jump detected (%f seconds)", float64(newTime-c.lastPhysicalTime)/1e9)
 		}
 	}
 
@@ -176,7 +177,7 @@ func (c *Clock) getPhysicalClock() int64 {
 // of the distributed network. This is the counterpart
 // of Update, which is passed a timestamp received from
 // another member of the distributed network.
-func (c *Clock) Now() roachpb.Timestamp {
+func (c *Clock) Now() Timestamp {
 	c.Lock()
 	defer c.Unlock()
 
@@ -215,7 +216,7 @@ func (c *Clock) PhysicalTime() time.Time {
 // in which case the state of the clock will not have been
 // altered.
 // To timestamp events of local origin, use Now instead.
-func (c *Clock) Update(rt roachpb.Timestamp) roachpb.Timestamp {
+func (c *Clock) Update(rt Timestamp) Timestamp {
 	c.Lock()
 	defer c.Unlock()
 	physicalClock := c.getPhysicalClock()
@@ -234,7 +235,7 @@ func (c *Clock) Update(rt roachpb.Timestamp) roachpb.Timestamp {
 	if rt.WallTime > c.state.WallTime {
 		offset := time.Duration(rt.WallTime-physicalClock) * time.Nanosecond
 		if c.maxOffset > 0 && offset > c.maxOffset {
-			log.Warningf("remote wall time is too far ahead (%s) to be trustworthy - updating anyway", offset)
+			log.Warningf(context.TODO(), "remote wall time is too far ahead (%s) to be trustworthy - updating anyway", offset)
 		}
 		// The remote clock is ahead of ours, and we update
 		// our own logical clock with theirs.

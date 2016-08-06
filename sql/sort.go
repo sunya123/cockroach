@@ -17,17 +17,36 @@
 package sql
 
 import (
+	"bytes"
 	"container/heap"
 	"fmt"
+	"math"
 	"strconv"
-	"strings"
+
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/encoding"
 	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/pkg/errors"
 )
+
+// sortNode represents a node that sorts the rows returned by its
+// sub-node.
+type sortNode struct {
+	ctx      context.Context
+	plan     planNode
+	columns  []ResultColumn
+	ordering sqlbase.ColumnOrdering
+
+	needSort     bool
+	sortStrategy sortingStrategy
+	valueIter    valueIterator
+
+	explain   explainMode
+	debugVals debugValues
+}
 
 // orderBy constructs a sortNode based on the ORDER BY clause.
 //
@@ -54,20 +73,13 @@ func (p *planner) orderBy(orderBy parser.OrderBy, n planNode) (*sortNode, error)
 	if s, ok := n.(*selectNode); ok {
 		numOriginalCols = s.numOriginalCols
 	}
-	var ordering columnOrdering
+	var ordering sqlbase.ColumnOrdering
 
 	for _, o := range orderBy {
 		index := -1
 
 		// Unwrap parenthesized expressions like "((a))" to "a".
-		expr := o.Expr
-		for {
-			if paren, ok := expr.(*parser.ParenExpr); ok {
-				expr = paren.Expr
-			} else {
-				break
-			}
-		}
+		expr := parser.StripParens(o.Expr)
 
 		if qname, ok := expr.(*parser.QualifiedName); ok {
 			if len(qname.Indirect) == 0 {
@@ -89,14 +101,14 @@ func (p *planner) orderBy(orderBy parser.OrderBy, n planNode) (*sortNode, error)
 				// render target that matches the column name. This handles cases like:
 				//
 				//   SELECT a AS b FROM t ORDER BY a
-				if err := qname.NormalizeColumnName(); err != nil {
+				colIdx, err := s.source.findUnaliasedColumn(qname)
+				if err != nil {
 					return nil, err
 				}
-				if qname.Table() == "" || sqlbase.EqualName(s.table.alias, qname.Table()) {
-					qnameCol := sqlbase.NormalizeName(qname.Column())
+				if colIdx != invalidColIdx {
 					for j, r := range s.render {
 						if qval, ok := r.(*qvalue); ok {
-							if sqlbase.NormalizeName(qval.colRef.get().Name) == qnameCol {
+							if qval.colRef.source == s.source.info && qval.colRef.colIdx == colIdx {
 								index = j
 								break
 							}
@@ -123,22 +135,22 @@ func (p *planner) orderBy(orderBy parser.OrderBy, n planNode) (*sortNode, error)
 				//
 				//   SELECT a FROM t ORDER by b
 				//   SELECT a, b FROM t ORDER by a+b
-				if err := s.addRender(parser.SelectExpr{Expr: expr}, parser.TypeInt); err != nil {
+				if err := s.addRender(parser.SelectExpr{Expr: expr}, nil); err != nil {
 					return nil, err
 				}
 				index = len(s.columns) - 1
 			} else {
-				return nil, util.Errorf("column %s does not exist", expr)
+				return nil, errors.Errorf("column %s does not exist", expr)
 			}
 		}
 		direction := encoding.Ascending
 		if o.Direction == parser.Descending {
 			direction = encoding.Descending
 		}
-		ordering = append(ordering, columnOrderInfo{index, direction})
+		ordering = append(ordering, sqlbase.ColumnOrderInfo{ColIdx: index, Direction: direction})
 	}
 
-	return &sortNode{columns: columns, ordering: ordering}, nil
+	return &sortNode{ctx: p.ctx(), columns: columns, ordering: ordering}, nil
 }
 
 // colIndex takes an expression that refers to a column using an integer, verifies it refers to a
@@ -166,20 +178,6 @@ func colIndex(numOriginalCols int, expr parser.Expr) (int, error) {
 		// expr doesn't look like a col index (i.e. not a constant).
 		return -1, nil
 	}
-}
-
-type sortNode struct {
-	plan     planNode
-	columns  []ResultColumn
-	ordering columnOrdering
-	err      error
-
-	needSort     bool
-	sortStrategy sortingStrategy
-	valueIter    valueIterator
-
-	explain   explainMode
-	debugVals debugValues
 }
 
 func (n *sortNode) Columns() []ResultColumn {
@@ -214,10 +212,6 @@ func (n *sortNode) DebugValues() debugValues {
 	return n.debugVals
 }
 
-func (n *sortNode) Err() error {
-	return n.err
-}
-
 func (n *sortNode) ExplainPlan(_ bool) (name, description string, children []planNode) {
 	if n.needSort {
 		name = "sort"
@@ -225,23 +219,20 @@ func (n *sortNode) ExplainPlan(_ bool) (name, description string, children []pla
 		name = "nosort"
 	}
 
-	columns := n.plan.Columns()
-	strs := make([]string, len(n.ordering))
-	for i, o := range n.ordering {
-		prefix := '+'
-		if o.direction == encoding.Descending {
-			prefix = '-'
-		}
-		strs[i] = fmt.Sprintf("%c%s", prefix, columns[o.colIdx].Name)
+	var buf bytes.Buffer
+	var columns []ResultColumn
+	if n.plan != nil {
+		columns = n.plan.Columns()
 	}
-	description = strings.Join(strs, ",")
+	n.Ordering().Format(&buf, columns)
 
 	switch ss := n.sortStrategy.(type) {
 	case *iterativeSortStrategy:
-		description = fmt.Sprintf("%s (iterative)", description)
+		buf.WriteString(" (iterative)")
 	case *sortTopKStrategy:
-		description = fmt.Sprintf("%s (top %d)", description, ss.topK)
+		fmt.Fprintf(&buf, " (top %d)", ss.topK)
 	}
+	description = buf.String()
 
 	return name, description, []planNode{n.plan}
 }
@@ -253,59 +244,62 @@ func (n *sortNode) SetLimitHint(numRows int64, soft bool) {
 		// The limit is only useful to the wrapped node if we don't need to sort.
 		n.plan.SetLimitHint(numRows, soft)
 	} else {
-		v := &valuesNode{ordering: n.ordering}
-		if soft {
-			n.sortStrategy = newIterativeSortStrategy(v)
-		} else {
-			n.sortStrategy = newSortTopKStrategy(v, numRows)
+		// The special value math.MaxInt64 means "no limit".
+		if numRows != math.MaxInt64 {
+			v := &valuesNode{ordering: n.ordering}
+			if soft {
+				n.sortStrategy = newIterativeSortStrategy(v)
+			} else {
+				n.sortStrategy = newSortTopKStrategy(v, numRows)
+			}
 		}
 	}
 }
 
 // wrap the supplied planNode with the sortNode if sorting is required.
-func (n *sortNode) wrap(plan planNode) planNode {
+// The first returned value is "true" if the sort node can be squashed
+// in the selectTopNode (sorting unneeded).
+func (n *sortNode) wrap(plan planNode) (bool, planNode) {
 	if n != nil {
 		// Check to see if the requested ordering is compatible with the existing
 		// ordering.
 		existingOrdering := plan.Ordering()
 		if log.V(2) {
-			log.Infof("Sort: existing=%+v desired=%+v", existingOrdering, n.ordering)
+			log.Infof(n.ctx, "Sort: existing=%+v desired=%+v", existingOrdering, n.ordering)
 		}
 		match := computeOrderingMatch(n.ordering, existingOrdering, false)
 		if match < len(n.ordering) {
 			n.plan = plan
 			n.needSort = true
-			return n
+			return false, n
 		}
 
 		if len(n.columns) < len(plan.Columns()) {
 			// No sorting required, but we have to strip off the extra render
 			// expressions we added.
 			n.plan = plan
-			return n
+			return false, n
+		}
+
+		if log.V(2) {
+			log.Infof(n.ctx, "Sort: no sorting required")
 		}
 	}
 
-	if log.V(2) {
-		log.Infof("Sort: no sorting required")
-	}
-	return plan
+	return true, plan
 }
 
 func (n *sortNode) expandPlan() error {
-	// TODO(knz) Some code from orderBy() above really belongs here.
-	return n.plan.expandPlan()
+	// We do not need to recurse into the child node here; selectTopNode
+	// does this for us.
+	return nil
 }
 
 func (n *sortNode) Start() error {
 	return n.plan.Start()
 }
 
-func (n *sortNode) Next() bool {
-	if n.err != nil {
-		return false
-	}
-
+func (n *sortNode) Next() (bool, error) {
 	for n.needSort {
 		if v, ok := n.plan.(*valuesNode); ok {
 			// The plan we wrap is already a values node. Just sort it.
@@ -322,12 +316,11 @@ func (n *sortNode) Next() bool {
 		// TODO(andrei): If we're scanning an index with a prefix matching an
 		// ordering prefix, we should only accumulate values for equal fields
 		// in this prefix, then sort the accumulated chunk and output.
-		if !n.plan.Next() {
-			n.err = n.plan.Err()
-			if n.err != nil {
-				return false
-			}
-
+		next, err := n.plan.Next()
+		if err != nil {
+			return false, err
+		}
+		if !next {
 			n.sortStrategy.Finish()
 			n.valueIter = n.sortStrategy
 			n.needSort = false
@@ -338,7 +331,7 @@ func (n *sortNode) Next() bool {
 			n.debugVals = n.plan.DebugValues()
 			if n.debugVals.output != debugValueRow {
 				// Pass through non-row debug values.
-				return true
+				return true, nil
 			}
 		}
 
@@ -348,30 +341,28 @@ func (n *sortNode) Next() bool {
 		if n.explain == explainDebug {
 			// Emit a "buffered" row.
 			n.debugVals.output = debugValueBuffered
-			return true
+			return true, nil
 		}
 	}
 
 	if n.valueIter == nil {
 		n.valueIter = n.plan
 	}
-	if !n.valueIter.Next() {
-		if n.valueIter == n.plan {
-			n.err = n.plan.Err()
-		}
-		return false
+	next, err := n.valueIter.Next()
+	if !next {
+		return false, err
 	}
 	if n.explain == explainDebug {
 		n.debugVals = n.valueIter.DebugValues()
 	}
-	return true
+	return true, nil
 }
 
 // valueIterator provides iterative access to a value source's values and
 // debug values. It is a subset of the planNode interface, so all methods
 // should conform to the comments expressed in the planNode definition.
 type valueIterator interface {
-	Next() bool
+	Next() (bool, error)
 	Values() parser.DTuple
 	DebugValues() debugValues
 }
@@ -414,7 +405,7 @@ func (ss *sortAllStrategy) Finish() {
 	ss.vNode.SortAll()
 }
 
-func (ss *sortAllStrategy) Next() bool {
+func (ss *sortAllStrategy) Next() (bool, error) {
 	return ss.vNode.Next()
 }
 
@@ -458,13 +449,13 @@ func (ss *iterativeSortStrategy) Finish() {
 	ss.vNode.InitMinHeap()
 }
 
-func (ss *iterativeSortStrategy) Next() bool {
+func (ss *iterativeSortStrategy) Next() (bool, error) {
 	if ss.vNode.Len() == 0 {
-		return false
+		return false, nil
 	}
 	ss.lastVal = ss.vNode.PopValues()
 	ss.nextRowIdx++
-	return true
+	return true, nil
 }
 
 func (ss *iterativeSortStrategy) Values() parser.DTuple {
@@ -541,7 +532,7 @@ func (ss *sortTopKStrategy) Finish() {
 	ss.vNode.rows = ss.vNode.rows[:origLen]
 }
 
-func (ss *sortTopKStrategy) Next() bool {
+func (ss *sortTopKStrategy) Next() (bool, error) {
 	return ss.vNode.Next()
 }
 

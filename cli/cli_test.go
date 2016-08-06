@@ -31,11 +31,16 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/context"
+
+	"github.com/pkg/errors"
+
+	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/build"
 	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/security/securitytest"
 	"github.com/cockroachdb/cockroach/server"
-	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/timeutil"
@@ -50,25 +55,26 @@ type cliTest struct {
 func (c cliTest) stop() {
 	c.cleanupFunc()
 	security.SetReadFileFn(securitytest.Asset)
-	c.Stop()
+	c.Stopper().Stop()
 }
 
 func newCLITest() cliTest {
 	// Reset the client context for each test. We don't reset the
 	// pointer (because they are tied into the flags), but instead
 	// overwrite the existing struct's values.
-	cliContext.InitDefaults()
+	baseCtx.InitDefaults()
+	cliCtx.InitCLIDefaults()
 
 	osStderr = os.Stdout
 
-	s := &server.TestServer{}
-	if err := s.Start(); err != nil {
-		log.Fatalf("Could not start server: %v", err)
+	s, err := serverutils.StartServerRaw(base.TestServerArgs{})
+	if err != nil {
+		log.Fatalf(context.Background(), "Could not start server: %v", err)
 	}
 
 	tempDir, err := ioutil.TempDir("", "cli-test")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(context.Background(), err)
 	}
 
 	// Copy these assets to disk from embedded strings, so this test can
@@ -91,11 +97,11 @@ func newCLITest() cliTest {
 	}
 
 	return cliTest{
-		TestServer: s,
+		TestServer: s.(*server.TestServer),
 		certsDir:   tempDir,
 		cleanupFunc: func() {
 			if err := os.RemoveAll(tempDir); err != nil {
-				log.Fatal(err)
+				log.Fatal(context.Background(), err)
 			}
 		},
 	}
@@ -111,6 +117,14 @@ func (c cliTest) Run(line string) {
 // errors in executing c, because those will be caught when the test verifies
 // the output of c.
 func (c cliTest) RunWithCapture(line string) (out string, err error) {
+	return captureOutput(func() {
+		c.Run(line)
+	})
+}
+
+// captureOutput runs f and returns a string containing the output and any
+// error that may have occurred capturing the output.
+func captureOutput(f func()) (out string, err error) {
 	// Heavily inspired by Go's testing/example.go:runExample().
 
 	// Funnel stdout into a pipe.
@@ -142,17 +156,17 @@ func (c cliTest) RunWithCapture(line string) (out string, err error) {
 		outResult := <-outC
 		out, err = outResult.out, outResult.err
 		if x := recover(); x != nil {
-			err = util.Errorf("panic: %v", x)
+			err = errors.Errorf("panic: %v", x)
 		}
 	}()
 
 	// Run the command. The output will be returned in the defer block.
-	c.Run(line)
+	f()
 	return
 }
 
 func (c cliTest) RunWithArgs(a []string) {
-	cliContext.execStmts = nil
+	sqlCtx.execStmts = nil
 
 	var args []string
 	args = append(args, a[0])
@@ -287,14 +301,13 @@ func Example_quoted() {
 }
 
 func Example_insecure() {
-	c := cliTest{cleanupFunc: func() {}}
-	c.TestServer = &server.TestServer{}
-	c.Ctx = server.NewTestContext()
-	c.Ctx.Insecure = true
-	if err := c.Start(); err != nil {
-		log.Fatalf("Could not start server: %v", err)
+	s, err := serverutils.StartServerRaw(
+		base.TestServerArgs{Insecure: true})
+	if err != nil {
+		log.Fatalf(context.Background(), "Could not start server: %v", err)
 	}
-	defer c.stop()
+	defer s.Stopper().Stop()
+	c := cliTest{TestServer: s.(*server.TestServer), cleanupFunc: func() {}}
 
 	c.Run("debug kv put --insecure a 1 b 2")
 	c.Run("debug kv scan --insecure")
@@ -472,29 +485,23 @@ func Example_zone() {
 	c := newCLITest()
 	defer c.stop()
 
-	const zone1 = `replicas:
-- attrs: [us-east-1a,ssd]`
-	const zone2 = `range_max_bytes: 134217728`
-
 	c.Run("zone ls")
-	// Call RunWithArgs to bypass the "split-by-whitespace" arg builder.
-	c.RunWithArgs([]string{"zone", "set", "system", zone1})
+	c.Run("zone set system --file=./testdata/zone_attrs.yaml")
 	c.Run("zone ls")
 	c.Run("zone get system.nonexistent")
 	c.Run("zone get system.lease")
-	c.RunWithArgs([]string{"zone", "set", "system", zone2})
+	c.Run("zone set system --file=./testdata/zone_range_max_bytes.yaml")
 	c.Run("zone get system")
 	c.Run("zone rm system")
 	c.Run("zone ls")
 	c.Run("zone rm .default")
-	c.RunWithArgs([]string{"zone", "set", ".default", zone2})
+	c.Run("zone set .default --file=./testdata/zone_range_max_bytes.yaml")
 	c.Run("zone get system")
 
 	// Output:
 	// zone ls
 	// .default
-	// zone set system replicas:
-	// - attrs: [us-east-1a,ssd]
+	// zone set system --file=./testdata/zone_attrs.yaml
 	// INSERT 1
 	// replicas:
 	// - attrs: [us-east-1a, ssd]
@@ -515,7 +522,7 @@ func Example_zone() {
 	// range_max_bytes: 67108864
 	// gc:
 	//   ttlseconds: 86400
-	// zone set system range_max_bytes: 134217728
+	// zone set system --file=./testdata/zone_range_max_bytes.yaml
 	// UPDATE 1
 	// replicas:
 	// - attrs: [us-east-1a, ssd]
@@ -537,7 +544,7 @@ func Example_zone() {
 	// .default
 	// zone rm .default
 	// unable to remove .default
-	// zone set .default range_max_bytes: 134217728
+	// zone set .default --file=./testdata/zone_range_max_bytes.yaml
 	// UPDATE 1
 	// replicas:
 	// - attrs: []
@@ -588,8 +595,9 @@ func Example_sql() {
 	// x	y
 	// 42	69
 	// sql --execute=show databases
-	// 2 rows
+	// 3 rows
 	// Database
+	// information_schema
 	// system
 	// t
 	// sql -e explain select 3
@@ -611,20 +619,34 @@ func Example_sql_escape() {
 
 	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.t (s string, d string);"})
 	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'foo', 'printable ASCII')"})
-	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'foo\\x0a', 'non-printable ASCII')"})
+	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\"foo', 'printable ASCII with quotes')"})
+	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\\\\foo', 'printable ASCII with backslash')"})
+	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'foo\\x0abar', 'non-printable ASCII')"})
 	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values ('κόσμε', 'printable UTF8')"})
 	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\\xc3\\xb1', 'printable UTF8 using escapes')"})
 	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\\x01', 'non-printable UTF8 string')"})
 	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\\xdc\\x88\\x38\\x35', 'UTF8 string with RTL char')"})
 	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'\\xc3\\x28', 'non-UTF8 string')"})
+	c.RunWithArgs([]string{"sql", "-e", "insert into t.t values (e'a\\tb\\tc\\n12\\t123123213\\t12313', 'tabs')"})
 	c.RunWithArgs([]string{"sql", "-e", "select * from t.t"})
+	c.RunWithArgs([]string{"sql", "-e", "create table t.u (\"\"\"foo\" int, \"\\foo\" int, \"foo\nbar\" int, \"κόσμε\" int, \"܈85\" int)"})
+	c.RunWithArgs([]string{"sql", "-e", "insert into t.u values (0, 0, 0, 0, 0)"})
+	c.RunWithArgs([]string{"sql", "-e", "show columns from t.u"})
+	c.RunWithArgs([]string{"sql", "-e", "select * from t.u"})
+	c.RunWithArgs([]string{"sql", "--pretty", "-e", "select * from t.t"})
+	c.RunWithArgs([]string{"sql", "--pretty", "-e", "show columns from t.u"})
+	c.RunWithArgs([]string{"sql", "--pretty", "-e", "select * from t.u"})
 
 	// Output:
 	// sql -e create database t; create table t.t (s string, d string);
 	// CREATE TABLE
 	// sql -e insert into t.t values (e'foo', 'printable ASCII')
 	// INSERT 1
-	// sql -e insert into t.t values (e'foo\x0a', 'non-printable ASCII')
+	// sql -e insert into t.t values (e'"foo', 'printable ASCII with quotes')
+	// INSERT 1
+	// sql -e insert into t.t values (e'\\foo', 'printable ASCII with backslash')
+	// INSERT 1
+	// sql -e insert into t.t values (e'foo\x0abar', 'non-printable ASCII')
 	// INSERT 1
 	// sql -e insert into t.t values ('κόσμε', 'printable UTF8')
 	// INSERT 1
@@ -636,16 +658,77 @@ func Example_sql_escape() {
 	// INSERT 1
 	// sql -e insert into t.t values (e'\xc3\x28', 'non-UTF8 string')
 	// INSERT 1
+	// sql -e insert into t.t values (e'a\tb\tc\n12\t123123213\t12313', 'tabs')
+	// INSERT 1
 	// sql -e select * from t.t
-	// 7 rows
+	// 10 rows
 	// s	d
 	// foo	printable ASCII
-	// "foo\n"	non-printable ASCII
+	// "\"foo"	printable ASCII with quotes
+	// "\\foo"	printable ASCII with backslash
+	// "foo\nbar"	non-printable ASCII
 	// "\u03ba\u1f79\u03c3\u03bc\u03b5"	printable UTF8
 	// "\u00f1"	printable UTF8 using escapes
 	// "\x01"	non-printable UTF8 string
 	// "\u070885"	UTF8 string with RTL char
 	// "\xc3("	non-UTF8 string
+	// "a\tb\tc\n12\t123123213\t12313"	tabs
+	// sql -e create table t.u ("""foo" int, "\foo" int, "foo
+	// bar" int, "κόσμε" int, "܈85" int)
+	// CREATE TABLE
+	// sql -e insert into t.u values (0, 0, 0, 0, 0)
+	// INSERT 1
+	// sql -e show columns from t.u
+	// 6 rows
+	// Field	Type	Null	Default
+	// "\"foo"	INT	true	NULL
+	// "\\foo"	INT	true	NULL
+	// "foo\nbar"	INT	true	NULL
+	// "\u03ba\u1f79\u03c3\u03bc\u03b5"	INT	true	NULL
+	// "\u070885"	INT	true	NULL
+	// rowid	INT	false	unique_rowid()
+	// sql -e select * from t.u
+	// 1 row
+	// "\"foo"	"\\foo"	"foo\nbar"	"\u03ba\u1f79\u03c3\u03bc\u03b5"	"\u070885"
+	// 0	0	0	0	0
+	// sql --pretty -e select * from t.t
+	// +--------------------------------+--------------------------------+
+	// |               s                |               d                |
+	// +--------------------------------+--------------------------------+
+	// | foo                            | printable ASCII                |
+	// | "foo                           | printable ASCII with quotes    |
+	// | \foo                           | printable ASCII with backslash |
+	// | foo␤                           | non-printable ASCII            |
+	// | bar                            |                                |
+	// | κόσμε                          | printable UTF8                 |
+	// | ñ                              | printable UTF8 using escapes   |
+	// | "\x01"                         | non-printable UTF8 string      |
+	// | ܈85                            | UTF8 string with RTL char      |
+	// | "\xc3("                        | non-UTF8 string                |
+	// | a   b         c␤               | tabs                           |
+	// | 12  123123213 12313            |                                |
+	// +--------------------------------+--------------------------------+
+	// (10 rows)
+	// sql --pretty -e show columns from t.u
+	// +----------+------+-------+----------------+
+	// |  Field   | Type | Null  |    Default     |
+	// +----------+------+-------+----------------+
+	// | "foo     | INT  | true  | NULL           |
+	// | \foo     | INT  | true  | NULL           |
+	// | foo␤     | INT  | true  | NULL           |
+	// | bar      |      |       |                |
+	// | κόσμε    | INT  | true  | NULL           |
+	// | ܈85      | INT  | true  | NULL           |
+	// | rowid    | INT  | false | unique_rowid() |
+	// +----------+------+-------+----------------+
+	// (6 rows)
+	// sql --pretty -e select * from t.u
+	// +------+------+------------+-------+-----+
+	// | "foo | \foo | "foo\nbar" | κόσμε | ܈85 |
+	// +------+------+------------+-------+-----+
+	// |    0 |    0 |          0 |     0 |   0 |
+	// +------+------+------------+-------+-----+
+	// (1 row)
 }
 
 func Example_user() {
@@ -653,34 +736,45 @@ func Example_user() {
 	defer c.stop()
 
 	c.Run("user ls")
+	c.Run("user ls --pretty")
+	c.Run("user ls --pretty=false")
 	c.Run("user set foo --password=bar")
 	// Don't use get, since the output of hashedPassword is random.
 	// c.Run("user get foo")
-	c.Run("user ls")
+	c.Run("user ls --pretty")
 	c.Run("user rm foo")
-	c.Run("user ls")
+	c.Run("user ls --pretty")
 
 	// Output:
 	// user ls
+	// 0 rows
+	// username
+	// user ls --pretty
 	// +----------+
 	// | username |
 	// +----------+
 	// +----------+
+	// (0 rows)
+	// user ls --pretty=false
+	// 0 rows
+	// username
 	// user set foo --password=bar
 	// INSERT 1
-	// user ls
+	// user ls --pretty
 	// +----------+
 	// | username |
 	// +----------+
 	// | foo      |
 	// +----------+
+	// (1 row)
 	// user rm foo
 	// DELETE 1
-	// user ls
+	// user ls --pretty
 	// +----------+
 	// | username |
 	// +----------+
 	// +----------+
+	// (0 rows)
 }
 
 // TestFlagUsage is a basic test to make sure the fragile
@@ -740,6 +834,7 @@ Available Commands:
   user           get, set, list and remove users
   zone           get, set, list and remove zones
   node           list nodes and show their status
+  dump           dump sql tables
 
   gen            generate manpages and bash completion file
   version        output version information
@@ -747,6 +842,7 @@ Available Commands:
 
 Flags:
       --alsologtostderr value[=INFO]   logs at or above this threshold go to stderr (default NONE)
+      --duration-random value          duration for randomized dump test to run (default 1s)
       --log-backtrace-at value         when logging hits line file:N, emit a stack trace (default :0)
       --log-dir value                  if non-empty, write log files in this directory
       --logtostderr                    log to standard error instead of files
@@ -768,34 +864,55 @@ func Example_node() {
 
 	// Refresh time series data, which is required to retrieve stats.
 	if err := c.TestServer.WriteSummaries(); err != nil {
-		log.Fatalf("Couldn't write stats summaries: %s", err)
+		log.Fatalf(context.Background(), "Couldn't write stats summaries: %s", err)
 	}
 
 	c.Run("node ls")
+	c.Run("node ls --pretty")
 	c.Run("node status 10000")
 
 	// Output:
 	// node ls
+	// 1 row
+	// id
+	// 1
+	// node ls --pretty
 	// +----+
 	// | id |
 	// +----+
 	// |  1 |
 	// +----+
+	// (1 row)
 	// node status 10000
 	// Error: node 10000 doesn't exist
 }
 
-func Example_freeze() {
+func TestFreeze(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
 	c := newCLITest()
 	defer c.stop()
 
-	c.Run("freeze-cluster")
-	c.Run("freeze-cluster --undo")
-	// Output:
-	// freeze-cluster
-	// ok
-	// freeze-cluster --undo
-	// ok
+	assertOutput := func(msg string) {
+		if !strings.HasSuffix(strings.TrimSpace(msg), "ok") {
+			t.Fatal(errors.Errorf("expected trailing 'ok':\n%s", msg))
+		}
+	}
+
+	{
+		out, err := c.RunWithCapture("freeze-cluster")
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertOutput(out)
+	}
+	{
+		out, err := c.RunWithCapture("freeze-cluster --undo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertOutput(out)
+	}
 }
 
 func TestNodeStatus(t *testing.T) {
@@ -810,13 +927,13 @@ func TestNodeStatus(t *testing.T) {
 		t.Fatalf("couldn't write stats summaries: %s", err)
 	}
 
-	out, err := c.RunWithCapture("node status 1")
+	out, err := c.RunWithCapture("node status 1 --pretty")
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkNodeStatus(t, c, out, start)
 
-	out, err = c.RunWithCapture("node status")
+	out, err = c.RunWithCapture("node status --pretty")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -950,7 +1067,7 @@ func extractFields(line string) ([]string, error) {
 	// |, and another empty one to the right of the final |. So, we need to take those
 	// out.
 	if a, e := len(fields), len(nodesColumnHeaders)+2; a != e {
-		return nil, util.Errorf("can't extract fields: # of fields (%d) != expected (%d)", a, e)
+		return nil, errors.Errorf("can't extract fields: # of fields (%d) != expected (%d)", a, e)
 	}
 	fields = fields[1 : len(fields)-1]
 	var r []string
@@ -1013,11 +1130,11 @@ func TestGenAutocomplete(t *testing.T) {
 	if err := Run([]string{"gen", "autocomplete", "--out=" + acpath}); err != nil {
 		t.Fatal(err)
 	}
-	s, err := os.Stat(acpath)
+	info, err := os.Stat(acpath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Size() < minsize {
-		t.Fatalf("autocomplete file size (%d) < minimum (%d)", s.Size(), minsize)
+	if size := info.Size(); size < minsize {
+		t.Fatalf("autocomplete file size (%d) < minimum (%d)", size, minsize)
 	}
 }

@@ -31,6 +31,18 @@ SELECT * FROM abc
 a b c
 1 2 3
 
+# synonym for SELECT * FROM abc
+query III
+TABLE abc
+----
+1 2 3
+
+query error invalid table name
+TABLE abc[TRUE]
+
+query error invalid table name
+TABLE abc.*
+
 query III colnames
 SELECT * FROM abc WHERE NULL
 ----
@@ -119,8 +131,16 @@ a NULL
 query error table "foo" not found
 SELECT foo.* FROM kv
 
-query error "*" with no tables specified is not valid
+query error cannot use "\*" without a FROM clause
 SELECT *
+
+# "*" must expand to zero columns if there are zero columns to select.
+statement ok
+CREATE TABLE nocols(x INT); ALTER TABLE nocols DROP COLUMN x
+
+query I
+SELECT 1, * FROM nocols
+----
 
 query error "kv.*" cannot be aliased
 SELECT kv.* AS foo FROM kv
@@ -259,6 +279,16 @@ SELECT CASE WHEN NULL THEN 1 ELSE 2 END
 ----
 2
 
+statement ok
+INSERT INTO abc VALUES (42, NULL, NULL)
+
+query III
+SELECT 0 * b, b % 1, 0 % b from abc
+----
+0 0 0
+0 0 0
+NULL NULL NULL
+
 # Doing an index lookup by MaxInt used to not work.
 # https://github.com/cockroachdb/cockroach/issues/3587
 statement ok
@@ -271,3 +301,6 @@ query I
 SELECT a FROM MaxIntTest WHERE a = 9223372036854775807
 ----
 9223372036854775807
+
+query error no value provided for placeholder
+SELECT $1::int

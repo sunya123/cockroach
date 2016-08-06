@@ -24,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage/engine"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/stop"
 	"github.com/cockroachdb/cockroach/util/uuid"
@@ -34,7 +35,7 @@ var (
 	testTxnID        *uuid.UUID
 	testTxnID2       *uuid.UUID
 	testTxnKey       = []byte("a")
-	testTxnTimestamp = roachpb.ZeroTimestamp.Add(123, 456)
+	testTxnTimestamp = hlc.ZeroTimestamp.Add(123, 456)
 	testTxnPriority  = int32(123)
 )
 
@@ -49,7 +50,7 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
-	testTxnID2, err = uuid.FromString("9ab49d02-eb45-beef-9212-c23a92bc8211")
+	testTxnID2, err = uuid.FromString("9855a1ef-8eb9-4c06-a106-cab1dda78a2b")
 	if err != nil {
 		panic(err)
 	}
@@ -73,7 +74,7 @@ func TestAbortCachePutGetClearData(t *testing.T) {
 	if aborted, readErr := sc.Get(context.Background(), e, testTxnID, &entry); aborted {
 		t.Errorf("expected not aborted for id %s", testTxnID)
 	} else if readErr != nil {
-		t.Fatalf("unxpected read error: %s", readErr)
+		t.Fatalf("unexpected read error: %s", readErr)
 	}
 
 	entry = roachpb.AbortCacheEntry{
@@ -190,7 +191,7 @@ func TestAbortCacheCopyFrom(t *testing.T) {
 	for i, cache := range []*AbortCache{rc1, rc2} {
 		var actual roachpb.AbortCacheEntry
 		if aborted, readErr := cache.Get(context.Background(), e, testTxnID, &actual); !aborted || readErr != nil {
-			t.Fatalf("%d: unxpected read error: %t, %s", i, aborted, readErr)
+			t.Fatalf("%d: unexpected read error: %t, %s", i, aborted, readErr)
 		} else if !reflect.DeepEqual(entry, actual) {
 			t.Fatalf("expected %v, got %v", entry, actual)
 		}

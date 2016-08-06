@@ -28,7 +28,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -37,23 +36,25 @@ import (
 	"github.com/docker/engine-api/types/container"
 	"github.com/docker/engine-api/types/events"
 	"github.com/docker/go-connections/nat"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/base"
-	roachClient "github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/config"
+	roachClient "github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/server"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/syncutil"
 	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 const (
 	builderImage     = "cockroachdb/builder"
-	builderTag       = "20160305-182433"
+	builderTag       = "20160804-184345"
 	builderImageFull = builderImage + ":" + builderTag
 	networkName      = "cockroachdb_acceptance"
 )
@@ -67,7 +68,7 @@ var cockroachBinary = flag.String("b", defaultBinary(), "the binary to run (if i
 var cockroachEntry = flag.String("e", "", "the entry point for the image")
 var waitOnStop = flag.Bool("w", false, "wait for the user to interrupt before tearing down the cluster")
 var pwd = filepath.Clean(os.ExpandEnv("${PWD}"))
-var maxRangeBytes = int64(config.DefaultZoneConfig().RangeMaxBytes)
+var maxRangeBytes = config.DefaultZoneConfig().RangeMaxBytes
 
 // keyLen is the length (in bits) of the generated CA and node certs.
 const keyLen = 1024
@@ -77,7 +78,7 @@ func defaultBinary() string {
 	if len(gopath) == 0 {
 		return ""
 	}
-	return gopath[0] + "/bin/linux_amd64/cockroach"
+	return gopath[0] + "/bin/docker_amd64/cockroach"
 }
 
 func exists(path string) bool {
@@ -127,7 +128,7 @@ type testNode struct {
 type LocalCluster struct {
 	client               client.APIClient
 	stopper              chan struct{}
-	mu                   sync.Mutex // Protects the fields below
+	mu                   syncutil.Mutex // Protects the fields below
 	vols                 *Container
 	config               TestConfig
 	Nodes                []*testNode
@@ -154,7 +155,7 @@ func CreateLocal(cfg TestConfig, logDir string, privileged bool, stopper chan st
 	}
 
 	if *cockroachImage == builderImageFull && !exists(*cockroachBinary) {
-		log.Fatalf("\"%s\": does not exist", *cockroachBinary)
+		log.Fatalf(context.TODO(), "\"%s\": does not exist", *cockroachBinary)
 	}
 
 	cli, err := client.NewEnvClient()
@@ -216,7 +217,7 @@ func (l *LocalCluster) OneShot(
 	l.oneshot = container
 	defer func() {
 		if err := l.oneshot.Remove(); err != nil {
-			log.Errorf("ContainerRemove: %s", err)
+			log.Errorf(context.TODO(), "ContainerRemove: %s", err)
 		}
 		l.oneshot = nil
 	}()
@@ -224,7 +225,10 @@ func (l *LocalCluster) OneShot(
 	if err := l.oneshot.Start(); err != nil {
 		return err
 	}
-	return l.oneshot.Wait()
+	if err := l.oneshot.Wait(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // stopOnPanic is invoked as a deferred function in Start in order to attempt
@@ -261,12 +265,18 @@ func (l *LocalCluster) panicOnStop() {
 func (l *LocalCluster) createNetwork() {
 	l.panicOnStop()
 
-	nets, err := l.client.NetworkList(context.Background(), types.NetworkListOptions{})
-	maybePanic(err)
-	for _, net := range nets {
-		if net.Name == networkName {
-			maybePanic(l.client.NetworkRemove(context.Background(), net.ID))
+	net, err := l.client.NetworkInspect(context.Background(), networkName)
+	if err == nil {
+		// We need to destroy the network and any running containers inside of it.
+		for containerID := range net.Containers {
+			// This call could fail if the container terminated on its own after we call
+			// NetworkInspect, but the likelihood of this seems low. If this line creates
+			// a lot of panics we should do more careful error checking.
+			maybePanic(l.client.ContainerKill(context.Background(), containerID, "9"))
 		}
+		maybePanic(l.client.NetworkRemove(context.Background(), networkName))
+	} else if !client.IsErrNotFound(err) {
+		panic(err)
 	}
 
 	resp, err := l.client.NetworkCreate(context.Background(), networkName, types.NetworkCreate{
@@ -276,7 +286,7 @@ func (l *LocalCluster) createNetwork() {
 	})
 	maybePanic(err)
 	if resp.Warning != "" {
-		log.Warningf("creating network: %s", resp.Warning)
+		log.Warningf(context.TODO(), "creating network: %s", resp.Warning)
 	}
 	l.networkID = resp.ID
 }
@@ -286,7 +296,7 @@ func (l *LocalCluster) createNetwork() {
 func (l *LocalCluster) initCluster() {
 	configJSON, err := json.Marshal(l.config)
 	maybePanic(err)
-	log.Infof("Initializing Cluster %s:\n%s", l.config.Name, configJSON)
+	log.Infof(context.TODO(), "Initializing Cluster %s:\n%s", l.config.Name, configJSON)
 	l.panicOnStop()
 
 	// Create the temporary certs directory in the current working
@@ -448,6 +458,7 @@ func (l *LocalCluster) startNode(node *testNode) {
 		"--key=/certs/node.key",
 		"--host=" + node.nodeStr,
 		"--alsologtostderr=INFO",
+		"--verbosity=1",
 	}
 
 	for _, store := range node.stores {
@@ -473,12 +484,16 @@ func (l *LocalCluster) startNode(node *testNode) {
 			"--logtostderr=false")
 
 	}
-	env := []string{"COCKROACH_SCAN_MAX_IDLE_TIME=200ms", "COCKROACH_CONSISTENCY_CHECK_PANIC_ON_FAILURE=true"}
+	env := []string{
+		"COCKROACH_SCAN_MAX_IDLE_TIME=200ms",
+		"COCKROACH_CONSISTENCY_CHECK_PANIC_ON_FAILURE=true",
+		"COCKROACH_SKIP_UPDATE_CHECK=1",
+	}
 	l.createRoach(node, l.vols, env, cmd...)
 	maybePanic(node.Start())
 	httpAddr := node.Addr(defaultHTTP)
 
-	log.Infof(`*** started %[1]s ***
+	log.Infof(context.TODO(), `*** started %[1]s ***
   ui:        %[2]s
   trace:     %[2]s/debug/requests
   logs:      %[3]s/cockroach.INFO
@@ -503,7 +518,7 @@ func (l *LocalCluster) processEvent(event events.Message) bool {
 	for i, n := range l.Nodes {
 		if n != nil && n.id == event.ID {
 			if log.V(1) {
-				log.Errorf("node=%d status=%s", i, event.Status)
+				log.Errorf(context.TODO(), "node=%d status=%s", i, event.Status)
 			}
 			select {
 			case l.events <- Event{NodeIndex: i, Status: event.Status}:
@@ -521,14 +536,14 @@ func (l *LocalCluster) processEvent(event events.Message) bool {
 	default:
 		// There is a very tiny race here: the signal handler might be closing the
 		// stopper simultaneously.
-		log.Errorf("stopping due to unexpected event: %+v", event)
+		log.Errorf(context.TODO(), "stopping due to unexpected event: %+v", event)
 		if rc, err := l.client.ContainerLogs(context.Background(), event.Actor.ID, types.ContainerLogsOptions{
 			ShowStdout: true,
 			ShowStderr: true,
 		}); err == nil {
 			defer rc.Close()
 			if _, err := io.Copy(os.Stderr, rc); err != nil {
-				log.Infof("error listing logs: %s", err)
+				log.Infof(context.TODO(), "error listing logs: %s", err)
 			}
 		}
 		close(l.stopper)
@@ -538,8 +553,8 @@ func (l *LocalCluster) processEvent(event events.Message) bool {
 
 func (l *LocalCluster) monitor() {
 	if log.V(1) {
-		log.Infof("events monitor starts")
-		defer log.Infof("events monitor exits")
+		log.Infof(context.TODO(), "events monitor starts")
+		defer log.Infof(context.TODO(), "events monitor exits")
 	}
 	longPoll := func() bool {
 		// If our context was cancelled, it's time to go home.
@@ -553,7 +568,7 @@ func (l *LocalCluster) monitor() {
 		for {
 			var event events.Message
 			if err := dec.Decode(&event); err != nil {
-				log.Infof("event stream done, resetting...: %s", err)
+				log.Infof(context.TODO(), "event stream done, resetting...: %s", err)
 				// Sometimes we get a random string-wrapped EOF error back.
 				// Hard to assert on, so we just let this goroutine spin.
 				return true
@@ -587,7 +602,7 @@ func (l *LocalCluster) Start() {
 
 	l.createNetwork()
 	l.initCluster()
-	log.Infof("creating certs (%dbit) in: %s", keyLen, l.CertsDir)
+	log.Infof(context.TODO(), "creating certs (%dbit) in: %s", keyLen, l.CertsDir)
 	l.createCACert()
 	l.createNodeCerts()
 	maybePanic(security.RunCreateClientCert(
@@ -635,7 +650,7 @@ func (l *LocalCluster) Assert(t *testing.T) {
 		t.Fatalf("unexpected extra event %v (after %v)", cur, events)
 	}
 	if log.V(2) {
-		log.Infof("asserted %v", events)
+		log.Infof(context.TODO(), "asserted %v", events)
 	}
 }
 
@@ -649,13 +664,11 @@ func (l *LocalCluster) AssertAndStop(t *testing.T) {
 // stop stops the cluster.
 func (l *LocalCluster) stop() {
 	if *waitOnStop {
-		log.Infof("waiting for interrupt")
-		select {
-		case <-l.stopper:
-		}
+		log.Infof(context.TODO(), "waiting for interrupt")
+		<-l.stopper
 	}
 
-	log.Infof("stopping")
+	log.Infof(context.TODO(), "stopping")
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -698,7 +711,7 @@ func (l *LocalCluster) stop() {
 			defer w.Close()
 			maybePanic(n.Logs(w))
 			if crashed {
-				log.Infof("node %d: stderr at %s", i, file)
+				log.Infof(context.TODO(), "node %d: stderr at %s", i, file)
 			}
 		}
 		maybePanic(n.Remove())
@@ -707,7 +720,7 @@ func (l *LocalCluster) stop() {
 
 	if l.networkID != "" {
 		maybePanic(
-			l.client.NetworkRemove(context.Background(), string(l.networkID)))
+			l.client.NetworkRemove(context.Background(), l.networkID))
 		l.networkID = ""
 	}
 }
@@ -767,7 +780,8 @@ func (l *LocalCluster) Kill(i int) error {
 
 // Restart restarts the given node. If the node isn't running, this starts it.
 func (l *LocalCluster) Restart(i int) error {
-	return l.Nodes[i].Restart(5)
+	// The default timeout is 10 seconds.
+	return l.Nodes[i].Restart(nil)
 }
 
 // URL returns the base url.
@@ -776,8 +790,8 @@ func (l *LocalCluster) URL(i int) string {
 }
 
 // Addr returns the host and port from the node in the format HOST:PORT.
-func (l *LocalCluster) Addr(i int) string {
-	return l.Nodes[i].Addr(defaultHTTP).String()
+func (l *LocalCluster) Addr(i int, port string) string {
+	return l.Nodes[i].Addr(nat.Port(port + "/tcp")).String()
 }
 
 // ExecRoot runs a command as root.
@@ -816,7 +830,7 @@ func (l *LocalCluster) ExecRoot(i int, cmd []string) error {
 				return err
 			}
 			if resp.Running {
-				return util.Errorf("command still running")
+				return errors.Errorf("command still running")
 			}
 			if resp.ExitCode != 0 {
 				return fmt.Errorf("error executing %s:\n%s\n%s",

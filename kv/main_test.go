@@ -17,11 +17,14 @@
 package kv_test
 
 import (
+	"os"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/security/securitytest"
+	"github.com/cockroachdb/cockroach/server"
 	"github.com/cockroachdb/cockroach/testutils/buildutil"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
@@ -36,8 +39,16 @@ func TestForbiddenDeps(t *testing.T) {
 	// Verify kv does not depend on storage (or any of its subpackages).
 	buildutil.VerifyNoImports(t,
 		"github.com/cockroachdb/cockroach/kv", true,
-		[]string{},
+		// TODO(tschottdorf): should really disallow ./storage/... but at the
+		// time of writing there's a (legit) dependency on `enginepb`.
 		[]string{
 			"github.com/cockroachdb/cockroach/storage",
-		})
+			"github.com/cockroachdb/cockroach/storage/engine",
+		},
+		[]string{})
+}
+
+func TestMain(m *testing.M) {
+	serverutils.InitTestServerFactory(server.TestServerFactory)
+	os.Exit(m.Run())
 }

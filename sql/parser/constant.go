@@ -24,6 +24,7 @@ import (
 	"go/token"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/cockroachdb/cockroach/util/decimal"
@@ -41,29 +42,34 @@ type Constant interface {
 	// error if the Constant could not be resolved as that type. The method should only
 	// be passed a type returned from AvailableTypes and should never be called more than
 	// once for a given Constant.
-	ResolveAsType(Datum) (Datum, error)
+	ResolveAsType(*SemaContext, Datum) (Datum, error)
 }
 
 var _ Constant = &NumVal{}
 var _ Constant = &StrVal{}
+
+func isConstant(expr Expr) bool {
+	_, ok := expr.(Constant)
+	return ok
+}
 
 func isNumericConstant(expr Expr) bool {
 	_, ok := expr.(*NumVal)
 	return ok
 }
 
-func typeCheckConstant(c Constant, desired Datum) (TypedExpr, error) {
+func typeCheckConstant(c Constant, ctx *SemaContext, desired Datum) (TypedExpr, error) {
 	avail := c.AvailableTypes()
 	if desired != nil {
 		for _, typ := range avail {
 			if desired.TypeEqual(typ) {
-				return c.ResolveAsType(desired)
+				return c.ResolveAsType(ctx, desired)
 			}
 		}
 	}
 
 	natural := avail[0]
-	return c.ResolveAsType(natural)
+	return c.ResolveAsType(ctx, natural)
 }
 
 func naturalConstantType(c Constant) Datum {
@@ -193,7 +199,7 @@ func (expr *NumVal) AvailableTypes() []Datum {
 }
 
 // ResolveAsType implements the Constant interface.
-func (expr *NumVal) ResolveAsType(typ Datum) (Datum, error) {
+func (expr *NumVal) ResolveAsType(ctx *SemaContext, typ Datum) (Datum, error) {
 	switch {
 	case typ.TypeEqual(TypeInt):
 		// We may have already set expr.resInt in asInt64.
@@ -234,7 +240,7 @@ func (expr *NumVal) ResolveAsType(typ Datum) (Datum, error) {
 			// TODO(nvanbenschoten) Handling e will not be necessary once the TODO about the
 			// OrigString workaround from above is addressed.
 			eScale := inf.Scale(0)
-			if eIdx := strings.IndexRune(s, 'e'); eIdx != -1 {
+			if eIdx := strings.IndexAny(s, "eE"); eIdx != -1 {
 				eInt, err := strconv.ParseInt(s[eIdx+1:], 10, 32)
 				if err != nil {
 					return nil, fmt.Errorf("could not evaluate %v as Datum type DDecimal from "+
@@ -273,6 +279,9 @@ func commonNumericConstantType(vals []indexedExpr) Datum {
 
 // StrVal represents a constant string value.
 type StrVal struct {
+	// We could embed a constant.Value here (like NumVal) and use the stringVal implementation,
+	// but that would have extra overhead without much of a benefit. However, it would make
+	// constant folding (below) a little more straightforward.
 	s        string
 	bytesEsc bool
 
@@ -290,14 +299,21 @@ func (expr *StrVal) Format(buf *bytes.Buffer, f FmtFlags) {
 	}
 }
 
-var strValAvailStringBytes = []Datum{TypeString, TypeBytes}
+var strValAvailAllParsable = []Datum{
+	TypeString,
+	TypeBytes,
+	TypeDate,
+	TypeTimestamp,
+	TypeTimestampTZ,
+	TypeInterval,
+}
 var strValAvailBytesString = []Datum{TypeBytes, TypeString}
 var strValAvailBytes = []Datum{TypeBytes}
 
 // AvailableTypes implements the Constant interface.
 func (expr *StrVal) AvailableTypes() []Datum {
 	if !expr.bytesEsc {
-		return strValAvailStringBytes
+		return strValAvailAllParsable
 	}
 	if utf8.ValidString(expr.s) {
 		return strValAvailBytesString
@@ -306,7 +322,7 @@ func (expr *StrVal) AvailableTypes() []Datum {
 }
 
 // ResolveAsType implements the Constant interface.
-func (expr *StrVal) ResolveAsType(typ Datum) (Datum, error) {
+func (expr *StrVal) ResolveAsType(ctx *SemaContext, typ Datum) (Datum, error) {
 	switch typ {
 	case TypeString:
 		expr.resString = DString(expr.s)
@@ -314,6 +330,14 @@ func (expr *StrVal) ResolveAsType(typ Datum) (Datum, error) {
 	case TypeBytes:
 		expr.resBytes = DBytes(expr.s)
 		return &expr.resBytes, nil
+	case TypeDate:
+		return ParseDDate(expr.s, ctx.getLocation())
+	case TypeTimestamp:
+		return ParseDTimestamp(expr.s, ctx.getLocation(), time.Microsecond)
+	case TypeTimestampTZ:
+		return ParseDTimestampTZ(expr.s, ctx.getLocation(), time.Microsecond)
+	case TypeInterval:
+		return ParseDInterval(expr.s)
 	default:
 		return nil, fmt.Errorf("could not resolve %T %v into a %T", expr, expr, typ)
 	}
@@ -338,13 +362,14 @@ var binaryOpToToken = map[BinaryOperator]token.Token{
 	Plus:  token.ADD,
 	Minus: token.SUB,
 	Mult:  token.MUL,
-	Div:   token.QUO, // token.QUO_ASSIGN to force integer division.
+	Div:   token.QUO,
 }
 var binaryOpToTokenIntOnly = map[BinaryOperator]token.Token{
-	Mod:    token.REM,
-	Bitand: token.AND,
-	Bitor:  token.OR,
-	Bitxor: token.XOR,
+	FloorDiv: token.QUO_ASSIGN,
+	Mod:      token.REM,
+	Bitand:   token.AND,
+	Bitor:    token.OR,
+	Bitxor:   token.XOR,
 }
 var binaryShiftOpToToken = map[BinaryOperator]token.Token{
 	LShift: token.SHL,
@@ -371,11 +396,13 @@ func (constantFolderVisitor) VisitPost(expr Expr) (retExpr Expr) {
 	}()
 	switch t := expr.(type) {
 	case *ParenExpr:
-		if cv, ok := t.Expr.(*NumVal); ok {
+		switch cv := t.Expr.(type) {
+		case *NumVal, *StrVal:
 			return cv
 		}
 	case *UnaryExpr:
-		if cv, ok := t.Expr.(*NumVal); ok {
+		switch cv := t.Expr.(type) {
+		case *NumVal:
 			if token, ok := unaryOpToToken[t.Operator]; ok {
 				return &NumVal{Value: constant.UnaryOp(token, cv.Value, 0)}
 			}
@@ -386,46 +413,78 @@ func (constantFolderVisitor) VisitPost(expr Expr) (retExpr Expr) {
 			}
 		}
 	case *BinaryExpr:
-		l, okL := t.Left.(*NumVal)
-		r, okR := t.Right.(*NumVal)
-		if okL && okR {
-			if token, ok := binaryOpToToken[t.Operator]; ok {
-				return &NumVal{Value: constant.BinaryOp(l.Value, token, r.Value)}
-			}
-			if token, ok := binaryOpToTokenIntOnly[t.Operator]; ok {
-				if lInt, ok := l.asConstantInt(); ok {
-					if rInt, ok := r.asConstantInt(); ok {
-						return &NumVal{Value: constant.BinaryOp(lInt, token, rInt)}
+		switch l := t.Left.(type) {
+		case *NumVal:
+			if r, ok := t.Right.(*NumVal); ok {
+				if token, ok := binaryOpToToken[t.Operator]; ok {
+					return &NumVal{Value: constant.BinaryOp(l.Value, token, r.Value)}
+				}
+				if token, ok := binaryOpToTokenIntOnly[t.Operator]; ok {
+					if lInt, ok := l.asConstantInt(); ok {
+						if rInt, ok := r.asConstantInt(); ok {
+							return &NumVal{Value: constant.BinaryOp(lInt, token, rInt)}
+						}
+					}
+				}
+				if token, ok := binaryShiftOpToToken[t.Operator]; ok {
+					if lInt, ok := l.asConstantInt(); ok {
+						if rInt64, err := r.asInt64(); err == nil && rInt64 >= 0 {
+							return &NumVal{Value: constant.Shift(lInt, token, uint(rInt64))}
+						}
 					}
 				}
 			}
-			if token, ok := binaryShiftOpToToken[t.Operator]; ok {
-				if lInt, ok := l.asConstantInt(); ok {
-					if rInt64, err := r.asInt64(); err == nil && rInt64 >= 0 {
-						return &NumVal{Value: constant.Shift(lInt, token, uint(rInt64))}
-					}
+		case *StrVal:
+			if r, ok := t.Right.(*StrVal); ok {
+				switch t.Operator {
+				case Concat:
+					// When folding string-like constants, if either was byte-escaped,
+					// the result is also considered byte escaped.
+					return &StrVal{s: l.s + r.s, bytesEsc: l.bytesEsc || r.bytesEsc}
 				}
 			}
 		}
 	case *ComparisonExpr:
-		l, okL := t.Left.(*NumVal)
-		r, okR := t.Right.(*NumVal)
-		if okL && okR {
-			if token, ok := comparisonOpToToken[t.Operator]; ok {
-				return MakeDBool(DBool(constant.Compare(l.Value, token, r.Value)))
+		switch l := t.Left.(type) {
+		case *NumVal:
+			if r, ok := t.Right.(*NumVal); ok {
+				if token, ok := comparisonOpToToken[t.Operator]; ok {
+					return MakeDBool(DBool(constant.Compare(l.Value, token, r.Value)))
+				}
+			}
+		case *StrVal:
+			// ComparisonExpr folding for String-like constants is not significantly different
+			// from constant evalutation during normalization (because both should be exact,
+			// unlike numeric comparisons). Still, folding these comparisons when possible here
+			// can reduce the amount of work performed during type checking, can reduce necessary
+			// allocations, and maintains symmetry with numeric constants.
+			if r, ok := t.Right.(*StrVal); ok {
+				switch t.Operator {
+				case EQ:
+					return MakeDBool(DBool(l.s == r.s))
+				case NE:
+					return MakeDBool(DBool(l.s != r.s))
+				case LT:
+					return MakeDBool(DBool(l.s < r.s))
+				case LE:
+					return MakeDBool(DBool(l.s <= r.s))
+				case GT:
+					return MakeDBool(DBool(l.s > r.s))
+				case GE:
+					return MakeDBool(DBool(l.s >= r.s))
+				}
 			}
 		}
 	}
 	return expr
 }
 
-// foldNumericConstants folds all numeric constants using exact arithmetic.
+// foldConstantLiterals folds all constant literals using exact arithmetic.
 //
 // TODO(nvanbenschoten) Can this visitor be preallocated (like normalizeVisitor)?
-// TODO(nvanbenschoten) Do we also want to fold string-like constants?
 // TODO(nvanbenschoten) Investigate normalizing associative operations to group
 //     constants together and permit further numeric constant folding.
-func foldNumericConstants(expr Expr) (Expr, error) {
+func foldConstantLiterals(expr Expr) (Expr, error) {
 	v := constantFolderVisitor{}
 	expr, _ = WalkExpr(v, expr)
 	return expr, nil

@@ -17,20 +17,23 @@
 package kv
 
 import (
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/config"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/randutil"
@@ -70,7 +73,7 @@ func startTestWriter(db *client.DB, i int64, valBytes int32, wg *sync.WaitGroup,
 					key := randutil.RandBytes(src, 10)
 					val := randutil.RandBytes(src, int(src.Int31n(valBytes)))
 					if err := txn.Put(key, val); err != nil {
-						log.Infof("experienced an error in routine %d: %s", i, err)
+						log.Infof(context.Background(), "experienced an error in routine %d: %s", i, err)
 						return err
 					}
 				}
@@ -98,16 +101,16 @@ func TestRangeSplitMeta(t *testing.T) {
 
 	// Execute the consecutive splits.
 	for _, splitKey := range splitKeys {
-		log.Infof("starting split at key %q...", splitKey)
+		log.Infof(context.Background(), "starting split at key %q...", splitKey)
 		if err := s.DB.AdminSplit(roachpb.Key(splitKey)); err != nil {
 			t.Fatal(err)
 		}
-		log.Infof("split at key %q complete", splitKey)
+		log.Infof(context.Background(), "split at key %q complete", splitKey)
 	}
 
 	util.SucceedsSoon(t, func() error {
-		if _, _, err := engine.MVCCScan(context.Background(), s.Eng, keys.LocalMax, roachpb.KeyMax, 0, roachpb.MaxTimestamp, true, nil); err != nil {
-			return util.Errorf("failed to verify no dangling intents: %s", err)
+		if _, _, err := engine.MVCCScan(context.Background(), s.Eng, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, true, nil); err != nil {
+			return errors.Errorf("failed to verify no dangling intents: %s", err)
 		}
 		return nil
 	})
@@ -143,11 +146,11 @@ func TestRangeSplitsWithConcurrentTxns(t *testing.T) {
 		for i := 0; i < concurrency; i++ {
 			<-txnChannel
 		}
-		log.Infof("starting split at key %q...", splitKey)
+		log.Infof(context.Background(), "starting split at key %q...", splitKey)
 		if pErr := s.DB.AdminSplit(splitKey); pErr != nil {
 			t.Error(pErr)
 		}
-		log.Infof("split at key %q complete", splitKey)
+		log.Infof(context.Background(), "split at key %q complete", splitKey)
 	}
 
 	close(done)
@@ -190,10 +193,10 @@ func TestRangeSplitsWithWritePressure(t *testing.T) {
 		// Scan the txn records.
 		rows, err := s.DB.Scan(keys.Meta2Prefix, keys.MetaMax, 0)
 		if err != nil {
-			return util.Errorf("failed to scan meta2 keys: %s", err)
+			return errors.Errorf("failed to scan meta2 keys: %s", err)
 		}
 		if lr := len(rows); lr < 5 {
-			return util.Errorf("expected >= 5 scans; got %d", lr)
+			return errors.Errorf("expected >= 5 scans; got %d", lr)
 		}
 		return nil
 	})
@@ -208,8 +211,8 @@ func TestRangeSplitsWithWritePressure(t *testing.T) {
 	// for timing of finishing the test writer and a possibly-ongoing
 	// asynchronous split.
 	util.SucceedsSoon(t, func() error {
-		if _, _, err := engine.MVCCScan(context.Background(), s.Eng, keys.LocalMax, roachpb.KeyMax, 0, roachpb.MaxTimestamp, true, nil); err != nil {
-			return util.Errorf("failed to verify no dangling intents: %s", err)
+		if _, _, err := engine.MVCCScan(context.Background(), s.Eng, keys.LocalMax, roachpb.KeyMax, math.MaxInt64, hlc.MaxTimestamp, true, nil); err != nil {
+			return errors.Errorf("failed to verify no dangling intents: %s", err)
 		}
 		return nil
 	})
@@ -223,11 +226,11 @@ func TestRangeSplitsWithSameKeyTwice(t *testing.T) {
 	defer s.Stop()
 
 	splitKey := roachpb.Key("aa")
-	log.Infof("starting split at key %q...", splitKey)
+	log.Infof(context.Background(), "starting split at key %q...", splitKey)
 	if err := s.DB.AdminSplit(splitKey); err != nil {
 		t.Fatal(err)
 	}
-	log.Infof("split at key %q first time complete", splitKey)
+	log.Infof(context.Background(), "split at key %q first time complete", splitKey)
 	ch := make(chan error)
 	go func() {
 		// should return error other than infinite loop

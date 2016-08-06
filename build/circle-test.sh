@@ -2,7 +2,6 @@
 
 set -euo pipefail
 
-export COCKROACH_SKIP_UPDATE_CHECK=1
 CIRCLE_NODE_INDEX="${CIRCLE_NODE_INDEX-0}"
 CIRCLE_NODE_TOTAL="${CIRCLE_NODE_TOTAL-1}"
 
@@ -88,7 +87,7 @@ prepare_artifacts() {
       function post() {
         curl -X POST -H "Authorization: token ${GITHUB_API_TOKEN}" \
         "https://api.github.com/repos/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/$1" \
-        -d "${2:0:30000}"
+        -d "${2}"
       }
 
       echo "Posting an issue"
@@ -102,7 +101,7 @@ prepare_artifacts() {
       fi
 
       # JSON monster to post the issue.
-      post issues "{ \"title\": \"circleci: failed tests: ${FAILEDTESTS}\", \"body\": \"The following test appears to have failed:\n\n[#${CIRCLE_BUILD_NUM}](https://circleci.com/gh/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/${CIRCLE_BUILD_NUM}):\n\n\`\`\`\n$(python -c 'import json,sys; print json.dumps(sys.stdin.read()).strip("\"")' < ${outdir}/excerpt.txt)\n\`\`\`\nPlease assign, take a look and update the issue accordingly.\", \"labels\": [\"test-failure\", \"Robot\"], \"milestone\": 4 }" > /dev/null
+      post issues "{ \"title\": \"circleci: failed tests: ${FAILEDTESTS}\", \"body\": \"The following test appears to have failed:\n\n[#${CIRCLE_BUILD_NUM}](https://circleci.com/gh/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/${CIRCLE_BUILD_NUM}):\n\n\`\`\`\n$(python -c 'import json,sys; print json.dumps(sys.stdin.read()[:30000]).strip("\"")' < ${outdir}/excerpt.txt)\n\`\`\`\nPlease assign, take a look and update the issue accordingly.\", \"labels\": [\"test-failure\", \"Robot\"], \"milestone\": 4 }" > /dev/null
       echo "Found test/race failures in test logs, see excerpt.log and the newly created issue on our issue tracker"
   fi
 
@@ -114,9 +113,6 @@ trap prepare_artifacts EXIT
 function is_shard() {
   test $(($1 % $CIRCLE_NODE_TOTAL)) -eq $CIRCLE_NODE_INDEX
 }
-
-# Enable dumping of all goroutine stacks due to unrecovered panics.
-export GOTRACEBACK=all
 
 # Note that the order of the is_shard tests is a bit odd. It would be
 # more natural to check shard 0, then 1, and then 2. The odd ordering
@@ -133,7 +129,7 @@ if is_shard 2; then
   # Verify that "go generate" was run.
   echo "verifying generated files"
   time ${builder} go generate ./...
-  time ${builder} /bin/bash -c '! git status --porcelain | read || (git status; git diff; exit 1)' | tee "${outdir}"/generate.log
+  time ${builder} /bin/bash -c '! git status --porcelain | read || (git status; git diff -a; exit 1)' | tee "${outdir}"/generate.log
 fi
 
 if is_shard 0; then

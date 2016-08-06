@@ -18,16 +18,20 @@ package keys
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
+	"github.com/pkg/errors"
+
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/encoding"
 	"github.com/cockroachdb/cockroach/util/uuid"
 )
+
+// PrettyPrintTimeseriesKey is a hook for pretty printing a timeseries key. The
+// timeseries key prefix will already have been stripped off.
+var PrettyPrintTimeseriesKey func(key roachpb.Key) string
 
 type dictEntry struct {
 	name   string
@@ -80,7 +84,7 @@ var (
 					if len(unq) == 0 {
 						return "", Meta1Prefix
 					}
-					return "", RangeMetaKey(mustAddr(RangeMetaKey(mustAddr(
+					return "", RangeMetaKey(MustAddr(RangeMetaKey(MustAddr(
 						roachpb.Key(unq)))))
 				},
 			}},
@@ -96,13 +100,17 @@ var (
 					if len(unq) == 0 {
 						return "", Meta2Prefix
 					}
-					return "", RangeMetaKey(mustAddr(roachpb.Key(unq)))
+					return "", RangeMetaKey(MustAddr(roachpb.Key(unq)))
 				},
 			}},
 		},
 		{name: "/System", start: SystemPrefix, end: SystemMax, entries: []dictEntry{
 			{name: "/StatusNode", prefix: StatusNodePrefix,
 				ppFunc: decodeKeyPrint,
+				psFunc: parseUnsupported,
+			},
+			{name: "/tsd", prefix: TimeseriesPrefix,
+				ppFunc: decodeTimeseriesKey,
 				psFunc: parseUnsupported,
 			},
 		}},
@@ -129,19 +137,22 @@ var (
 		psFunc func(rangeID roachpb.RangeID, input string) (string, roachpb.Key)
 	}{
 		{name: "AbortCache", suffix: LocalAbortCacheSuffix, ppFunc: abortCacheKeyPrint, psFunc: abortCacheKeyParse},
-		{name: "RaftTombstone", suffix: localRaftTombstoneSuffix},
-		{name: "RaftHardState", suffix: localRaftHardStateSuffix},
+		{name: "RaftTombstone", suffix: LocalRaftTombstoneSuffix},
+		{name: "RaftHardState", suffix: LocalRaftHardStateSuffix},
 		{name: "RaftAppliedIndex", suffix: LocalRaftAppliedIndexSuffix},
+		{name: "LeaseAppliedIndex", suffix: LocalLeaseAppliedIndexSuffix},
 		{name: "RaftLog", suffix: LocalRaftLogSuffix,
 			ppFunc: raftLogKeyPrint,
 			psFunc: raftLogKeyParse,
 		},
 		{name: "RaftTruncatedState", suffix: LocalRaftTruncatedStateSuffix},
-		{name: "RaftLastIndex", suffix: localRaftLastIndexSuffix},
-		{name: "RangeLastReplicaGCTimestamp", suffix: localRangeLastReplicaGCTimestampSuffix},
-		{name: "RangeLastVerificationTimestamp", suffix: localRangeLastVerificationTimestampSuffix},
-		{name: "RangeLeaderLease", suffix: localRangeLeaderLeaseSuffix},
-		{name: "RangeStats", suffix: localRangeStatsSuffix},
+		{name: "RaftLastIndex", suffix: LocalRaftLastIndexSuffix},
+		{name: "RangeLastReplicaGCTimestamp", suffix: LocalRangeLastReplicaGCTimestampSuffix},
+		{name: "RangeLastVerificationTimestamp", suffix: LocalRangeLastVerificationTimestampSuffix},
+		{name: "RangeLease", suffix: LocalRangeLeaseSuffix},
+		{name: "RangeStats", suffix: LocalRangeStatsSuffix},
+		{name: "RangeFrozenStatus", suffix: LocalRangeFrozenStatusSuffix},
+		{name: "RangeLastGC", suffix: LocalRangeLastGCSuffix},
 	}
 
 	rangeSuffixDict = []struct {
@@ -150,7 +161,6 @@ var (
 		atEnd  bool
 	}{
 		{name: "RangeDescriptor", suffix: LocalRangeDescriptorSuffix, atEnd: true},
-		{name: "RangeTreeNode", suffix: localRangeTreeNodeSuffix, atEnd: true},
 		{name: "Transaction", suffix: localTransactionSuffix, atEnd: false},
 	}
 )
@@ -241,7 +251,7 @@ func localRangeIDKeyParse(input string) (remainder string, key roachpb.Key) {
 		}
 		input = input[endPos:]
 	} else {
-		panic(errors.New("illegal RangeID"))
+		panic(errors.Errorf("illegal RangeID: %q", input))
 	}
 	input = mustShiftSlash(input)
 	var infix string
@@ -252,7 +262,7 @@ func localRangeIDKeyParse(input string) (remainder string, key roachpb.Key) {
 	case bytes.Equal(localRangeIDReplicatedInfix, []byte(infix)):
 		replicated = true
 	default:
-		panic(fmt.Errorf("invalid infix"))
+		panic(errors.Errorf("invalid infix: %q", infix))
 	}
 
 	input = mustShiftSlash(input)
@@ -284,7 +294,7 @@ func localRangeIDKeyParse(input string) (remainder string, key roachpb.Key) {
 		// 	return "", nil, err
 		// }
 		remainder = ""
-		key = maker(roachpb.RangeID(rangeID), suffix, roachpb.RKey(detail))
+		key = maker(roachpb.RangeID(rangeID), suffix, detail)
 		return
 	}
 	panic(&errUglifyUnsupported{errors.New("unhandled general range key")})
@@ -407,6 +417,10 @@ func decodeKeyPrint(key roachpb.Key) string {
 	return encoding.PrettyPrintValue(key, "/")
 }
 
+func decodeTimeseriesKey(key roachpb.Key) string {
+	return PrettyPrintTimeseriesKey(key)
+}
+
 // prettyPrintInternal parse key with prefix in keyDict,
 // if the key don't march any prefix in keyDict, return its byte value with quotation and false,
 // or else return its human readable value and true.
@@ -448,7 +462,7 @@ func prettyPrintInternal(key roachpb.Key) (string, bool) {
 // 		/Store/...                                  "\x01s"+...
 //		/RangeID/...                                "\x01s"+[rangeid]
 //			/[rangeid]/AbortCache/[id]                "\x01s"+[rangeid]+"abc-"+[id]
-//			/[rangeid]/RaftLeaderLease                "\x01s"+[rangeid]+"rfll"
+//			/[rangeid]/Lease						  "\x01s"+[rangeid]+"rfll"
 //			/[rangeid]/RaftTombstone                  "\x01s"+[rangeid]+"rftb"
 //			/[rangeid]/RaftHardState						      "\x01s"+[rangeid]+"rfth"
 //			/[rangeid]/RaftAppliedIndex						    "\x01s"+[rangeid]+"rfta"
@@ -460,7 +474,6 @@ func prettyPrintInternal(key roachpb.Key) (string, bool) {
 //			/[rangeid]/RangeStats                     "\x01s"+[rangeid]+"stat"
 //		/Range/...                                  "\x01k"+...
 //			/RangeDescriptor/[key]                    "\x01k"+[key]+"rdsc"
-//			/RangeTreeNode/[key]                      "\x01k"+[key]+"rtn-"
 //			/Transaction/addrKey:[key]/id:[id]				"\x01k"+[key]+"txn-"+[id]
 // /Local/Max                                     "\x02"
 //
@@ -508,7 +521,7 @@ func UglyPrint(input string) (_ roachpb.Key, rErr error) {
 				rErr = err
 				return
 			}
-			rErr = fmt.Errorf("%v", r)
+			rErr = errors.Errorf("%v", r)
 		}
 	}()
 
@@ -519,7 +532,7 @@ func UglyPrint(input string) (_ roachpb.Key, rErr error) {
 		if err == nil {
 			err = errIllegalInput
 		}
-		return nil, util.ErrorfSkipFrames(1, `can't parse "%s" after reading %s: %s`, input, origInput[:len(origInput)-len(input)], err)
+		return nil, errors.Errorf(`can't parse "%s" after reading %s: %s`, input, origInput[:len(origInput)-len(input)], err)
 	}
 
 	var entries []dictEntry // nil if not pinned to a subrange
@@ -560,7 +573,7 @@ outer:
 		return mkErr(errors.New("can't handle key"))
 	}
 	if out := PrettyPrint(output); out != origInput {
-		return nil, fmt.Errorf("constructed key deviates from original: %s vs %s", out, origInput)
+		return nil, errors.Errorf("constructed key deviates from original: %s vs %s", out, origInput)
 	}
 	return output, nil
 }

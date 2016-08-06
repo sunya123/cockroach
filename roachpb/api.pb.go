@@ -45,6 +45,8 @@
 		AdminSplitResponse
 		AdminMergeRequest
 		AdminMergeResponse
+		AdminTransferLeaseRequest
+		AdminTransferLeaseResponse
 		RangeLookupRequest
 		RangeLookupResponse
 		HeartbeatTxnRequest
@@ -63,8 +65,9 @@
 		MergeResponse
 		TruncateLogRequest
 		TruncateLogResponse
-		LeaderLeaseRequest
-		LeaderLeaseResponse
+		RequestLeaseRequest
+		TransferLeaseRequest
+		RequestLeaseResponse
 		ComputeChecksumRequest
 		ComputeChecksumResponse
 		VerifyChecksumRequest
@@ -78,8 +81,9 @@
 		StoreRequestHeader
 		PollFrozenRequest
 		PollFrozenResponse
+		ReservationRequest
+		ReservationResponse
 		Span
-		Timestamp
 		Value
 		KeyValue
 		StoreIdent
@@ -88,12 +92,11 @@
 		ChangeReplicasTrigger
 		ModifiedSpanTrigger
 		InternalCommitTrigger
-		TxnMeta
 		Transaction
 		Intent
 		Lease
 		AbortCacheEntry
-		NotLeaderError
+		NotLeaseHolderError
 		NodeUnavailableError
 		RangeNotFoundError
 		RangeKeyMismatchError
@@ -122,17 +125,21 @@
 		RaftSnapshotData
 		Attributes
 		ReplicaDescriptor
+		ReplicaIdent
 		RangeDescriptor
 		StoreCapacity
 		NodeDescriptor
 		StoreDescriptor
+		StoreDeadReplicas
 */
 package roachpb
 
 import proto "github.com/gogo/protobuf/proto"
 import fmt "fmt"
 import math "math"
+import cockroach_storage_engine_enginepb "github.com/cockroachdb/cockroach/storage/engine/enginepb"
 import cockroach_util_tracing "github.com/cockroachdb/cockroach/util/tracing"
+import cockroach_util_hlc "github.com/cockroachdb/cockroach/util/hlc"
 
 // skipping weak import gogoproto "github.com/cockroachdb/gogoproto"
 
@@ -154,7 +161,9 @@ var _ = math.Inf
 
 // This is a compile-time assertion to ensure that this generated file
 // is compatible with the proto package it is being compiled against.
-const _ = proto.GoGoProtoPackageIsVersion1
+// A compilation error at this line likely means your copy of the
+// proto package needs to be updated.
+const _ = proto.GoGoProtoPackageIsVersion2 // please upgrade the proto package
 
 // ReadConsistencyType specifies what type of consistency is observed
 // during read operations.
@@ -428,10 +437,8 @@ func (*DeleteResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, 
 // specifies the range of keys to delete.
 type DeleteRangeRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
-	// If 0, *all* entries between key (inclusive) and end_key
-	// (exclusive) are deleted. Must be >= 0.
-	MaxEntriesToDelete int64 `protobuf:"varint,2,opt,name=max_entries_to_delete,json=maxEntriesToDelete" json:"max_entries_to_delete"`
-	ReturnKeys         bool  `protobuf:"varint,3,opt,name=return_keys,json=returnKeys" json:"return_keys"`
+	// return the keys that are deleted in the response.
+	ReturnKeys bool `protobuf:"varint,3,opt,name=return_keys,json=returnKeys" json:"return_keys"`
 }
 
 func (m *DeleteRangeRequest) Reset()                    { *m = DeleteRangeRequest{} }
@@ -443,7 +450,7 @@ func (*DeleteRangeRequest) Descriptor() ([]byte, []int) { return fileDescriptorA
 // method.
 type DeleteRangeResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
-	// Number of entries removed.
+	// All the deleted keys if return_keys is set.
 	Keys []Key `protobuf:"bytes,2,rep,name=keys,casttype=Key" json:"keys,omitempty"`
 }
 
@@ -454,11 +461,9 @@ func (*DeleteRangeResponse) Descriptor() ([]byte, []int) { return fileDescriptor
 
 // A ScanRequest is the argument to the Scan() method. It specifies the
 // start and end keys for an ascending scan of [start,end) and the maximum
-// number of results.
+// number of results (unbounded if zero).
 type ScanRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
-	// If 0, there is no limit on the number of retrieved entries. Must be >= 0.
-	MaxResults int64 `protobuf:"varint,2,opt,name=max_results,json=maxResults" json:"max_results"`
 }
 
 func (m *ScanRequest) Reset()                    { *m = ScanRequest{} }
@@ -480,11 +485,9 @@ func (*ScanResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []
 
 // A ReverseScanRequest is the argument to the ReverseScan() method. It specifies the
 // start and end keys for a descending scan of [start,end) and the maximum
-// number of results.
+// number of results (unbounded if zero).
 type ReverseScanRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
-	// If 0, there is no limit on the number of retrieved entries. Must be >= 0.
-	MaxResults int64 `protobuf:"varint,2,opt,name=max_results,json=maxResults" json:"max_results"`
 }
 
 func (m *ReverseScanRequest) Reset()                    { *m = ReverseScanRequest{} }
@@ -520,7 +523,7 @@ func (*CheckConsistencyRequest) ProtoMessage()               {}
 func (*CheckConsistencyRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{19} }
 
 // A CheckConsistencyResponse is the return value from the CheckConsistency() method.
-// If a replica finds itself to be inconsistent with its leader it will panic.
+// If a replica finds itself to be inconsistent with its lease holder it will panic.
 type CheckConsistencyResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
@@ -595,7 +598,7 @@ type EndTransactionRequest struct {
 	// False to abort and rollback.
 	Commit bool `protobuf:"varint,2,opt,name=commit" json:"commit"`
 	// The deadline by which the transaction must commit, if present.
-	Deadline *Timestamp `protobuf:"bytes,3,opt,name=deadline" json:"deadline,omitempty"`
+	Deadline *cockroach_util_hlc.Timestamp `protobuf:"bytes,3,opt,name=deadline" json:"deadline,omitempty"`
 	// Optional commit triggers. Note that commit triggers are for
 	// internal use only and will cause an error if requested through the
 	// external-facing KV API.
@@ -706,6 +709,29 @@ func (m *AdminMergeResponse) String() string            { return proto.CompactTe
 func (*AdminMergeResponse) ProtoMessage()               {}
 func (*AdminMergeResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{30} }
 
+// An AdminTransferLeaseRequest is the argument to the AdminTransferLease()
+// method. A lease transfer allows an external entity to control the lease
+// holder for a range. The target of the lease transfer needs to be a valid
+// replica of the range.
+type AdminTransferLeaseRequest struct {
+	Span   `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
+	Target StoreID `protobuf:"varint,2,opt,name=target,casttype=StoreID" json:"target"`
+}
+
+func (m *AdminTransferLeaseRequest) Reset()                    { *m = AdminTransferLeaseRequest{} }
+func (m *AdminTransferLeaseRequest) String() string            { return proto.CompactTextString(m) }
+func (*AdminTransferLeaseRequest) ProtoMessage()               {}
+func (*AdminTransferLeaseRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{31} }
+
+type AdminTransferLeaseResponse struct {
+	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
+}
+
+func (m *AdminTransferLeaseResponse) Reset()                    { *m = AdminTransferLeaseResponse{} }
+func (m *AdminTransferLeaseResponse) String() string            { return proto.CompactTextString(m) }
+func (*AdminTransferLeaseResponse) ProtoMessage()               {}
+func (*AdminTransferLeaseResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{32} }
+
 // A RangeLookupRequest is arguments to the RangeLookup() method. A
 // forward lookup request returns a range containing the requested
 // key. A reverse lookup request returns a range containing the
@@ -733,7 +759,7 @@ type RangeLookupRequest struct {
 func (m *RangeLookupRequest) Reset()                    { *m = RangeLookupRequest{} }
 func (m *RangeLookupRequest) String() string            { return proto.CompactTextString(m) }
 func (*RangeLookupRequest) ProtoMessage()               {}
-func (*RangeLookupRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{31} }
+func (*RangeLookupRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{33} }
 
 // A RangeLookupResponse is the return value from the RangeLookup()
 // method. It returns metadata for the range containing the requested
@@ -749,7 +775,7 @@ type RangeLookupResponse struct {
 func (m *RangeLookupResponse) Reset()                    { *m = RangeLookupResponse{} }
 func (m *RangeLookupResponse) String() string            { return proto.CompactTextString(m) }
 func (*RangeLookupResponse) ProtoMessage()               {}
-func (*RangeLookupResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{32} }
+func (*RangeLookupResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{34} }
 
 // A HeartbeatTxnRequest is arguments to the HeartbeatTxn()
 // method. It's sent by transaction coordinators to let the system
@@ -758,13 +784,13 @@ func (*RangeLookupResponse) Descriptor() ([]byte, []int) { return fileDescriptor
 // gossip protocol.
 type HeartbeatTxnRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
-	Now  Timestamp `protobuf:"bytes,2,opt,name=now" json:"now"`
+	Now  cockroach_util_hlc.Timestamp `protobuf:"bytes,2,opt,name=now" json:"now"`
 }
 
 func (m *HeartbeatTxnRequest) Reset()                    { *m = HeartbeatTxnRequest{} }
 func (m *HeartbeatTxnRequest) String() string            { return proto.CompactTextString(m) }
 func (*HeartbeatTxnRequest) ProtoMessage()               {}
-func (*HeartbeatTxnRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{33} }
+func (*HeartbeatTxnRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{35} }
 
 // A HeartbeatTxnResponse is the return value from the HeartbeatTxn()
 // method. It returns the transaction info in the response header. The
@@ -777,29 +803,31 @@ type HeartbeatTxnResponse struct {
 func (m *HeartbeatTxnResponse) Reset()                    { *m = HeartbeatTxnResponse{} }
 func (m *HeartbeatTxnResponse) String() string            { return proto.CompactTextString(m) }
 func (*HeartbeatTxnResponse) ProtoMessage()               {}
-func (*HeartbeatTxnResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{34} }
+func (*HeartbeatTxnResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{36} }
 
 // A GCRequest is arguments to the GC() method. It's sent by range
-// leaders after scanning range data to find expired MVCC values.
+// lease holders after scanning range data to find expired MVCC values.
 type GCRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 	Keys []GCRequest_GCKey `protobuf:"bytes,3,rep,name=keys" json:"keys"`
+	// Threshold is the expiration timestamp.
+	Threshold cockroach_util_hlc.Timestamp `protobuf:"bytes,4,opt,name=threshold" json:"threshold"`
 }
 
 func (m *GCRequest) Reset()                    { *m = GCRequest{} }
 func (m *GCRequest) String() string            { return proto.CompactTextString(m) }
 func (*GCRequest) ProtoMessage()               {}
-func (*GCRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{35} }
+func (*GCRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{37} }
 
 type GCRequest_GCKey struct {
-	Key       Key       `protobuf:"bytes,1,opt,name=key,casttype=Key" json:"key,omitempty"`
-	Timestamp Timestamp `protobuf:"bytes,2,opt,name=timestamp" json:"timestamp"`
+	Key       Key                          `protobuf:"bytes,1,opt,name=key,casttype=Key" json:"key,omitempty"`
+	Timestamp cockroach_util_hlc.Timestamp `protobuf:"bytes,2,opt,name=timestamp" json:"timestamp"`
 }
 
 func (m *GCRequest_GCKey) Reset()                    { *m = GCRequest_GCKey{} }
 func (m *GCRequest_GCKey) String() string            { return proto.CompactTextString(m) }
 func (*GCRequest_GCKey) ProtoMessage()               {}
-func (*GCRequest_GCKey) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{35, 0} }
+func (*GCRequest_GCKey) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{37, 0} }
 
 // A GCResponse is the return value from the GC() method.
 type GCResponse struct {
@@ -809,7 +837,7 @@ type GCResponse struct {
 func (m *GCResponse) Reset()                    { *m = GCResponse{} }
 func (m *GCResponse) String() string            { return proto.CompactTextString(m) }
 func (*GCResponse) ProtoMessage()               {}
-func (*GCResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{36} }
+func (*GCResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{38} }
 
 // A PushTxnRequest is arguments to the PushTxn() method. It's sent by
 // readers or writers which have encountered an "intent" laid down by
@@ -835,16 +863,16 @@ type PushTxnRequest struct {
 	// the push transaction request. Note that this may not be the most
 	// up-to-date value of the transaction record, but will be set or
 	// merged as appropriate.
-	PusheeTxn TxnMeta `protobuf:"bytes,3,opt,name=pushee_txn,json=pusheeTxn" json:"pushee_txn"`
+	PusheeTxn cockroach_storage_engine_enginepb.TxnMeta `protobuf:"bytes,3,opt,name=pushee_txn,json=pusheeTxn" json:"pushee_txn"`
 	// PushTo is the timestamp just after which PusheeTxn is attempted to be
 	// pushed. During conflict resolution, it should be set to the timestamp
 	// of the its conflicting write.
-	PushTo Timestamp `protobuf:"bytes,4,opt,name=push_to,json=pushTo" json:"push_to"`
+	PushTo cockroach_util_hlc.Timestamp `protobuf:"bytes,4,opt,name=push_to,json=pushTo" json:"push_to"`
 	// Now holds the timestamp used to compare the last heartbeat of the pushee
 	// against. This is necessary since the request header's timestamp does not
 	// necessarily advance with the node clock across retries and hence cannot
 	// detect abandoned transactions.
-	Now Timestamp `protobuf:"bytes,5,opt,name=now" json:"now"`
+	Now cockroach_util_hlc.Timestamp `protobuf:"bytes,5,opt,name=now" json:"now"`
 	// Readers set this to PUSH_TIMESTAMP to move pushee_txn's provisional
 	// commit timestamp forward. Writers set this to PUSH_ABORT to request
 	// that pushee_txn be aborted if possible. Inconsistent readers set
@@ -856,7 +884,7 @@ type PushTxnRequest struct {
 func (m *PushTxnRequest) Reset()                    { *m = PushTxnRequest{} }
 func (m *PushTxnRequest) String() string            { return proto.CompactTextString(m) }
 func (*PushTxnRequest) ProtoMessage()               {}
-func (*PushTxnRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{37} }
+func (*PushTxnRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{39} }
 
 // A PushTxnResponse is the return value from the PushTxn() method. It
 // returns success and the resulting state of PusheeTxn if the
@@ -875,7 +903,7 @@ type PushTxnResponse struct {
 func (m *PushTxnResponse) Reset()                    { *m = PushTxnResponse{} }
 func (m *PushTxnResponse) String() string            { return proto.CompactTextString(m) }
 func (*PushTxnResponse) ProtoMessage()               {}
-func (*PushTxnResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{38} }
+func (*PushTxnResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{40} }
 
 // A ResolveIntentRequest is arguments to the ResolveIntent()
 // method. It is sent by transaction coordinators after success
@@ -884,7 +912,7 @@ func (*PushTxnResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi,
 type ResolveIntentRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 	// The transaction whose intent is being resolved.
-	IntentTxn TxnMeta `protobuf:"bytes,2,opt,name=intent_txn,json=intentTxn" json:"intent_txn"`
+	IntentTxn cockroach_storage_engine_enginepb.TxnMeta `protobuf:"bytes,2,opt,name=intent_txn,json=intentTxn" json:"intent_txn"`
 	// The status of the transaction.
 	Status TransactionStatus `protobuf:"varint,3,opt,name=status,enum=cockroach.roachpb.TransactionStatus" json:"status"`
 	// Optionally poison the sequence cache for the transaction the intent's
@@ -895,7 +923,7 @@ type ResolveIntentRequest struct {
 func (m *ResolveIntentRequest) Reset()                    { *m = ResolveIntentRequest{} }
 func (m *ResolveIntentRequest) String() string            { return proto.CompactTextString(m) }
 func (*ResolveIntentRequest) ProtoMessage()               {}
-func (*ResolveIntentRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{39} }
+func (*ResolveIntentRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{41} }
 
 // A ResolveIntentResponse is the return value from the
 // ResolveIntent() method.
@@ -906,7 +934,7 @@ type ResolveIntentResponse struct {
 func (m *ResolveIntentResponse) Reset()                    { *m = ResolveIntentResponse{} }
 func (m *ResolveIntentResponse) String() string            { return proto.CompactTextString(m) }
 func (*ResolveIntentResponse) ProtoMessage()               {}
-func (*ResolveIntentResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{40} }
+func (*ResolveIntentResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{42} }
 
 // A ResolveIntentRangeRequest is arguments to the ResolveIntentRange() method.
 // It is sent by transaction coordinators after success calling PushTxn to
@@ -915,7 +943,7 @@ func (*ResolveIntentResponse) Descriptor() ([]byte, []int) { return fileDescript
 type ResolveIntentRangeRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 	// The transaction whose intents are being resolved.
-	IntentTxn TxnMeta `protobuf:"bytes,2,opt,name=intent_txn,json=intentTxn" json:"intent_txn"`
+	IntentTxn cockroach_storage_engine_enginepb.TxnMeta `protobuf:"bytes,2,opt,name=intent_txn,json=intentTxn" json:"intent_txn"`
 	// The status of the transaction.
 	Status TransactionStatus `protobuf:"varint,3,opt,name=status,enum=cockroach.roachpb.TransactionStatus" json:"status"`
 	// Optionally poison the sequence cache for the transaction on all ranges
@@ -926,7 +954,7 @@ type ResolveIntentRangeRequest struct {
 func (m *ResolveIntentRangeRequest) Reset()                    { *m = ResolveIntentRangeRequest{} }
 func (m *ResolveIntentRangeRequest) String() string            { return proto.CompactTextString(m) }
 func (*ResolveIntentRangeRequest) ProtoMessage()               {}
-func (*ResolveIntentRangeRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{41} }
+func (*ResolveIntentRangeRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{43} }
 
 // A NoopResponse is the return value from a no-op operation.
 type NoopResponse struct {
@@ -935,7 +963,7 @@ type NoopResponse struct {
 func (m *NoopResponse) Reset()                    { *m = NoopResponse{} }
 func (m *NoopResponse) String() string            { return proto.CompactTextString(m) }
 func (*NoopResponse) ProtoMessage()               {}
-func (*NoopResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{42} }
+func (*NoopResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{44} }
 
 // A NoopRequest is a no-op.
 type NoopRequest struct {
@@ -944,7 +972,7 @@ type NoopRequest struct {
 func (m *NoopRequest) Reset()                    { *m = NoopRequest{} }
 func (m *NoopRequest) String() string            { return proto.CompactTextString(m) }
 func (*NoopRequest) ProtoMessage()               {}
-func (*NoopRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{43} }
+func (*NoopRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{45} }
 
 // A ResolveIntentRangeResponse is the return value from the
 // ResolveIntent() method.
@@ -955,7 +983,7 @@ type ResolveIntentRangeResponse struct {
 func (m *ResolveIntentRangeResponse) Reset()                    { *m = ResolveIntentRangeResponse{} }
 func (m *ResolveIntentRangeResponse) String() string            { return proto.CompactTextString(m) }
 func (*ResolveIntentRangeResponse) ProtoMessage()               {}
-func (*ResolveIntentRangeResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{44} }
+func (*ResolveIntentRangeResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{46} }
 
 // A MergeRequest contains arguments to the Merge() method. It
 // specifies a key and a value which should be merged into the
@@ -968,7 +996,7 @@ type MergeRequest struct {
 func (m *MergeRequest) Reset()                    { *m = MergeRequest{} }
 func (m *MergeRequest) String() string            { return proto.CompactTextString(m) }
 func (*MergeRequest) ProtoMessage()               {}
-func (*MergeRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{45} }
+func (*MergeRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{47} }
 
 // MergeResponse is the response to a Merge() operation.
 type MergeResponse struct {
@@ -978,7 +1006,7 @@ type MergeResponse struct {
 func (m *MergeResponse) Reset()                    { *m = MergeResponse{} }
 func (m *MergeResponse) String() string            { return proto.CompactTextString(m) }
 func (*MergeResponse) ProtoMessage()               {}
-func (*MergeResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{46} }
+func (*MergeResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{48} }
 
 // TruncateLogRequest is used to remove a prefix of the raft log. While there
 // is no requirement for correctness that the raft log truncation be synchronized across
@@ -999,7 +1027,7 @@ type TruncateLogRequest struct {
 func (m *TruncateLogRequest) Reset()                    { *m = TruncateLogRequest{} }
 func (m *TruncateLogRequest) String() string            { return proto.CompactTextString(m) }
 func (*TruncateLogRequest) ProtoMessage()               {}
-func (*TruncateLogRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{47} }
+func (*TruncateLogRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{49} }
 
 // TruncateLogResponse is the response to a TruncateLog() operation.
 type TruncateLogResponse struct {
@@ -1009,31 +1037,53 @@ type TruncateLogResponse struct {
 func (m *TruncateLogResponse) Reset()                    { *m = TruncateLogResponse{} }
 func (m *TruncateLogResponse) String() string            { return proto.CompactTextString(m) }
 func (*TruncateLogResponse) ProtoMessage()               {}
-func (*TruncateLogResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{48} }
+func (*TruncateLogResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{50} }
 
-// A LeaderLeaseRequest is arguments to the LeaderLease()
+// A RequestLeaseRequest is arguments to the RequestLease()
 // method. It is sent by the store on behalf of one of its ranges upon receipt
-// of a leader election event for that range.
-type LeaderLeaseRequest struct {
+// of a command requiring a lease when none is found.
+type RequestLeaseRequest struct {
 	Span  `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 	Lease Lease `protobuf:"bytes,2,opt,name=lease" json:"lease"`
 }
 
-func (m *LeaderLeaseRequest) Reset()                    { *m = LeaderLeaseRequest{} }
-func (m *LeaderLeaseRequest) String() string            { return proto.CompactTextString(m) }
-func (*LeaderLeaseRequest) ProtoMessage()               {}
-func (*LeaderLeaseRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{49} }
+func (m *RequestLeaseRequest) Reset()                    { *m = RequestLeaseRequest{} }
+func (m *RequestLeaseRequest) String() string            { return proto.CompactTextString(m) }
+func (*RequestLeaseRequest) ProtoMessage()               {}
+func (*RequestLeaseRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{51} }
 
-// A LeaderLeaseResponse is the response to a LeaderLease()
+// A TransferLeaseRequest represents the arguments to the TransferLease()
+// method. It is sent by a replica that currently holds the range lease and
+// wants to transfer it away.
+//
+// Like a RequestLeaseRequest, this request has the effect of instituting a new
+// lease. The difference is that the new lease is allowed to overlap the
+// existing one. It is a separate request because the LeaderLeaseRequest is
+// special - it's not subject to the same replay protection restrictions as
+// other requests, instead being protected from replays by the fact that leases
+// are not generally allowed to overlap. The TransferLeaseRequest is not
+// special in this respect (for example, the proposer of this command is
+// checked to have been holding the lease when the proposal was made).
+type TransferLeaseRequest struct {
+	Span  `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
+	Lease Lease `protobuf:"bytes,2,opt,name=lease" json:"lease"`
+}
+
+func (m *TransferLeaseRequest) Reset()                    { *m = TransferLeaseRequest{} }
+func (m *TransferLeaseRequest) String() string            { return proto.CompactTextString(m) }
+func (*TransferLeaseRequest) ProtoMessage()               {}
+func (*TransferLeaseRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{52} }
+
+// A RequestLeaseResponse is the response to a RequestLease() or TransferLease()
 // operation.
-type LeaderLeaseResponse struct {
+type RequestLeaseResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *LeaderLeaseResponse) Reset()                    { *m = LeaderLeaseResponse{} }
-func (m *LeaderLeaseResponse) String() string            { return proto.CompactTextString(m) }
-func (*LeaderLeaseResponse) ProtoMessage()               {}
-func (*LeaderLeaseResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{50} }
+func (m *RequestLeaseResponse) Reset()                    { *m = RequestLeaseResponse{} }
+func (m *RequestLeaseResponse) String() string            { return proto.CompactTextString(m) }
+func (*RequestLeaseResponse) ProtoMessage()               {}
+func (*RequestLeaseResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{53} }
 
 // A ComputeChecksumRequest is arguments to the ComputeChecksum() method, to
 // start computing the checksum for the specified range at the snapshot for
@@ -1055,7 +1105,7 @@ type ComputeChecksumRequest struct {
 func (m *ComputeChecksumRequest) Reset()                    { *m = ComputeChecksumRequest{} }
 func (m *ComputeChecksumRequest) String() string            { return proto.CompactTextString(m) }
 func (*ComputeChecksumRequest) ProtoMessage()               {}
-func (*ComputeChecksumRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{51} }
+func (*ComputeChecksumRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{54} }
 
 // A ComputeChecksumResponse is the response to a ComputeChecksum() operation.
 type ComputeChecksumResponse struct {
@@ -1065,10 +1115,10 @@ type ComputeChecksumResponse struct {
 func (m *ComputeChecksumResponse) Reset()                    { *m = ComputeChecksumResponse{} }
 func (m *ComputeChecksumResponse) String() string            { return proto.CompactTextString(m) }
 func (*ComputeChecksumResponse) ProtoMessage()               {}
-func (*ComputeChecksumResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{52} }
+func (*ComputeChecksumResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{55} }
 
 // A VerifyChecksumRequest is arguments to the VerifyChecksum() method, to
-// verify the checksum computed on the leader against the one requested
+// verify the checksum computed on the lease holder against the one requested
 // earlier through a ComputeChecksumRequest with the same checksum_id.
 type VerifyChecksumRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
@@ -1084,7 +1134,7 @@ type VerifyChecksumRequest struct {
 func (m *VerifyChecksumRequest) Reset()                    { *m = VerifyChecksumRequest{} }
 func (m *VerifyChecksumRequest) String() string            { return proto.CompactTextString(m) }
 func (*VerifyChecksumRequest) ProtoMessage()               {}
-func (*VerifyChecksumRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{53} }
+func (*VerifyChecksumRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{56} }
 
 // A VerifyChecksumResponse is the response to a VerifyChecksum() operation.
 type VerifyChecksumResponse struct {
@@ -1094,7 +1144,7 @@ type VerifyChecksumResponse struct {
 func (m *VerifyChecksumResponse) Reset()                    { *m = VerifyChecksumResponse{} }
 func (m *VerifyChecksumResponse) String() string            { return proto.CompactTextString(m) }
 func (*VerifyChecksumResponse) ProtoMessage()               {}
-func (*VerifyChecksumResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{54} }
+func (*VerifyChecksumResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{57} }
 
 // A RequestUnion contains exactly one of the optional requests.
 // The values added here must match those in ResponseUnion.
@@ -1110,6 +1160,7 @@ type RequestUnion struct {
 	EndTransaction     *EndTransactionRequest     `protobuf:"bytes,9,opt,name=end_transaction,json=endTransaction" json:"end_transaction,omitempty"`
 	AdminSplit         *AdminSplitRequest         `protobuf:"bytes,10,opt,name=admin_split,json=adminSplit" json:"admin_split,omitempty"`
 	AdminMerge         *AdminMergeRequest         `protobuf:"bytes,11,opt,name=admin_merge,json=adminMerge" json:"admin_merge,omitempty"`
+	AdminTransferLease *AdminTransferLeaseRequest `protobuf:"bytes,29,opt,name=admin_transfer_lease,json=adminTransferLease" json:"admin_transfer_lease,omitempty"`
 	HeartbeatTxn       *HeartbeatTxnRequest       `protobuf:"bytes,12,opt,name=heartbeat_txn,json=heartbeatTxn" json:"heartbeat_txn,omitempty"`
 	Gc                 *GCRequest                 `protobuf:"bytes,13,opt,name=gc" json:"gc,omitempty"`
 	PushTxn            *PushTxnRequest            `protobuf:"bytes,14,opt,name=push_txn,json=pushTxn" json:"push_txn,omitempty"`
@@ -1118,7 +1169,7 @@ type RequestUnion struct {
 	ResolveIntentRange *ResolveIntentRangeRequest `protobuf:"bytes,17,opt,name=resolve_intent_range,json=resolveIntentRange" json:"resolve_intent_range,omitempty"`
 	Merge              *MergeRequest              `protobuf:"bytes,18,opt,name=merge" json:"merge,omitempty"`
 	TruncateLog        *TruncateLogRequest        `protobuf:"bytes,19,opt,name=truncate_log,json=truncateLog" json:"truncate_log,omitempty"`
-	LeaderLease        *LeaderLeaseRequest        `protobuf:"bytes,20,opt,name=leader_lease,json=leaderLease" json:"leader_lease,omitempty"`
+	RequestLease       *RequestLeaseRequest       `protobuf:"bytes,20,opt,name=request_lease,json=requestLease" json:"request_lease,omitempty"`
 	ReverseScan        *ReverseScanRequest        `protobuf:"bytes,21,opt,name=reverse_scan,json=reverseScan" json:"reverse_scan,omitempty"`
 	ComputeChecksum    *ComputeChecksumRequest    `protobuf:"bytes,22,opt,name=compute_checksum,json=computeChecksum" json:"compute_checksum,omitempty"`
 	VerifyChecksum     *VerifyChecksumRequest     `protobuf:"bytes,23,opt,name=verify_checksum,json=verifyChecksum" json:"verify_checksum,omitempty"`
@@ -1126,12 +1177,13 @@ type RequestUnion struct {
 	Noop               *NoopRequest               `protobuf:"bytes,25,opt,name=noop" json:"noop,omitempty"`
 	InitPut            *InitPutRequest            `protobuf:"bytes,26,opt,name=init_put,json=initPut" json:"init_put,omitempty"`
 	ChangeFrozen       *ChangeFrozenRequest       `protobuf:"bytes,27,opt,name=change_frozen,json=changeFrozen" json:"change_frozen,omitempty"`
+	TransferLease      *TransferLeaseRequest      `protobuf:"bytes,28,opt,name=transfer_lease,json=transferLease" json:"transfer_lease,omitempty"`
 }
 
 func (m *RequestUnion) Reset()                    { *m = RequestUnion{} }
 func (m *RequestUnion) String() string            { return proto.CompactTextString(m) }
 func (*RequestUnion) ProtoMessage()               {}
-func (*RequestUnion) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{55} }
+func (*RequestUnion) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{58} }
 
 // A ResponseUnion contains exactly one of the optional responses.
 // The values added here must match those in RequestUnion.
@@ -1147,6 +1199,7 @@ type ResponseUnion struct {
 	EndTransaction     *EndTransactionResponse     `protobuf:"bytes,9,opt,name=end_transaction,json=endTransaction" json:"end_transaction,omitempty"`
 	AdminSplit         *AdminSplitResponse         `protobuf:"bytes,10,opt,name=admin_split,json=adminSplit" json:"admin_split,omitempty"`
 	AdminMerge         *AdminMergeResponse         `protobuf:"bytes,11,opt,name=admin_merge,json=adminMerge" json:"admin_merge,omitempty"`
+	AdminTransferLease *AdminTransferLeaseResponse `protobuf:"bytes,29,opt,name=admin_transfer_lease,json=adminTransferLease" json:"admin_transfer_lease,omitempty"`
 	HeartbeatTxn       *HeartbeatTxnResponse       `protobuf:"bytes,12,opt,name=heartbeat_txn,json=heartbeatTxn" json:"heartbeat_txn,omitempty"`
 	Gc                 *GCResponse                 `protobuf:"bytes,13,opt,name=gc" json:"gc,omitempty"`
 	PushTxn            *PushTxnResponse            `protobuf:"bytes,14,opt,name=push_txn,json=pushTxn" json:"push_txn,omitempty"`
@@ -1155,7 +1208,7 @@ type ResponseUnion struct {
 	ResolveIntentRange *ResolveIntentRangeResponse `protobuf:"bytes,17,opt,name=resolve_intent_range,json=resolveIntentRange" json:"resolve_intent_range,omitempty"`
 	Merge              *MergeResponse              `protobuf:"bytes,18,opt,name=merge" json:"merge,omitempty"`
 	TruncateLog        *TruncateLogResponse        `protobuf:"bytes,19,opt,name=truncate_log,json=truncateLog" json:"truncate_log,omitempty"`
-	LeaderLease        *LeaderLeaseResponse        `protobuf:"bytes,20,opt,name=leader_lease,json=leaderLease" json:"leader_lease,omitempty"`
+	RequestLease       *RequestLeaseResponse       `protobuf:"bytes,20,opt,name=request_lease,json=requestLease" json:"request_lease,omitempty"`
 	ReverseScan        *ReverseScanResponse        `protobuf:"bytes,21,opt,name=reverse_scan,json=reverseScan" json:"reverse_scan,omitempty"`
 	ComputeChecksum    *ComputeChecksumResponse    `protobuf:"bytes,22,opt,name=compute_checksum,json=computeChecksum" json:"compute_checksum,omitempty"`
 	VerifyChecksum     *VerifyChecksumResponse     `protobuf:"bytes,23,opt,name=verify_checksum,json=verifyChecksum" json:"verify_checksum,omitempty"`
@@ -1168,7 +1221,7 @@ type ResponseUnion struct {
 func (m *ResponseUnion) Reset()                    { *m = ResponseUnion{} }
 func (m *ResponseUnion) String() string            { return proto.CompactTextString(m) }
 func (*ResponseUnion) ProtoMessage()               {}
-func (*ResponseUnion) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{56} }
+func (*ResponseUnion) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{59} }
 
 // A Header is attached to a BatchRequest, encapsulating routing and auxiliary
 // information required for executing it.
@@ -1176,7 +1229,7 @@ type Header struct {
 	// timestamp specifies time at which read or writes should be
 	// performed. If the timestamp is set to zero value, its value
 	// is initialized to the wall time of the receiving node.
-	Timestamp Timestamp `protobuf:"bytes,1,opt,name=timestamp" json:"timestamp"`
+	Timestamp cockroach_util_hlc.Timestamp `protobuf:"bytes,1,opt,name=timestamp" json:"timestamp"`
 	// replica specifies the destination of the request.
 	Replica ReplicaDescriptor `protobuf:"bytes,2,opt,name=replica" json:"replica"`
 	// range_id specifies the ID of the Raft consensus group which the key
@@ -1205,15 +1258,23 @@ type Header struct {
 	ReadConsistency ReadConsistencyType `protobuf:"varint,6,opt,name=read_consistency,json=readConsistency,enum=cockroach.roachpb.ReadConsistencyType" json:"read_consistency"`
 	// trace, if set, is the active span of an OpenTracing distributed trace.
 	Trace *cockroach_util_tracing.Span `protobuf:"bytes,7,opt,name=trace" json:"trace,omitempty"`
-	// if set to a non-zero value, limits the total number of results for
-	// Scan/ReverseScan requests in the batch.
-	MaxScanResults int64 `protobuf:"varint,8,opt,name=max_scan_results,json=maxScanResults" json:"max_scan_results"`
+	// If set to a non-zero value, it limits the total number of keys touched
+	// by span requests in the batch. Span requests are requests like
+	// Scan, ReverseScan, and DelRange. If two requests touch the
+	// same key it is double counted.
+	MaxSpanRequestKeys int64 `protobuf:"varint,8,opt,name=max_span_request_keys,json=maxSpanRequestKeys" json:"max_span_request_keys"`
+	// if set, all of the spans in the batch are distinct. Note that the
+	// calculation of distinct spans does not include intents in an
+	// EndTransactionRequest. Currently set conservatively: a request
+	// might be composed of distinct spans yet have this field set to
+	// false.
+	DistinctSpans bool `protobuf:"varint,9,opt,name=distinct_spans,json=distinctSpans" json:"distinct_spans"`
 }
 
 func (m *Header) Reset()                    { *m = Header{} }
 func (m *Header) String() string            { return proto.CompactTextString(m) }
 func (*Header) ProtoMessage()               {}
-func (*Header) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{57} }
+func (*Header) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{60} }
 
 // A BatchRequest contains one or more requests to be executed in
 // parallel, or if applicable (based on write-only commands and
@@ -1225,7 +1286,7 @@ type BatchRequest struct {
 
 func (m *BatchRequest) Reset()                    { *m = BatchRequest{} }
 func (*BatchRequest) ProtoMessage()               {}
-func (*BatchRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{58} }
+func (*BatchRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{61} }
 
 // A BatchResponse contains one or more responses, one per request
 // corresponding to the requests in the matching BatchRequest. The
@@ -1238,7 +1299,7 @@ type BatchResponse struct {
 
 func (m *BatchResponse) Reset()                    { *m = BatchResponse{} }
 func (*BatchResponse) ProtoMessage()               {}
-func (*BatchResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{59} }
+func (*BatchResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{62} }
 
 type BatchResponse_Header struct {
 	// error is non-nil if an error occurred.
@@ -1246,7 +1307,7 @@ type BatchResponse_Header struct {
 	// timestamp is set only for non-transactional responses and denotes the
 	// highest timestamp at which a command from the batch executed. At the
 	// time of writing, it is used solely for informational purposes and tests.
-	Timestamp Timestamp `protobuf:"bytes,2,opt,name=Timestamp,json=timestamp" json:"Timestamp"`
+	Timestamp cockroach_util_hlc.Timestamp `protobuf:"bytes,2,opt,name=Timestamp,json=timestamp" json:"Timestamp"`
 	// txn is non-nil if the request specified a non-nil
 	// transaction. The transaction timestamp and/or priority may have
 	// been updated, depending on the outcome of the request.
@@ -1256,13 +1317,13 @@ type BatchResponse_Header struct {
 	CollectedSpans [][]byte `protobuf:"bytes,4,rep,name=collected_spans,json=collectedSpans" json:"collected_spans,omitempty"`
 	// now is the current time at the node sending the response,
 	// which can be used by the receiver to update its local HLC.
-	Now Timestamp `protobuf:"bytes,5,opt,name=now" json:"now"`
+	Now cockroach_util_hlc.Timestamp `protobuf:"bytes,5,opt,name=now" json:"now"`
 }
 
 func (m *BatchResponse_Header) Reset()                    { *m = BatchResponse_Header{} }
 func (m *BatchResponse_Header) String() string            { return proto.CompactTextString(m) }
 func (*BatchResponse_Header) ProtoMessage()               {}
-func (*BatchResponse_Header) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{59, 0} }
+func (*BatchResponse_Header) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{62, 0} }
 
 // A RaftCommand is a command which can be serialized and sent via
 // raft.
@@ -1270,12 +1331,46 @@ type RaftCommand struct {
 	RangeID       RangeID           `protobuf:"varint,1,opt,name=range_id,json=rangeId,casttype=RangeID" json:"range_id"`
 	OriginReplica ReplicaDescriptor `protobuf:"bytes,2,opt,name=origin_replica,json=originReplica" json:"origin_replica"`
 	Cmd           BatchRequest      `protobuf:"bytes,3,opt,name=cmd" json:"cmd"`
+	// When the command is applied, its result is an error if the lease log
+	// counter has already reached (or exceeded) max_lease_index.
+	//
+	// The lease index is a replay protection mechanism. Similar to the Raft
+	// applied index, it is strictly increasing, but may have gaps. A command
+	// will only apply successfully if its max_lease_index has not been surpassed
+	// by the Range's applied lease index (in which case the command may need to
+	// be 'refurbished', that is, regenerated with a higher max_lease_index).
+	// When the command applies, the new lease index will increase to
+	// max_lease_index (so a potential later replay will fail).
+	//
+	// Refurbishment is conditional on whether there is a difference between the
+	// local pending and the applying version of the command - if the local copy
+	// has a different max_lease_index, an earlier incarnation of the command has
+	// already been refurbished, and no repeated refurbishment takes place.
+	//
+	// This mechanism was introduced as a simpler alternative to using the Raft
+	// applied index, which is fraught with complexity due to the need to predict
+	// exactly the log position at which a command will apply, even when the Raft
+	// leader is not colocated with the lease holder (which usually proposes all
+	// commands).
+	//
+	// Pinning the lease-index to the assigned slot (as opposed to allowing gaps
+	// as we do now) is an interesting venue to explore from the standpoint of
+	// parallelization: One could hope to enforce command ordering in that way
+	// (without recourse to a higher-level locking primitive such as the command
+	// queue). This is a hard problem: First of all, managing the pending
+	// commands gets more involved; a command must not be removed if others have
+	// been added after it, and on removal, the assignment counters must be
+	// updated accordingly. Even worse though, refurbishments must be avoided at
+	// all costs (since a refurbished command is likely to order after one that
+	// it originally preceded (and which may well commit successfully without
+	// a refurbishment).
+	MaxLeaseIndex uint64 `protobuf:"varint,4,opt,name=max_lease_index,json=maxLeaseIndex" json:"max_lease_index"`
 }
 
 func (m *RaftCommand) Reset()                    { *m = RaftCommand{} }
 func (m *RaftCommand) String() string            { return proto.CompactTextString(m) }
 func (*RaftCommand) ProtoMessage()               {}
-func (*RaftCommand) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{60} }
+func (*RaftCommand) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{63} }
 
 // StoreRequestHeader locates a Store on a Node.
 type StoreRequestHeader struct {
@@ -1286,29 +1381,61 @@ type StoreRequestHeader struct {
 func (m *StoreRequestHeader) Reset()                    { *m = StoreRequestHeader{} }
 func (m *StoreRequestHeader) String() string            { return proto.CompactTextString(m) }
 func (*StoreRequestHeader) ProtoMessage()               {}
-func (*StoreRequestHeader) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{61} }
+func (*StoreRequestHeader) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{64} }
 
-// A PollFrozenRequest asks addressed Store for counts of its frozen and
-// unfrozen replicas.
+// A PollFrozenRequest asks the addressed Store for its frozen or thawed
+// Replicas.
 type PollFrozenRequest struct {
 	StoreRequestHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
+	// When true, collect the frozen Replicas, and the thawed ones otherwise.
+	CollectFrozen bool `protobuf:"varint,2,opt,name=collect_frozen,json=collectFrozen" json:"collect_frozen"`
 }
 
 func (m *PollFrozenRequest) Reset()                    { *m = PollFrozenRequest{} }
 func (m *PollFrozenRequest) String() string            { return proto.CompactTextString(m) }
 func (*PollFrozenRequest) ProtoMessage()               {}
-func (*PollFrozenRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{62} }
+func (*PollFrozenRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{65} }
 
 // A PollFrozenResponse is the response returned from a PollFrozenRequest.
 type PollFrozenResponse struct {
-	NumFrozen int64 `protobuf:"varint,1,opt,name=num_frozen,json=numFrozen" json:"num_frozen"`
-	NumThawed int64 `protobuf:"varint,2,opt,name=num_thawed,json=numThawed" json:"num_thawed"`
+	Results []ReplicaDescriptor `protobuf:"bytes,1,rep,name=results" json:"results"`
 }
 
 func (m *PollFrozenResponse) Reset()                    { *m = PollFrozenResponse{} }
 func (m *PollFrozenResponse) String() string            { return proto.CompactTextString(m) }
 func (*PollFrozenResponse) ProtoMessage()               {}
-func (*PollFrozenResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{63} }
+func (*PollFrozenResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{66} }
+
+// A ReservationRequest asks the addressed Store to reserve the space for a new
+// replica for the Range of RangeID reserving RangeSize bytes.
+type ReservationRequest struct {
+	StoreRequestHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
+	FromNodeID         NodeID  `protobuf:"varint,2,opt,name=from_node_id,json=fromNodeId,casttype=NodeID" json:"from_node_id"`
+	FromStoreID        StoreID `protobuf:"varint,3,opt,name=from_store_id,json=fromStoreId,casttype=StoreID" json:"from_store_id"`
+	RangeID            RangeID `protobuf:"varint,4,opt,name=range_id,json=rangeId,casttype=RangeID" json:"range_id"`
+	RangeSize          int64   `protobuf:"varint,5,opt,name=range_size,json=rangeSize" json:"range_size"`
+}
+
+func (m *ReservationRequest) Reset()                    { *m = ReservationRequest{} }
+func (m *ReservationRequest) String() string            { return proto.CompactTextString(m) }
+func (*ReservationRequest) ProtoMessage()               {}
+func (*ReservationRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{67} }
+
+// A ReservationResponse is the repoonse returned from a ReservationRequest.
+type ReservationResponse struct {
+	Reserved bool `protobuf:"varint,1,opt,name=reserved" json:"reserved"`
+	// The current number of ranges and reservations on the target
+	// store. This is returned even if the reservation isn't filled.
+	//
+	// NB: Nullable so we can detect if the field isn't set as will be
+	// the case when talking to older servers.
+	RangeCount *int32 `protobuf:"varint,2,opt,name=range_count,json=rangeCount" json:"range_count,omitempty"`
+}
+
+func (m *ReservationResponse) Reset()                    { *m = ReservationResponse{} }
+func (m *ReservationResponse) String() string            { return proto.CompactTextString(m) }
+func (*ReservationResponse) ProtoMessage()               {}
+func (*ReservationResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{68} }
 
 func init() {
 	proto.RegisterType((*ResponseHeader)(nil), "cockroach.roachpb.ResponseHeader")
@@ -1342,6 +1469,8 @@ func init() {
 	proto.RegisterType((*AdminSplitResponse)(nil), "cockroach.roachpb.AdminSplitResponse")
 	proto.RegisterType((*AdminMergeRequest)(nil), "cockroach.roachpb.AdminMergeRequest")
 	proto.RegisterType((*AdminMergeResponse)(nil), "cockroach.roachpb.AdminMergeResponse")
+	proto.RegisterType((*AdminTransferLeaseRequest)(nil), "cockroach.roachpb.AdminTransferLeaseRequest")
+	proto.RegisterType((*AdminTransferLeaseResponse)(nil), "cockroach.roachpb.AdminTransferLeaseResponse")
 	proto.RegisterType((*RangeLookupRequest)(nil), "cockroach.roachpb.RangeLookupRequest")
 	proto.RegisterType((*RangeLookupResponse)(nil), "cockroach.roachpb.RangeLookupResponse")
 	proto.RegisterType((*HeartbeatTxnRequest)(nil), "cockroach.roachpb.HeartbeatTxnRequest")
@@ -1361,8 +1490,9 @@ func init() {
 	proto.RegisterType((*MergeResponse)(nil), "cockroach.roachpb.MergeResponse")
 	proto.RegisterType((*TruncateLogRequest)(nil), "cockroach.roachpb.TruncateLogRequest")
 	proto.RegisterType((*TruncateLogResponse)(nil), "cockroach.roachpb.TruncateLogResponse")
-	proto.RegisterType((*LeaderLeaseRequest)(nil), "cockroach.roachpb.LeaderLeaseRequest")
-	proto.RegisterType((*LeaderLeaseResponse)(nil), "cockroach.roachpb.LeaderLeaseResponse")
+	proto.RegisterType((*RequestLeaseRequest)(nil), "cockroach.roachpb.RequestLeaseRequest")
+	proto.RegisterType((*TransferLeaseRequest)(nil), "cockroach.roachpb.TransferLeaseRequest")
+	proto.RegisterType((*RequestLeaseResponse)(nil), "cockroach.roachpb.RequestLeaseResponse")
 	proto.RegisterType((*ComputeChecksumRequest)(nil), "cockroach.roachpb.ComputeChecksumRequest")
 	proto.RegisterType((*ComputeChecksumResponse)(nil), "cockroach.roachpb.ComputeChecksumResponse")
 	proto.RegisterType((*VerifyChecksumRequest)(nil), "cockroach.roachpb.VerifyChecksumRequest")
@@ -1377,6 +1507,8 @@ func init() {
 	proto.RegisterType((*StoreRequestHeader)(nil), "cockroach.roachpb.StoreRequestHeader")
 	proto.RegisterType((*PollFrozenRequest)(nil), "cockroach.roachpb.PollFrozenRequest")
 	proto.RegisterType((*PollFrozenResponse)(nil), "cockroach.roachpb.PollFrozenResponse")
+	proto.RegisterType((*ReservationRequest)(nil), "cockroach.roachpb.ReservationRequest")
+	proto.RegisterType((*ReservationResponse)(nil), "cockroach.roachpb.ReservationResponse")
 	proto.RegisterEnum("cockroach.roachpb.ReadConsistencyType", ReadConsistencyType_name, ReadConsistencyType_value)
 	proto.RegisterEnum("cockroach.roachpb.PushTxnType", PushTxnType_name, PushTxnType_value)
 }
@@ -1387,13 +1519,17 @@ var _ grpc.ClientConn
 
 // This is a compile-time assertion to ensure that this generated file
 // is compatible with the grpc package it is being compiled against.
-const _ = grpc.SupportPackageIsVersion2
+const _ = grpc.SupportPackageIsVersion3
 
 // Client API for Internal service
 
 type InternalClient interface {
 	Batch(ctx context.Context, in *BatchRequest, opts ...grpc.CallOption) (*BatchResponse, error)
+	// TODO(wiz): These methods have been split out into the InternalStores
+	// service, but remain here until we determine that a breaking RPC change is
+	// acceptable.
 	PollFrozen(ctx context.Context, in *PollFrozenRequest, opts ...grpc.CallOption) (*PollFrozenResponse, error)
+	Reserve(ctx context.Context, in *ReservationRequest, opts ...grpc.CallOption) (*ReservationResponse, error)
 }
 
 type internalClient struct {
@@ -1422,11 +1558,24 @@ func (c *internalClient) PollFrozen(ctx context.Context, in *PollFrozenRequest, 
 	return out, nil
 }
 
+func (c *internalClient) Reserve(ctx context.Context, in *ReservationRequest, opts ...grpc.CallOption) (*ReservationResponse, error) {
+	out := new(ReservationResponse)
+	err := grpc.Invoke(ctx, "/cockroach.roachpb.Internal/Reserve", in, out, c.cc, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // Server API for Internal service
 
 type InternalServer interface {
 	Batch(context.Context, *BatchRequest) (*BatchResponse, error)
+	// TODO(wiz): These methods have been split out into the InternalStores
+	// service, but remain here until we determine that a breaking RPC change is
+	// acceptable.
 	PollFrozen(context.Context, *PollFrozenRequest) (*PollFrozenResponse, error)
+	Reserve(context.Context, *ReservationRequest) (*ReservationResponse, error)
 }
 
 func RegisterInternalServer(s *grpc.Server, srv InternalServer) {
@@ -1469,6 +1618,24 @@ func _Internal_PollFrozen_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Internal_Reserve_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReservationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).Reserve(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/cockroach.roachpb.Internal/Reserve",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).Reserve(ctx, req.(*ReservationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 var _Internal_serviceDesc = grpc.ServiceDesc{
 	ServiceName: "cockroach.roachpb.Internal",
 	HandlerType: (*InternalServer)(nil),
@@ -1481,8 +1648,13 @@ var _Internal_serviceDesc = grpc.ServiceDesc{
 			MethodName: "PollFrozen",
 			Handler:    _Internal_PollFrozen_Handler,
 		},
+		{
+			MethodName: "Reserve",
+			Handler:    _Internal_Reserve_Handler,
+		},
 	},
-	Streams: []grpc.StreamDesc{},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: fileDescriptorApi,
 }
 
 // Client API for External service
@@ -1545,7 +1717,105 @@ var _External_serviceDesc = grpc.ServiceDesc{
 			Handler:    _External_Batch_Handler,
 		},
 	},
-	Streams: []grpc.StreamDesc{},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: fileDescriptorApi,
+}
+
+// Client API for InternalStores service
+
+type InternalStoresClient interface {
+	PollFrozen(ctx context.Context, in *PollFrozenRequest, opts ...grpc.CallOption) (*PollFrozenResponse, error)
+	Reserve(ctx context.Context, in *ReservationRequest, opts ...grpc.CallOption) (*ReservationResponse, error)
+}
+
+type internalStoresClient struct {
+	cc *grpc.ClientConn
+}
+
+func NewInternalStoresClient(cc *grpc.ClientConn) InternalStoresClient {
+	return &internalStoresClient{cc}
+}
+
+func (c *internalStoresClient) PollFrozen(ctx context.Context, in *PollFrozenRequest, opts ...grpc.CallOption) (*PollFrozenResponse, error) {
+	out := new(PollFrozenResponse)
+	err := grpc.Invoke(ctx, "/cockroach.roachpb.InternalStores/PollFrozen", in, out, c.cc, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalStoresClient) Reserve(ctx context.Context, in *ReservationRequest, opts ...grpc.CallOption) (*ReservationResponse, error) {
+	out := new(ReservationResponse)
+	err := grpc.Invoke(ctx, "/cockroach.roachpb.InternalStores/Reserve", in, out, c.cc, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// Server API for InternalStores service
+
+type InternalStoresServer interface {
+	PollFrozen(context.Context, *PollFrozenRequest) (*PollFrozenResponse, error)
+	Reserve(context.Context, *ReservationRequest) (*ReservationResponse, error)
+}
+
+func RegisterInternalStoresServer(s *grpc.Server, srv InternalStoresServer) {
+	s.RegisterService(&_InternalStores_serviceDesc, srv)
+}
+
+func _InternalStores_PollFrozen_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PollFrozenRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalStoresServer).PollFrozen(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/cockroach.roachpb.InternalStores/PollFrozen",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalStoresServer).PollFrozen(ctx, req.(*PollFrozenRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _InternalStores_Reserve_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReservationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalStoresServer).Reserve(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/cockroach.roachpb.InternalStores/Reserve",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalStoresServer).Reserve(ctx, req.(*ReservationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+var _InternalStores_serviceDesc = grpc.ServiceDesc{
+	ServiceName: "cockroach.roachpb.InternalStores",
+	HandlerType: (*InternalStoresServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "PollFrozen",
+			Handler:    _InternalStores_PollFrozen_Handler,
+		},
+		{
+			MethodName: "Reserve",
+			Handler:    _InternalStores_Reserve_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: fileDescriptorApi,
 }
 
 func (m *ResponseHeader) Marshal() (data []byte, err error) {
@@ -1985,9 +2255,6 @@ func (m *DeleteRangeRequest) MarshalTo(data []byte) (int, error) {
 		return 0, err
 	}
 	i += n19
-	data[i] = 0x10
-	i++
-	i = encodeVarintApi(data, i, uint64(m.MaxEntriesToDelete))
 	data[i] = 0x18
 	i++
 	if m.ReturnKeys {
@@ -2056,9 +2323,6 @@ func (m *ScanRequest) MarshalTo(data []byte) (int, error) {
 		return 0, err
 	}
 	i += n21
-	data[i] = 0x10
-	i++
-	i = encodeVarintApi(data, i, uint64(m.MaxResults))
 	return i, nil
 }
 
@@ -2123,9 +2387,6 @@ func (m *ReverseScanRequest) MarshalTo(data []byte) (int, error) {
 		return 0, err
 	}
 	i += n23
-	data[i] = 0x10
-	i++
-	i = encodeVarintApi(data, i, uint64(m.MaxResults))
 	return i, nil
 }
 
@@ -2593,6 +2854,61 @@ func (m *AdminMergeResponse) MarshalTo(data []byte) (int, error) {
 	return i, nil
 }
 
+func (m *AdminTransferLeaseRequest) Marshal() (data []byte, err error) {
+	size := m.Size()
+	data = make([]byte, size)
+	n, err := m.MarshalTo(data)
+	if err != nil {
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+func (m *AdminTransferLeaseRequest) MarshalTo(data []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	data[i] = 0xa
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
+	n39, err := m.Span.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n39
+	data[i] = 0x10
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Target))
+	return i, nil
+}
+
+func (m *AdminTransferLeaseResponse) Marshal() (data []byte, err error) {
+	size := m.Size()
+	data = make([]byte, size)
+	n, err := m.MarshalTo(data)
+	if err != nil {
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+func (m *AdminTransferLeaseResponse) MarshalTo(data []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	data[i] = 0xa
+	i++
+	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
+	n40, err := m.ResponseHeader.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n40
+	return i, nil
+}
+
 func (m *RangeLookupRequest) Marshal() (data []byte, err error) {
 	size := m.Size()
 	data = make([]byte, size)
@@ -2611,11 +2927,11 @@ func (m *RangeLookupRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n39, err := m.Span.MarshalTo(data[i:])
+	n41, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n39
+	i += n41
 	data[i] = 0x10
 	i++
 	i = encodeVarintApi(data, i, uint64(m.MaxRanges))
@@ -2656,11 +2972,11 @@ func (m *RangeLookupResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n40, err := m.ResponseHeader.MarshalTo(data[i:])
+	n42, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n40
+	i += n42
 	if len(m.Ranges) > 0 {
 		for _, msg := range m.Ranges {
 			data[i] = 0x12
@@ -2706,19 +3022,19 @@ func (m *HeartbeatTxnRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n41, err := m.Span.MarshalTo(data[i:])
+	n43, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n41
+	i += n43
 	data[i] = 0x12
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Now.Size()))
-	n42, err := m.Now.MarshalTo(data[i:])
+	n44, err := m.Now.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n42
+	i += n44
 	return i, nil
 }
 
@@ -2740,11 +3056,11 @@ func (m *HeartbeatTxnResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n43, err := m.ResponseHeader.MarshalTo(data[i:])
+	n45, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n43
+	i += n45
 	return i, nil
 }
 
@@ -2766,11 +3082,11 @@ func (m *GCRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n44, err := m.Span.MarshalTo(data[i:])
+	n46, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n44
+	i += n46
 	if len(m.Keys) > 0 {
 		for _, msg := range m.Keys {
 			data[i] = 0x1a
@@ -2783,6 +3099,14 @@ func (m *GCRequest) MarshalTo(data []byte) (int, error) {
 			i += n
 		}
 	}
+	data[i] = 0x22
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Threshold.Size()))
+	n47, err := m.Threshold.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n47
 	return i, nil
 }
 
@@ -2810,11 +3134,11 @@ func (m *GCRequest_GCKey) MarshalTo(data []byte) (int, error) {
 	data[i] = 0x12
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Timestamp.Size()))
-	n45, err := m.Timestamp.MarshalTo(data[i:])
+	n48, err := m.Timestamp.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n45
+	i += n48
 	return i, nil
 }
 
@@ -2836,11 +3160,11 @@ func (m *GCResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n46, err := m.ResponseHeader.MarshalTo(data[i:])
+	n49, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n46
+	i += n49
 	return i, nil
 }
 
@@ -2862,43 +3186,43 @@ func (m *PushTxnRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n47, err := m.Span.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n47
-	data[i] = 0x12
-	i++
-	i = encodeVarintApi(data, i, uint64(m.PusherTxn.Size()))
-	n48, err := m.PusherTxn.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n48
-	data[i] = 0x1a
-	i++
-	i = encodeVarintApi(data, i, uint64(m.PusheeTxn.Size()))
-	n49, err := m.PusheeTxn.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n49
-	data[i] = 0x22
-	i++
-	i = encodeVarintApi(data, i, uint64(m.PushTo.Size()))
-	n50, err := m.PushTo.MarshalTo(data[i:])
+	n50, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n50
-	data[i] = 0x2a
+	data[i] = 0x12
 	i++
-	i = encodeVarintApi(data, i, uint64(m.Now.Size()))
-	n51, err := m.Now.MarshalTo(data[i:])
+	i = encodeVarintApi(data, i, uint64(m.PusherTxn.Size()))
+	n51, err := m.PusherTxn.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n51
+	data[i] = 0x1a
+	i++
+	i = encodeVarintApi(data, i, uint64(m.PusheeTxn.Size()))
+	n52, err := m.PusheeTxn.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n52
+	data[i] = 0x22
+	i++
+	i = encodeVarintApi(data, i, uint64(m.PushTo.Size()))
+	n53, err := m.PushTo.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n53
+	data[i] = 0x2a
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Now.Size()))
+	n54, err := m.Now.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n54
 	data[i] = 0x30
 	i++
 	i = encodeVarintApi(data, i, uint64(m.PushType))
@@ -2923,19 +3247,19 @@ func (m *PushTxnResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n52, err := m.ResponseHeader.MarshalTo(data[i:])
+	n55, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n52
+	i += n55
 	data[i] = 0x12
 	i++
 	i = encodeVarintApi(data, i, uint64(m.PusheeTxn.Size()))
-	n53, err := m.PusheeTxn.MarshalTo(data[i:])
+	n56, err := m.PusheeTxn.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n53
+	i += n56
 	return i, nil
 }
 
@@ -2957,19 +3281,19 @@ func (m *ResolveIntentRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n54, err := m.Span.MarshalTo(data[i:])
+	n57, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n54
+	i += n57
 	data[i] = 0x12
 	i++
 	i = encodeVarintApi(data, i, uint64(m.IntentTxn.Size()))
-	n55, err := m.IntentTxn.MarshalTo(data[i:])
+	n58, err := m.IntentTxn.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n55
+	i += n58
 	data[i] = 0x18
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Status))
@@ -3002,11 +3326,11 @@ func (m *ResolveIntentResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n56, err := m.ResponseHeader.MarshalTo(data[i:])
+	n59, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n56
+	i += n59
 	return i, nil
 }
 
@@ -3028,19 +3352,19 @@ func (m *ResolveIntentRangeRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n57, err := m.Span.MarshalTo(data[i:])
+	n60, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n57
+	i += n60
 	data[i] = 0x12
 	i++
 	i = encodeVarintApi(data, i, uint64(m.IntentTxn.Size()))
-	n58, err := m.IntentTxn.MarshalTo(data[i:])
+	n61, err := m.IntentTxn.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n58
+	i += n61
 	data[i] = 0x18
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Status))
@@ -3109,11 +3433,11 @@ func (m *ResolveIntentRangeResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n59, err := m.ResponseHeader.MarshalTo(data[i:])
+	n62, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n59
+	i += n62
 	return i, nil
 }
 
@@ -3135,19 +3459,19 @@ func (m *MergeRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n60, err := m.Span.MarshalTo(data[i:])
+	n63, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n60
+	i += n63
 	data[i] = 0x12
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Value.Size()))
-	n61, err := m.Value.MarshalTo(data[i:])
+	n64, err := m.Value.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n61
+	i += n64
 	return i, nil
 }
 
@@ -3169,11 +3493,11 @@ func (m *MergeResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n62, err := m.ResponseHeader.MarshalTo(data[i:])
+	n65, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n62
+	i += n65
 	return i, nil
 }
 
@@ -3195,11 +3519,11 @@ func (m *TruncateLogRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n63, err := m.Span.MarshalTo(data[i:])
+	n66, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n63
+	i += n66
 	data[i] = 0x10
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Index))
@@ -3227,15 +3551,15 @@ func (m *TruncateLogResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n64, err := m.ResponseHeader.MarshalTo(data[i:])
+	n67, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n64
+	i += n67
 	return i, nil
 }
 
-func (m *LeaderLeaseRequest) Marshal() (data []byte, err error) {
+func (m *RequestLeaseRequest) Marshal() (data []byte, err error) {
 	size := m.Size()
 	data = make([]byte, size)
 	n, err := m.MarshalTo(data)
@@ -3245,7 +3569,7 @@ func (m *LeaderLeaseRequest) Marshal() (data []byte, err error) {
 	return data[:n], nil
 }
 
-func (m *LeaderLeaseRequest) MarshalTo(data []byte) (int, error) {
+func (m *RequestLeaseRequest) MarshalTo(data []byte) (int, error) {
 	var i int
 	_ = i
 	var l int
@@ -3253,23 +3577,23 @@ func (m *LeaderLeaseRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n65, err := m.Span.MarshalTo(data[i:])
+	n68, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n65
+	i += n68
 	data[i] = 0x12
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Lease.Size()))
-	n66, err := m.Lease.MarshalTo(data[i:])
+	n69, err := m.Lease.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n66
+	i += n69
 	return i, nil
 }
 
-func (m *LeaderLeaseResponse) Marshal() (data []byte, err error) {
+func (m *TransferLeaseRequest) Marshal() (data []byte, err error) {
 	size := m.Size()
 	data = make([]byte, size)
 	n, err := m.MarshalTo(data)
@@ -3279,7 +3603,41 @@ func (m *LeaderLeaseResponse) Marshal() (data []byte, err error) {
 	return data[:n], nil
 }
 
-func (m *LeaderLeaseResponse) MarshalTo(data []byte) (int, error) {
+func (m *TransferLeaseRequest) MarshalTo(data []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	data[i] = 0xa
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
+	n70, err := m.Span.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n70
+	data[i] = 0x12
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Lease.Size()))
+	n71, err := m.Lease.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n71
+	return i, nil
+}
+
+func (m *RequestLeaseResponse) Marshal() (data []byte, err error) {
+	size := m.Size()
+	data = make([]byte, size)
+	n, err := m.MarshalTo(data)
+	if err != nil {
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+func (m *RequestLeaseResponse) MarshalTo(data []byte) (int, error) {
 	var i int
 	_ = i
 	var l int
@@ -3287,11 +3645,11 @@ func (m *LeaderLeaseResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n67, err := m.ResponseHeader.MarshalTo(data[i:])
+	n72, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n67
+	i += n72
 	return i, nil
 }
 
@@ -3313,22 +3671,22 @@ func (m *ComputeChecksumRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n68, err := m.Span.MarshalTo(data[i:])
+	n73, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n68
+	i += n73
 	data[i] = 0x10
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Version))
 	data[i] = 0x1a
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ChecksumID.Size()))
-	n69, err := m.ChecksumID.MarshalTo(data[i:])
+	n74, err := m.ChecksumID.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n69
+	i += n74
 	data[i] = 0x20
 	i++
 	if m.Snapshot {
@@ -3358,11 +3716,11 @@ func (m *ComputeChecksumResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n70, err := m.ResponseHeader.MarshalTo(data[i:])
+	n75, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n70
+	i += n75
 	return i, nil
 }
 
@@ -3384,22 +3742,22 @@ func (m *VerifyChecksumRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n71, err := m.Span.MarshalTo(data[i:])
+	n76, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n71
+	i += n76
 	data[i] = 0x10
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Version))
 	data[i] = 0x1a
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ChecksumID.Size()))
-	n72, err := m.ChecksumID.MarshalTo(data[i:])
+	n77, err := m.ChecksumID.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n72
+	i += n77
 	if m.Checksum != nil {
 		data[i] = 0x22
 		i++
@@ -3410,11 +3768,11 @@ func (m *VerifyChecksumRequest) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x2a
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Snapshot.Size()))
-		n73, err := m.Snapshot.MarshalTo(data[i:])
+		n78, err := m.Snapshot.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n73
+		i += n78
 	}
 	return i, nil
 }
@@ -3437,11 +3795,11 @@ func (m *VerifyChecksumResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n74, err := m.ResponseHeader.MarshalTo(data[i:])
+	n79, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n74
+	i += n79
 	return i, nil
 }
 
@@ -3464,151 +3822,151 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0xa
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Get.Size()))
-		n75, err := m.Get.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n75
-	}
-	if m.Put != nil {
-		data[i] = 0x12
-		i++
-		i = encodeVarintApi(data, i, uint64(m.Put.Size()))
-		n76, err := m.Put.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n76
-	}
-	if m.ConditionalPut != nil {
-		data[i] = 0x1a
-		i++
-		i = encodeVarintApi(data, i, uint64(m.ConditionalPut.Size()))
-		n77, err := m.ConditionalPut.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n77
-	}
-	if m.Increment != nil {
-		data[i] = 0x22
-		i++
-		i = encodeVarintApi(data, i, uint64(m.Increment.Size()))
-		n78, err := m.Increment.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n78
-	}
-	if m.Delete != nil {
-		data[i] = 0x2a
-		i++
-		i = encodeVarintApi(data, i, uint64(m.Delete.Size()))
-		n79, err := m.Delete.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n79
-	}
-	if m.DeleteRange != nil {
-		data[i] = 0x32
-		i++
-		i = encodeVarintApi(data, i, uint64(m.DeleteRange.Size()))
-		n80, err := m.DeleteRange.MarshalTo(data[i:])
+		n80, err := m.Get.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n80
 	}
-	if m.Scan != nil {
-		data[i] = 0x3a
+	if m.Put != nil {
+		data[i] = 0x12
 		i++
-		i = encodeVarintApi(data, i, uint64(m.Scan.Size()))
-		n81, err := m.Scan.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.Put.Size()))
+		n81, err := m.Put.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n81
 	}
-	if m.BeginTransaction != nil {
-		data[i] = 0x42
+	if m.ConditionalPut != nil {
+		data[i] = 0x1a
 		i++
-		i = encodeVarintApi(data, i, uint64(m.BeginTransaction.Size()))
-		n82, err := m.BeginTransaction.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.ConditionalPut.Size()))
+		n82, err := m.ConditionalPut.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n82
 	}
-	if m.EndTransaction != nil {
-		data[i] = 0x4a
+	if m.Increment != nil {
+		data[i] = 0x22
 		i++
-		i = encodeVarintApi(data, i, uint64(m.EndTransaction.Size()))
-		n83, err := m.EndTransaction.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.Increment.Size()))
+		n83, err := m.Increment.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n83
 	}
-	if m.AdminSplit != nil {
-		data[i] = 0x52
+	if m.Delete != nil {
+		data[i] = 0x2a
 		i++
-		i = encodeVarintApi(data, i, uint64(m.AdminSplit.Size()))
-		n84, err := m.AdminSplit.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.Delete.Size()))
+		n84, err := m.Delete.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n84
 	}
-	if m.AdminMerge != nil {
-		data[i] = 0x5a
+	if m.DeleteRange != nil {
+		data[i] = 0x32
 		i++
-		i = encodeVarintApi(data, i, uint64(m.AdminMerge.Size()))
-		n85, err := m.AdminMerge.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.DeleteRange.Size()))
+		n85, err := m.DeleteRange.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n85
 	}
-	if m.HeartbeatTxn != nil {
-		data[i] = 0x62
+	if m.Scan != nil {
+		data[i] = 0x3a
 		i++
-		i = encodeVarintApi(data, i, uint64(m.HeartbeatTxn.Size()))
-		n86, err := m.HeartbeatTxn.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.Scan.Size()))
+		n86, err := m.Scan.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n86
 	}
-	if m.Gc != nil {
-		data[i] = 0x6a
+	if m.BeginTransaction != nil {
+		data[i] = 0x42
 		i++
-		i = encodeVarintApi(data, i, uint64(m.Gc.Size()))
-		n87, err := m.Gc.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.BeginTransaction.Size()))
+		n87, err := m.BeginTransaction.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n87
 	}
-	if m.PushTxn != nil {
-		data[i] = 0x72
+	if m.EndTransaction != nil {
+		data[i] = 0x4a
 		i++
-		i = encodeVarintApi(data, i, uint64(m.PushTxn.Size()))
-		n88, err := m.PushTxn.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.EndTransaction.Size()))
+		n88, err := m.EndTransaction.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n88
 	}
-	if m.RangeLookup != nil {
-		data[i] = 0x7a
+	if m.AdminSplit != nil {
+		data[i] = 0x52
 		i++
-		i = encodeVarintApi(data, i, uint64(m.RangeLookup.Size()))
-		n89, err := m.RangeLookup.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.AdminSplit.Size()))
+		n89, err := m.AdminSplit.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n89
+	}
+	if m.AdminMerge != nil {
+		data[i] = 0x5a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.AdminMerge.Size()))
+		n90, err := m.AdminMerge.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n90
+	}
+	if m.HeartbeatTxn != nil {
+		data[i] = 0x62
+		i++
+		i = encodeVarintApi(data, i, uint64(m.HeartbeatTxn.Size()))
+		n91, err := m.HeartbeatTxn.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n91
+	}
+	if m.Gc != nil {
+		data[i] = 0x6a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.Gc.Size()))
+		n92, err := m.Gc.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n92
+	}
+	if m.PushTxn != nil {
+		data[i] = 0x72
+		i++
+		i = encodeVarintApi(data, i, uint64(m.PushTxn.Size()))
+		n93, err := m.PushTxn.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n93
+	}
+	if m.RangeLookup != nil {
+		data[i] = 0x7a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.RangeLookup.Size()))
+		n94, err := m.RangeLookup.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n94
 	}
 	if m.ResolveIntent != nil {
 		data[i] = 0x82
@@ -3616,11 +3974,11 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ResolveIntent.Size()))
-		n90, err := m.ResolveIntent.MarshalTo(data[i:])
+		n95, err := m.ResolveIntent.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n90
+		i += n95
 	}
 	if m.ResolveIntentRange != nil {
 		data[i] = 0x8a
@@ -3628,11 +3986,11 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ResolveIntentRange.Size()))
-		n91, err := m.ResolveIntentRange.MarshalTo(data[i:])
+		n96, err := m.ResolveIntentRange.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n91
+		i += n96
 	}
 	if m.Merge != nil {
 		data[i] = 0x92
@@ -3640,11 +3998,11 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Merge.Size()))
-		n92, err := m.Merge.MarshalTo(data[i:])
+		n97, err := m.Merge.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n92
+		i += n97
 	}
 	if m.TruncateLog != nil {
 		data[i] = 0x9a
@@ -3652,23 +4010,23 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.TruncateLog.Size()))
-		n93, err := m.TruncateLog.MarshalTo(data[i:])
+		n98, err := m.TruncateLog.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n93
+		i += n98
 	}
-	if m.LeaderLease != nil {
+	if m.RequestLease != nil {
 		data[i] = 0xa2
 		i++
 		data[i] = 0x1
 		i++
-		i = encodeVarintApi(data, i, uint64(m.LeaderLease.Size()))
-		n94, err := m.LeaderLease.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.RequestLease.Size()))
+		n99, err := m.RequestLease.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n94
+		i += n99
 	}
 	if m.ReverseScan != nil {
 		data[i] = 0xaa
@@ -3676,11 +4034,11 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ReverseScan.Size()))
-		n95, err := m.ReverseScan.MarshalTo(data[i:])
+		n100, err := m.ReverseScan.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n95
+		i += n100
 	}
 	if m.ComputeChecksum != nil {
 		data[i] = 0xb2
@@ -3688,11 +4046,11 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ComputeChecksum.Size()))
-		n96, err := m.ComputeChecksum.MarshalTo(data[i:])
+		n101, err := m.ComputeChecksum.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n96
+		i += n101
 	}
 	if m.VerifyChecksum != nil {
 		data[i] = 0xba
@@ -3700,11 +4058,11 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.VerifyChecksum.Size()))
-		n97, err := m.VerifyChecksum.MarshalTo(data[i:])
+		n102, err := m.VerifyChecksum.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n97
+		i += n102
 	}
 	if m.CheckConsistency != nil {
 		data[i] = 0xc2
@@ -3712,11 +4070,11 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.CheckConsistency.Size()))
-		n98, err := m.CheckConsistency.MarshalTo(data[i:])
+		n103, err := m.CheckConsistency.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n98
+		i += n103
 	}
 	if m.Noop != nil {
 		data[i] = 0xca
@@ -3724,11 +4082,11 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Noop.Size()))
-		n99, err := m.Noop.MarshalTo(data[i:])
+		n104, err := m.Noop.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n99
+		i += n104
 	}
 	if m.InitPut != nil {
 		data[i] = 0xd2
@@ -3736,11 +4094,11 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.InitPut.Size()))
-		n100, err := m.InitPut.MarshalTo(data[i:])
+		n105, err := m.InitPut.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n100
+		i += n105
 	}
 	if m.ChangeFrozen != nil {
 		data[i] = 0xda
@@ -3748,11 +4106,35 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ChangeFrozen.Size()))
-		n101, err := m.ChangeFrozen.MarshalTo(data[i:])
+		n106, err := m.ChangeFrozen.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n101
+		i += n106
+	}
+	if m.TransferLease != nil {
+		data[i] = 0xe2
+		i++
+		data[i] = 0x1
+		i++
+		i = encodeVarintApi(data, i, uint64(m.TransferLease.Size()))
+		n107, err := m.TransferLease.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n107
+	}
+	if m.AdminTransferLease != nil {
+		data[i] = 0xea
+		i++
+		data[i] = 0x1
+		i++
+		i = encodeVarintApi(data, i, uint64(m.AdminTransferLease.Size()))
+		n108, err := m.AdminTransferLease.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n108
 	}
 	return i, nil
 }
@@ -3776,151 +4158,151 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0xa
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Get.Size()))
-		n102, err := m.Get.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n102
-	}
-	if m.Put != nil {
-		data[i] = 0x12
-		i++
-		i = encodeVarintApi(data, i, uint64(m.Put.Size()))
-		n103, err := m.Put.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n103
-	}
-	if m.ConditionalPut != nil {
-		data[i] = 0x1a
-		i++
-		i = encodeVarintApi(data, i, uint64(m.ConditionalPut.Size()))
-		n104, err := m.ConditionalPut.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n104
-	}
-	if m.Increment != nil {
-		data[i] = 0x22
-		i++
-		i = encodeVarintApi(data, i, uint64(m.Increment.Size()))
-		n105, err := m.Increment.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n105
-	}
-	if m.Delete != nil {
-		data[i] = 0x2a
-		i++
-		i = encodeVarintApi(data, i, uint64(m.Delete.Size()))
-		n106, err := m.Delete.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n106
-	}
-	if m.DeleteRange != nil {
-		data[i] = 0x32
-		i++
-		i = encodeVarintApi(data, i, uint64(m.DeleteRange.Size()))
-		n107, err := m.DeleteRange.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n107
-	}
-	if m.Scan != nil {
-		data[i] = 0x3a
-		i++
-		i = encodeVarintApi(data, i, uint64(m.Scan.Size()))
-		n108, err := m.Scan.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n108
-	}
-	if m.BeginTransaction != nil {
-		data[i] = 0x42
-		i++
-		i = encodeVarintApi(data, i, uint64(m.BeginTransaction.Size()))
-		n109, err := m.BeginTransaction.MarshalTo(data[i:])
+		n109, err := m.Get.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n109
 	}
-	if m.EndTransaction != nil {
-		data[i] = 0x4a
+	if m.Put != nil {
+		data[i] = 0x12
 		i++
-		i = encodeVarintApi(data, i, uint64(m.EndTransaction.Size()))
-		n110, err := m.EndTransaction.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.Put.Size()))
+		n110, err := m.Put.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n110
 	}
-	if m.AdminSplit != nil {
-		data[i] = 0x52
+	if m.ConditionalPut != nil {
+		data[i] = 0x1a
 		i++
-		i = encodeVarintApi(data, i, uint64(m.AdminSplit.Size()))
-		n111, err := m.AdminSplit.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.ConditionalPut.Size()))
+		n111, err := m.ConditionalPut.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n111
 	}
-	if m.AdminMerge != nil {
-		data[i] = 0x5a
+	if m.Increment != nil {
+		data[i] = 0x22
 		i++
-		i = encodeVarintApi(data, i, uint64(m.AdminMerge.Size()))
-		n112, err := m.AdminMerge.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.Increment.Size()))
+		n112, err := m.Increment.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n112
 	}
-	if m.HeartbeatTxn != nil {
-		data[i] = 0x62
+	if m.Delete != nil {
+		data[i] = 0x2a
 		i++
-		i = encodeVarintApi(data, i, uint64(m.HeartbeatTxn.Size()))
-		n113, err := m.HeartbeatTxn.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.Delete.Size()))
+		n113, err := m.Delete.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n113
 	}
-	if m.Gc != nil {
-		data[i] = 0x6a
+	if m.DeleteRange != nil {
+		data[i] = 0x32
 		i++
-		i = encodeVarintApi(data, i, uint64(m.Gc.Size()))
-		n114, err := m.Gc.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.DeleteRange.Size()))
+		n114, err := m.DeleteRange.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n114
 	}
-	if m.PushTxn != nil {
-		data[i] = 0x72
+	if m.Scan != nil {
+		data[i] = 0x3a
 		i++
-		i = encodeVarintApi(data, i, uint64(m.PushTxn.Size()))
-		n115, err := m.PushTxn.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.Scan.Size()))
+		n115, err := m.Scan.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n115
 	}
-	if m.RangeLookup != nil {
-		data[i] = 0x7a
+	if m.BeginTransaction != nil {
+		data[i] = 0x42
 		i++
-		i = encodeVarintApi(data, i, uint64(m.RangeLookup.Size()))
-		n116, err := m.RangeLookup.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.BeginTransaction.Size()))
+		n116, err := m.BeginTransaction.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n116
+	}
+	if m.EndTransaction != nil {
+		data[i] = 0x4a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.EndTransaction.Size()))
+		n117, err := m.EndTransaction.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n117
+	}
+	if m.AdminSplit != nil {
+		data[i] = 0x52
+		i++
+		i = encodeVarintApi(data, i, uint64(m.AdminSplit.Size()))
+		n118, err := m.AdminSplit.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n118
+	}
+	if m.AdminMerge != nil {
+		data[i] = 0x5a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.AdminMerge.Size()))
+		n119, err := m.AdminMerge.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n119
+	}
+	if m.HeartbeatTxn != nil {
+		data[i] = 0x62
+		i++
+		i = encodeVarintApi(data, i, uint64(m.HeartbeatTxn.Size()))
+		n120, err := m.HeartbeatTxn.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n120
+	}
+	if m.Gc != nil {
+		data[i] = 0x6a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.Gc.Size()))
+		n121, err := m.Gc.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n121
+	}
+	if m.PushTxn != nil {
+		data[i] = 0x72
+		i++
+		i = encodeVarintApi(data, i, uint64(m.PushTxn.Size()))
+		n122, err := m.PushTxn.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n122
+	}
+	if m.RangeLookup != nil {
+		data[i] = 0x7a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.RangeLookup.Size()))
+		n123, err := m.RangeLookup.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n123
 	}
 	if m.ResolveIntent != nil {
 		data[i] = 0x82
@@ -3928,11 +4310,11 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ResolveIntent.Size()))
-		n117, err := m.ResolveIntent.MarshalTo(data[i:])
+		n124, err := m.ResolveIntent.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n117
+		i += n124
 	}
 	if m.ResolveIntentRange != nil {
 		data[i] = 0x8a
@@ -3940,11 +4322,11 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ResolveIntentRange.Size()))
-		n118, err := m.ResolveIntentRange.MarshalTo(data[i:])
+		n125, err := m.ResolveIntentRange.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n118
+		i += n125
 	}
 	if m.Merge != nil {
 		data[i] = 0x92
@@ -3952,11 +4334,11 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Merge.Size()))
-		n119, err := m.Merge.MarshalTo(data[i:])
+		n126, err := m.Merge.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n119
+		i += n126
 	}
 	if m.TruncateLog != nil {
 		data[i] = 0x9a
@@ -3964,23 +4346,23 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.TruncateLog.Size()))
-		n120, err := m.TruncateLog.MarshalTo(data[i:])
+		n127, err := m.TruncateLog.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n120
+		i += n127
 	}
-	if m.LeaderLease != nil {
+	if m.RequestLease != nil {
 		data[i] = 0xa2
 		i++
 		data[i] = 0x1
 		i++
-		i = encodeVarintApi(data, i, uint64(m.LeaderLease.Size()))
-		n121, err := m.LeaderLease.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.RequestLease.Size()))
+		n128, err := m.RequestLease.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n121
+		i += n128
 	}
 	if m.ReverseScan != nil {
 		data[i] = 0xaa
@@ -3988,11 +4370,11 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ReverseScan.Size()))
-		n122, err := m.ReverseScan.MarshalTo(data[i:])
+		n129, err := m.ReverseScan.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n122
+		i += n129
 	}
 	if m.ComputeChecksum != nil {
 		data[i] = 0xb2
@@ -4000,11 +4382,11 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ComputeChecksum.Size()))
-		n123, err := m.ComputeChecksum.MarshalTo(data[i:])
+		n130, err := m.ComputeChecksum.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n123
+		i += n130
 	}
 	if m.VerifyChecksum != nil {
 		data[i] = 0xba
@@ -4012,11 +4394,11 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.VerifyChecksum.Size()))
-		n124, err := m.VerifyChecksum.MarshalTo(data[i:])
+		n131, err := m.VerifyChecksum.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n124
+		i += n131
 	}
 	if m.CheckConsistency != nil {
 		data[i] = 0xc2
@@ -4024,11 +4406,11 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.CheckConsistency.Size()))
-		n125, err := m.CheckConsistency.MarshalTo(data[i:])
+		n132, err := m.CheckConsistency.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n125
+		i += n132
 	}
 	if m.Noop != nil {
 		data[i] = 0xca
@@ -4036,11 +4418,11 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Noop.Size()))
-		n126, err := m.Noop.MarshalTo(data[i:])
+		n133, err := m.Noop.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n126
+		i += n133
 	}
 	if m.InitPut != nil {
 		data[i] = 0xd2
@@ -4048,11 +4430,11 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.InitPut.Size()))
-		n127, err := m.InitPut.MarshalTo(data[i:])
+		n134, err := m.InitPut.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n127
+		i += n134
 	}
 	if m.ChangeFrozen != nil {
 		data[i] = 0xda
@@ -4060,11 +4442,23 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ChangeFrozen.Size()))
-		n128, err := m.ChangeFrozen.MarshalTo(data[i:])
+		n135, err := m.ChangeFrozen.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n128
+		i += n135
+	}
+	if m.AdminTransferLease != nil {
+		data[i] = 0xea
+		i++
+		data[i] = 0x1
+		i++
+		i = encodeVarintApi(data, i, uint64(m.AdminTransferLease.Size()))
+		n136, err := m.AdminTransferLease.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n136
 	}
 	return i, nil
 }
@@ -4087,19 +4481,19 @@ func (m *Header) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Timestamp.Size()))
-	n129, err := m.Timestamp.MarshalTo(data[i:])
+	n137, err := m.Timestamp.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n129
+	i += n137
 	data[i] = 0x12
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Replica.Size()))
-	n130, err := m.Replica.MarshalTo(data[i:])
+	n138, err := m.Replica.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n130
+	i += n138
 	data[i] = 0x18
 	i++
 	i = encodeVarintApi(data, i, uint64(m.RangeID))
@@ -4110,11 +4504,11 @@ func (m *Header) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x2a
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Txn.Size()))
-		n131, err := m.Txn.MarshalTo(data[i:])
+		n139, err := m.Txn.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n131
+		i += n139
 	}
 	data[i] = 0x30
 	i++
@@ -4123,15 +4517,23 @@ func (m *Header) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x3a
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Trace.Size()))
-		n132, err := m.Trace.MarshalTo(data[i:])
+		n140, err := m.Trace.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n132
+		i += n140
 	}
 	data[i] = 0x40
 	i++
-	i = encodeVarintApi(data, i, uint64(m.MaxScanResults))
+	i = encodeVarintApi(data, i, uint64(m.MaxSpanRequestKeys))
+	data[i] = 0x48
+	i++
+	if m.DistinctSpans {
+		data[i] = 1
+	} else {
+		data[i] = 0
+	}
+	i++
 	return i, nil
 }
 
@@ -4153,11 +4555,11 @@ func (m *BatchRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Header.Size()))
-	n133, err := m.Header.MarshalTo(data[i:])
+	n141, err := m.Header.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n133
+	i += n141
 	if len(m.Requests) > 0 {
 		for _, msg := range m.Requests {
 			data[i] = 0x12
@@ -4191,11 +4593,11 @@ func (m *BatchResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.BatchResponse_Header.Size()))
-	n134, err := m.BatchResponse_Header.MarshalTo(data[i:])
+	n142, err := m.BatchResponse_Header.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n134
+	i += n142
 	if len(m.Responses) > 0 {
 		for _, msg := range m.Responses {
 			data[i] = 0x12
@@ -4230,29 +4632,29 @@ func (m *BatchResponse_Header) MarshalTo(data []byte) (int, error) {
 		data[i] = 0xa
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Error.Size()))
-		n135, err := m.Error.MarshalTo(data[i:])
+		n143, err := m.Error.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n135
+		i += n143
 	}
 	data[i] = 0x12
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Timestamp.Size()))
-	n136, err := m.Timestamp.MarshalTo(data[i:])
+	n144, err := m.Timestamp.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n136
+	i += n144
 	if m.Txn != nil {
 		data[i] = 0x1a
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Txn.Size()))
-		n137, err := m.Txn.MarshalTo(data[i:])
+		n145, err := m.Txn.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n137
+		i += n145
 	}
 	if len(m.CollectedSpans) > 0 {
 		for _, b := range m.CollectedSpans {
@@ -4265,11 +4667,11 @@ func (m *BatchResponse_Header) MarshalTo(data []byte) (int, error) {
 	data[i] = 0x2a
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Now.Size()))
-	n138, err := m.Now.MarshalTo(data[i:])
+	n146, err := m.Now.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n138
+	i += n146
 	return i, nil
 }
 
@@ -4294,19 +4696,22 @@ func (m *RaftCommand) MarshalTo(data []byte) (int, error) {
 	data[i] = 0x12
 	i++
 	i = encodeVarintApi(data, i, uint64(m.OriginReplica.Size()))
-	n139, err := m.OriginReplica.MarshalTo(data[i:])
+	n147, err := m.OriginReplica.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n139
+	i += n147
 	data[i] = 0x1a
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Cmd.Size()))
-	n140, err := m.Cmd.MarshalTo(data[i:])
+	n148, err := m.Cmd.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n140
+	i += n148
+	data[i] = 0x20
+	i++
+	i = encodeVarintApi(data, i, uint64(m.MaxLeaseIndex))
 	return i, nil
 }
 
@@ -4352,11 +4757,19 @@ func (m *PollFrozenRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.StoreRequestHeader.Size()))
-	n141, err := m.StoreRequestHeader.MarshalTo(data[i:])
+	n149, err := m.StoreRequestHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n141
+	i += n149
+	data[i] = 0x10
+	i++
+	if m.CollectFrozen {
+		data[i] = 1
+	} else {
+		data[i] = 0
+	}
+	i++
 	return i, nil
 }
 
@@ -4375,12 +4788,87 @@ func (m *PollFrozenResponse) MarshalTo(data []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	data[i] = 0x8
+	if len(m.Results) > 0 {
+		for _, msg := range m.Results {
+			data[i] = 0xa
+			i++
+			i = encodeVarintApi(data, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(data[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	return i, nil
+}
+
+func (m *ReservationRequest) Marshal() (data []byte, err error) {
+	size := m.Size()
+	data = make([]byte, size)
+	n, err := m.MarshalTo(data)
+	if err != nil {
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+func (m *ReservationRequest) MarshalTo(data []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	data[i] = 0xa
 	i++
-	i = encodeVarintApi(data, i, uint64(m.NumFrozen))
+	i = encodeVarintApi(data, i, uint64(m.StoreRequestHeader.Size()))
+	n150, err := m.StoreRequestHeader.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n150
 	data[i] = 0x10
 	i++
-	i = encodeVarintApi(data, i, uint64(m.NumThawed))
+	i = encodeVarintApi(data, i, uint64(m.FromNodeID))
+	data[i] = 0x18
+	i++
+	i = encodeVarintApi(data, i, uint64(m.FromStoreID))
+	data[i] = 0x20
+	i++
+	i = encodeVarintApi(data, i, uint64(m.RangeID))
+	data[i] = 0x28
+	i++
+	i = encodeVarintApi(data, i, uint64(m.RangeSize))
+	return i, nil
+}
+
+func (m *ReservationResponse) Marshal() (data []byte, err error) {
+	size := m.Size()
+	data = make([]byte, size)
+	n, err := m.MarshalTo(data)
+	if err != nil {
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+func (m *ReservationResponse) MarshalTo(data []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	data[i] = 0x8
+	i++
+	if m.Reserved {
+		data[i] = 1
+	} else {
+		data[i] = 0
+	}
+	i++
+	if m.RangeCount != nil {
+		data[i] = 0x10
+		i++
+		i = encodeVarintApi(data, i, uint64(*m.RangeCount))
+	}
 	return i, nil
 }
 
@@ -4541,7 +5029,6 @@ func (m *DeleteRangeRequest) Size() (n int) {
 	_ = l
 	l = m.Span.Size()
 	n += 1 + l + sovApi(uint64(l))
-	n += 1 + sovApi(uint64(m.MaxEntriesToDelete))
 	n += 2
 	return n
 }
@@ -4565,7 +5052,6 @@ func (m *ScanRequest) Size() (n int) {
 	_ = l
 	l = m.Span.Size()
 	n += 1 + l + sovApi(uint64(l))
-	n += 1 + sovApi(uint64(m.MaxResults))
 	return n
 }
 
@@ -4588,7 +5074,6 @@ func (m *ReverseScanRequest) Size() (n int) {
 	_ = l
 	l = m.Span.Size()
 	n += 1 + l + sovApi(uint64(l))
-	n += 1 + sovApi(uint64(m.MaxResults))
 	return n
 }
 
@@ -4746,6 +5231,23 @@ func (m *AdminMergeResponse) Size() (n int) {
 	return n
 }
 
+func (m *AdminTransferLeaseRequest) Size() (n int) {
+	var l int
+	_ = l
+	l = m.Span.Size()
+	n += 1 + l + sovApi(uint64(l))
+	n += 1 + sovApi(uint64(m.Target))
+	return n
+}
+
+func (m *AdminTransferLeaseResponse) Size() (n int) {
+	var l int
+	_ = l
+	l = m.ResponseHeader.Size()
+	n += 1 + l + sovApi(uint64(l))
+	return n
+}
+
 func (m *RangeLookupRequest) Size() (n int) {
 	var l int
 	_ = l
@@ -4806,6 +5308,8 @@ func (m *GCRequest) Size() (n int) {
 			n += 1 + l + sovApi(uint64(l))
 		}
 	}
+	l = m.Threshold.Size()
+	n += 1 + l + sovApi(uint64(l))
 	return n
 }
 
@@ -4944,7 +5448,7 @@ func (m *TruncateLogResponse) Size() (n int) {
 	return n
 }
 
-func (m *LeaderLeaseRequest) Size() (n int) {
+func (m *RequestLeaseRequest) Size() (n int) {
 	var l int
 	_ = l
 	l = m.Span.Size()
@@ -4954,7 +5458,17 @@ func (m *LeaderLeaseRequest) Size() (n int) {
 	return n
 }
 
-func (m *LeaderLeaseResponse) Size() (n int) {
+func (m *TransferLeaseRequest) Size() (n int) {
+	var l int
+	_ = l
+	l = m.Span.Size()
+	n += 1 + l + sovApi(uint64(l))
+	l = m.Lease.Size()
+	n += 1 + l + sovApi(uint64(l))
+	return n
+}
+
+func (m *RequestLeaseResponse) Size() (n int) {
 	var l int
 	_ = l
 	l = m.ResponseHeader.Size()
@@ -5088,8 +5602,8 @@ func (m *RequestUnion) Size() (n int) {
 		l = m.TruncateLog.Size()
 		n += 2 + l + sovApi(uint64(l))
 	}
-	if m.LeaderLease != nil {
-		l = m.LeaderLease.Size()
+	if m.RequestLease != nil {
+		l = m.RequestLease.Size()
 		n += 2 + l + sovApi(uint64(l))
 	}
 	if m.ReverseScan != nil {
@@ -5118,6 +5632,14 @@ func (m *RequestUnion) Size() (n int) {
 	}
 	if m.ChangeFrozen != nil {
 		l = m.ChangeFrozen.Size()
+		n += 2 + l + sovApi(uint64(l))
+	}
+	if m.TransferLease != nil {
+		l = m.TransferLease.Size()
+		n += 2 + l + sovApi(uint64(l))
+	}
+	if m.AdminTransferLease != nil {
+		l = m.AdminTransferLease.Size()
 		n += 2 + l + sovApi(uint64(l))
 	}
 	return n
@@ -5202,8 +5724,8 @@ func (m *ResponseUnion) Size() (n int) {
 		l = m.TruncateLog.Size()
 		n += 2 + l + sovApi(uint64(l))
 	}
-	if m.LeaderLease != nil {
-		l = m.LeaderLease.Size()
+	if m.RequestLease != nil {
+		l = m.RequestLease.Size()
 		n += 2 + l + sovApi(uint64(l))
 	}
 	if m.ReverseScan != nil {
@@ -5234,6 +5756,10 @@ func (m *ResponseUnion) Size() (n int) {
 		l = m.ChangeFrozen.Size()
 		n += 2 + l + sovApi(uint64(l))
 	}
+	if m.AdminTransferLease != nil {
+		l = m.AdminTransferLease.Size()
+		n += 2 + l + sovApi(uint64(l))
+	}
 	return n
 }
 
@@ -5255,7 +5781,8 @@ func (m *Header) Size() (n int) {
 		l = m.Trace.Size()
 		n += 1 + l + sovApi(uint64(l))
 	}
-	n += 1 + sovApi(uint64(m.MaxScanResults))
+	n += 1 + sovApi(uint64(m.MaxSpanRequestKeys))
+	n += 2
 	return n
 }
 
@@ -5319,6 +5846,7 @@ func (m *RaftCommand) Size() (n int) {
 	n += 1 + l + sovApi(uint64(l))
 	l = m.Cmd.Size()
 	n += 1 + l + sovApi(uint64(l))
+	n += 1 + sovApi(uint64(m.MaxLeaseIndex))
 	return n
 }
 
@@ -5335,14 +5863,41 @@ func (m *PollFrozenRequest) Size() (n int) {
 	_ = l
 	l = m.StoreRequestHeader.Size()
 	n += 1 + l + sovApi(uint64(l))
+	n += 2
 	return n
 }
 
 func (m *PollFrozenResponse) Size() (n int) {
 	var l int
 	_ = l
-	n += 1 + sovApi(uint64(m.NumFrozen))
-	n += 1 + sovApi(uint64(m.NumThawed))
+	if len(m.Results) > 0 {
+		for _, e := range m.Results {
+			l = e.Size()
+			n += 1 + l + sovApi(uint64(l))
+		}
+	}
+	return n
+}
+
+func (m *ReservationRequest) Size() (n int) {
+	var l int
+	_ = l
+	l = m.StoreRequestHeader.Size()
+	n += 1 + l + sovApi(uint64(l))
+	n += 1 + sovApi(uint64(m.FromNodeID))
+	n += 1 + sovApi(uint64(m.FromStoreID))
+	n += 1 + sovApi(uint64(m.RangeID))
+	n += 1 + sovApi(uint64(m.RangeSize))
+	return n
+}
+
+func (m *ReservationResponse) Size() (n int) {
+	var l int
+	_ = l
+	n += 2
+	if m.RangeCount != nil {
+		n += 1 + sovApi(uint64(*m.RangeCount))
+	}
 	return n
 }
 
@@ -5417,8 +5972,8 @@ func (this *RequestUnion) GetValue() interface{} {
 	if this.TruncateLog != nil {
 		return this.TruncateLog
 	}
-	if this.LeaderLease != nil {
-		return this.LeaderLease
+	if this.RequestLease != nil {
+		return this.RequestLease
 	}
 	if this.ReverseScan != nil {
 		return this.ReverseScan
@@ -5440,6 +5995,12 @@ func (this *RequestUnion) GetValue() interface{} {
 	}
 	if this.ChangeFrozen != nil {
 		return this.ChangeFrozen
+	}
+	if this.TransferLease != nil {
+		return this.TransferLease
+	}
+	if this.AdminTransferLease != nil {
+		return this.AdminTransferLease
 	}
 	return nil
 }
@@ -5484,8 +6045,8 @@ func (this *RequestUnion) SetValue(value interface{}) bool {
 		this.Merge = vt
 	case *TruncateLogRequest:
 		this.TruncateLog = vt
-	case *LeaderLeaseRequest:
-		this.LeaderLease = vt
+	case *RequestLeaseRequest:
+		this.RequestLease = vt
 	case *ReverseScanRequest:
 		this.ReverseScan = vt
 	case *ComputeChecksumRequest:
@@ -5500,6 +6061,10 @@ func (this *RequestUnion) SetValue(value interface{}) bool {
 		this.InitPut = vt
 	case *ChangeFrozenRequest:
 		this.ChangeFrozen = vt
+	case *TransferLeaseRequest:
+		this.TransferLease = vt
+	case *AdminTransferLeaseRequest:
+		this.AdminTransferLease = vt
 	default:
 		return false
 	}
@@ -5563,8 +6128,8 @@ func (this *ResponseUnion) GetValue() interface{} {
 	if this.TruncateLog != nil {
 		return this.TruncateLog
 	}
-	if this.LeaderLease != nil {
-		return this.LeaderLease
+	if this.RequestLease != nil {
+		return this.RequestLease
 	}
 	if this.ReverseScan != nil {
 		return this.ReverseScan
@@ -5586,6 +6151,9 @@ func (this *ResponseUnion) GetValue() interface{} {
 	}
 	if this.ChangeFrozen != nil {
 		return this.ChangeFrozen
+	}
+	if this.AdminTransferLease != nil {
+		return this.AdminTransferLease
 	}
 	return nil
 }
@@ -5630,8 +6198,8 @@ func (this *ResponseUnion) SetValue(value interface{}) bool {
 		this.Merge = vt
 	case *TruncateLogResponse:
 		this.TruncateLog = vt
-	case *LeaderLeaseResponse:
-		this.LeaderLease = vt
+	case *RequestLeaseResponse:
+		this.RequestLease = vt
 	case *ReverseScanResponse:
 		this.ReverseScan = vt
 	case *ComputeChecksumResponse:
@@ -5646,6 +6214,8 @@ func (this *ResponseUnion) SetValue(value interface{}) bool {
 		this.InitPut = vt
 	case *ChangeFrozenResponse:
 		this.ChangeFrozen = vt
+	case *AdminTransferLeaseResponse:
+		this.AdminTransferLease = vt
 	default:
 		return false
 	}
@@ -7007,25 +7577,6 @@ func (m *DeleteRangeRequest) Unmarshal(data []byte) error {
 				return err
 			}
 			iNdEx = postIndex
-		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field MaxEntriesToDelete", wireType)
-			}
-			m.MaxEntriesToDelete = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowApi
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.MaxEntriesToDelete |= (int64(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
 		case 3:
 			if wireType != 0 {
 				return fmt.Errorf("proto: wrong wireType = %d for field ReturnKeys", wireType)
@@ -7235,25 +7786,6 @@ func (m *ScanRequest) Unmarshal(data []byte) error {
 				return err
 			}
 			iNdEx = postIndex
-		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field MaxResults", wireType)
-			}
-			m.MaxResults = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowApi
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.MaxResults |= (int64(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
 		default:
 			iNdEx = preIndex
 			skippy, err := skipApi(data[iNdEx:])
@@ -7445,25 +7977,6 @@ func (m *ReverseScanRequest) Unmarshal(data []byte) error {
 				return err
 			}
 			iNdEx = postIndex
-		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field MaxResults", wireType)
-			}
-			m.MaxResults = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowApi
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.MaxResults |= (int64(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
 		default:
 			iNdEx = preIndex
 			skippy, err := skipApi(data[iNdEx:])
@@ -8070,40 +8583,45 @@ func (m *ChangeFrozenResponse) Unmarshal(data []byte) error {
 					break
 				}
 			}
-			var valuekey uint64
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowApi
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				valuekey |= (uint64(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			var mapvalue int32
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowApi
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				mapvalue |= (int32(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
 			if m.Stores == nil {
 				m.Stores = make(map[StoreID]NodeID)
 			}
-			m.Stores[StoreID(mapkey)] = ((NodeID)(mapvalue))
+			if iNdEx < postIndex {
+				var valuekey uint64
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowApi
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := data[iNdEx]
+					iNdEx++
+					valuekey |= (uint64(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				var mapvalue int32
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowApi
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := data[iNdEx]
+					iNdEx++
+					mapvalue |= (int32(b) & 0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				m.Stores[StoreID(mapkey)] = ((NodeID)(mapvalue))
+			} else {
+				var mapvalue NodeID
+				m.Stores[StoreID(mapkey)] = mapvalue
+			}
 			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
@@ -8392,7 +8910,7 @@ func (m *EndTransactionRequest) Unmarshal(data []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			if m.Deadline == nil {
-				m.Deadline = &Timestamp{}
+				m.Deadline = &cockroach_util_hlc.Timestamp{}
 			}
 			if err := m.Deadline.Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
@@ -8929,6 +9447,185 @@ func (m *AdminMergeResponse) Unmarshal(data []byte) error {
 		}
 		if fieldNum <= 0 {
 			return fmt.Errorf("proto: AdminMergeResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ResponseHeader", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.ResponseHeader.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipApi(data[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthApi
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *AdminTransferLeaseRequest) Unmarshal(data []byte) error {
+	l := len(data)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowApi
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := data[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: AdminTransferLeaseRequest: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: AdminTransferLeaseRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Span", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Span.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Target", wireType)
+			}
+			m.Target = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				m.Target |= (StoreID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipApi(data[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthApi
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *AdminTransferLeaseResponse) Unmarshal(data []byte) error {
+	l := len(data)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowApi
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := data[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: AdminTransferLeaseResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: AdminTransferLeaseResponse: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
@@ -9540,6 +10237,36 @@ func (m *GCRequest) Unmarshal(data []byte) error {
 			}
 			m.Keys = append(m.Keys, GCRequest_GCKey{})
 			if err := m.Keys[len(m.Keys)-1].Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 4:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Threshold", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Threshold.Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -11030,7 +11757,7 @@ func (m *TruncateLogResponse) Unmarshal(data []byte) error {
 	}
 	return nil
 }
-func (m *LeaderLeaseRequest) Unmarshal(data []byte) error {
+func (m *RequestLeaseRequest) Unmarshal(data []byte) error {
 	l := len(data)
 	iNdEx := 0
 	for iNdEx < l {
@@ -11053,10 +11780,10 @@ func (m *LeaderLeaseRequest) Unmarshal(data []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: LeaderLeaseRequest: wiretype end group for non-group")
+			return fmt.Errorf("proto: RequestLeaseRequest: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: LeaderLeaseRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: RequestLeaseRequest: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
@@ -11140,7 +11867,7 @@ func (m *LeaderLeaseRequest) Unmarshal(data []byte) error {
 	}
 	return nil
 }
-func (m *LeaderLeaseResponse) Unmarshal(data []byte) error {
+func (m *TransferLeaseRequest) Unmarshal(data []byte) error {
 	l := len(data)
 	iNdEx := 0
 	for iNdEx < l {
@@ -11163,10 +11890,120 @@ func (m *LeaderLeaseResponse) Unmarshal(data []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: LeaderLeaseResponse: wiretype end group for non-group")
+			return fmt.Errorf("proto: TransferLeaseRequest: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: LeaderLeaseResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: TransferLeaseRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Span", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Span.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Lease", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Lease.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipApi(data[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthApi
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *RequestLeaseResponse) Unmarshal(data []byte) error {
+	l := len(data)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowApi
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := data[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: RequestLeaseResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: RequestLeaseResponse: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
@@ -12380,7 +13217,7 @@ func (m *RequestUnion) Unmarshal(data []byte) error {
 			iNdEx = postIndex
 		case 20:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field LeaderLease", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field RequestLease", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -12404,10 +13241,10 @@ func (m *RequestUnion) Unmarshal(data []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if m.LeaderLease == nil {
-				m.LeaderLease = &LeaderLeaseRequest{}
+			if m.RequestLease == nil {
+				m.RequestLease = &RequestLeaseRequest{}
 			}
-			if err := m.LeaderLease.Unmarshal(data[iNdEx:postIndex]); err != nil {
+			if err := m.RequestLease.Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -12639,6 +13476,72 @@ func (m *RequestUnion) Unmarshal(data []byte) error {
 				m.ChangeFrozen = &ChangeFrozenRequest{}
 			}
 			if err := m.ChangeFrozen.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 28:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field TransferLease", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.TransferLease == nil {
+				m.TransferLease = &TransferLeaseRequest{}
+			}
+			if err := m.TransferLease.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 29:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field AdminTransferLease", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.AdminTransferLease == nil {
+				m.AdminTransferLease = &AdminTransferLeaseRequest{}
+			}
+			if err := m.AdminTransferLease.Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -13321,7 +14224,7 @@ func (m *ResponseUnion) Unmarshal(data []byte) error {
 			iNdEx = postIndex
 		case 20:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field LeaderLease", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field RequestLease", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -13345,10 +14248,10 @@ func (m *ResponseUnion) Unmarshal(data []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if m.LeaderLease == nil {
-				m.LeaderLease = &LeaderLeaseResponse{}
+			if m.RequestLease == nil {
+				m.RequestLease = &RequestLeaseResponse{}
 			}
-			if err := m.LeaderLease.Unmarshal(data[iNdEx:postIndex]); err != nil {
+			if err := m.RequestLease.Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -13580,6 +14483,39 @@ func (m *ResponseUnion) Unmarshal(data []byte) error {
 				m.ChangeFrozen = &ChangeFrozenResponse{}
 			}
 			if err := m.ChangeFrozen.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 29:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field AdminTransferLease", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.AdminTransferLease == nil {
+				m.AdminTransferLease = &AdminTransferLeaseResponse{}
+			}
+			if err := m.AdminTransferLease.Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -13817,9 +14753,9 @@ func (m *Header) Unmarshal(data []byte) error {
 			iNdEx = postIndex
 		case 8:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field MaxScanResults", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field MaxSpanRequestKeys", wireType)
 			}
-			m.MaxScanResults = 0
+			m.MaxSpanRequestKeys = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowApi
@@ -13829,11 +14765,31 @@ func (m *Header) Unmarshal(data []byte) error {
 				}
 				b := data[iNdEx]
 				iNdEx++
-				m.MaxScanResults |= (int64(b) & 0x7F) << shift
+				m.MaxSpanRequestKeys |= (int64(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
+		case 9:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field DistinctSpans", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.DistinctSpans = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := skipApi(data[iNdEx:])
@@ -14390,6 +15346,25 @@ func (m *RaftCommand) Unmarshal(data []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		case 4:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field MaxLeaseIndex", wireType)
+			}
+			m.MaxLeaseIndex = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				m.MaxLeaseIndex |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := skipApi(data[iNdEx:])
@@ -14558,6 +15533,26 @@ func (m *PollFrozenRequest) Unmarshal(data []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field CollectFrozen", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.CollectFrozen = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := skipApi(data[iNdEx:])
@@ -14609,10 +15604,10 @@ func (m *PollFrozenResponse) Unmarshal(data []byte) error {
 		}
 		switch fieldNum {
 		case 1:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field NumFrozen", wireType)
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Results", wireType)
 			}
-			m.NumFrozen = 0
+			var msglen int
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowApi
@@ -14622,16 +15617,108 @@ func (m *PollFrozenResponse) Unmarshal(data []byte) error {
 				}
 				b := data[iNdEx]
 				iNdEx++
-				m.NumFrozen |= (int64(b) & 0x7F) << shift
+				msglen |= (int(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Results = append(m.Results, ReplicaDescriptor{})
+			if err := m.Results[len(m.Results)-1].Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipApi(data[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthApi
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *ReservationRequest) Unmarshal(data []byte) error {
+	l := len(data)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowApi
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := data[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: ReservationRequest: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: ReservationRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field StoreRequestHeader", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.StoreRequestHeader.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		case 2:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field NumThawed", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field FromNodeID", wireType)
 			}
-			m.NumThawed = 0
+			m.FromNodeID = 0
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowApi
@@ -14641,11 +15728,158 @@ func (m *PollFrozenResponse) Unmarshal(data []byte) error {
 				}
 				b := data[iNdEx]
 				iNdEx++
-				m.NumThawed |= (int64(b) & 0x7F) << shift
+				m.FromNodeID |= (NodeID(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field FromStoreID", wireType)
+			}
+			m.FromStoreID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				m.FromStoreID |= (StoreID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 4:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field RangeID", wireType)
+			}
+			m.RangeID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				m.RangeID |= (RangeID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 5:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field RangeSize", wireType)
+			}
+			m.RangeSize = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				m.RangeSize |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipApi(data[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthApi
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *ReservationResponse) Unmarshal(data []byte) error {
+	l := len(data)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowApi
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := data[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: ReservationResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: ReservationResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Reserved", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.Reserved = bool(v != 0)
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field RangeCount", wireType)
+			}
+			var v int32
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				v |= (int32(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.RangeCount = &v
 		default:
 			iNdEx = preIndex
 			skippy, err := skipApi(data[iNdEx:])
@@ -14772,213 +16006,238 @@ var (
 	ErrIntOverflowApi   = fmt.Errorf("proto: integer overflow")
 )
 
+func init() { proto.RegisterFile("cockroach/roachpb/api.proto", fileDescriptorApi) }
+
 var fileDescriptorApi = []byte{
-	// 3297 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x09, 0x6e, 0x88, 0x02, 0xff, 0xdc, 0x5b, 0x5b, 0x6f, 0x1b, 0xc7,
-	0x15, 0xf6, 0x8a, 0xa2, 0x44, 0x1d, 0x52, 0x14, 0x35, 0x96, 0x6c, 0x9a, 0x4e, 0x44, 0x79, 0xe3,
-	0x7b, 0x12, 0x29, 0x55, 0x9a, 0xe6, 0xd6, 0xa0, 0x11, 0x25, 0xc6, 0x66, 0xe3, 0xc8, 0xf2, 0x8a,
-	0x72, 0x9c, 0xeb, 0x76, 0xc5, 0x5d, 0x89, 0x0b, 0x93, 0xbb, 0xcc, 0xee, 0xd2, 0x92, 0x5b, 0xa0,
-	0x45, 0x03, 0xf4, 0x82, 0xf4, 0xa5, 0x05, 0x0a, 0xb4, 0x40, 0x5f, 0x82, 0xe6, 0x07, 0xf4, 0xa5,
-	0x45, 0x7e, 0x41, 0x01, 0x3f, 0x15, 0x79, 0x2c, 0x1a, 0xc0, 0x69, 0x53, 0xf4, 0xa5, 0x6f, 0x45,
-	0xfb, 0x52, 0x03, 0x05, 0x3a, 0xb7, 0xbd, 0x71, 0x77, 0x45, 0xda, 0xd9, 0x34, 0x6d, 0x1f, 0x6c,
-	0x2c, 0xcf, 0x9c, 0xf3, 0xcd, 0xcc, 0x99, 0x99, 0xf3, 0x9d, 0xb9, 0x08, 0x4e, 0xb6, 0xcc, 0xd6,
-	0x4d, 0xcb, 0x54, 0x5a, 0xed, 0x65, 0xfa, 0x7f, 0x6f, 0x67, 0x59, 0xe9, 0xe9, 0x4b, 0x3d, 0xcb,
-	0x74, 0x4c, 0x34, 0xeb, 0x15, 0x2e, 0xf1, 0xc2, 0xca, 0x43, 0x51, 0x7d, 0x55, 0x71, 0x14, 0x66,
-	0x50, 0x59, 0x88, 0x96, 0x6a, 0x96, 0x65, 0x5a, 0x36, 0x2f, 0x3f, 0x13, 0x2d, 0xd7, 0x0d, 0x47,
-	0xb3, 0x0c, 0xa5, 0x23, 0x5b, 0xca, 0xae, 0xc3, 0xd5, 0x16, 0xa3, 0x6a, 0x5d, 0xcd, 0x51, 0x02,
-	0x15, 0x9d, 0xf2, 0x35, 0xfa, 0x8e, 0xde, 0x59, 0x76, 0x2c, 0xa5, 0xa5, 0x1b, 0x7b, 0xcb, 0x76,
-	0x4f, 0x31, 0xb8, 0xca, 0xdc, 0x9e, 0xb9, 0x67, 0xd2, 0xcf, 0x65, 0xf2, 0xc5, 0xa4, 0x62, 0x0d,
-	0x8a, 0x92, 0x66, 0xf7, 0x4c, 0xc3, 0xd6, 0x2e, 0x6b, 0x8a, 0xaa, 0x59, 0xe8, 0x09, 0xc8, 0x38,
-	0x07, 0x46, 0x39, 0xb3, 0x28, 0x9c, 0xcf, 0xaf, 0x2c, 0x2c, 0x45, 0xba, 0xbc, 0xd4, 0xb4, 0x14,
-	0xc3, 0x56, 0x5a, 0x8e, 0x6e, 0x1a, 0x12, 0x51, 0x15, 0x2f, 0x01, 0x5c, 0xd2, 0x1c, 0x49, 0x7b,
-	0xa7, 0xaf, 0xd9, 0x0e, 0x7a, 0x16, 0x26, 0xda, 0x14, 0xa9, 0x2c, 0x50, 0x88, 0xe3, 0x31, 0x10,
-	0x5b, 0xb8, 0x59, 0xb5, 0xdc, 0x9d, 0xbb, 0xd5, 0x23, 0x1f, 0xdd, 0xad, 0x0a, 0x12, 0x37, 0x10,
-	0xdf, 0x15, 0x20, 0x4f, 0x91, 0x58, 0x83, 0xd0, 0xda, 0x00, 0xd4, 0xa9, 0x18, 0xa8, 0x70, 0xeb,
-	0xa3, 0xa0, 0x68, 0x09, 0xb2, 0xb7, 0x94, 0x4e, 0x5f, 0x2b, 0x8f, 0x51, 0x8c, 0x72, 0x0c, 0xc6,
-	0x75, 0x52, 0x2e, 0x31, 0x35, 0xf1, 0x43, 0x01, 0x60, 0xb3, 0x9f, 0x42, 0x77, 0xd0, 0x97, 0x47,
-	0xac, 0xb9, 0x36, 0x4e, 0x4c, 0x79, 0xfd, 0xe8, 0x21, 0x98, 0xd0, 0x8d, 0x8e, 0x6e, 0x68, 0x74,
-	0x08, 0x72, 0xbc, 0x90, 0xcb, 0x50, 0x05, 0xb2, 0x3b, 0xf8, 0x43, 0x2d, 0x8f, 0x07, 0x0a, 0x99,
-	0x48, 0x94, 0x20, 0x4f, 0x1b, 0x9e, 0xa2, 0xf7, 0xc4, 0x8f, 0x05, 0x98, 0x5f, 0x33, 0x0d, 0x55,
-	0x27, 0xc3, 0xad, 0x74, 0xbe, 0x48, 0xc7, 0x3c, 0x05, 0x53, 0xda, 0x41, 0x4f, 0x66, 0x96, 0x99,
-	0x21, 0x83, 0x99, 0xc3, 0xaa, 0xf4, 0xeb, 0x50, 0x8f, 0xbd, 0x05, 0xc7, 0x06, 0x3b, 0x97, 0xa6,
-	0xf3, 0xbe, 0x2b, 0x40, 0xb1, 0x61, 0xe8, 0xce, 0x17, 0xe8, 0x35, 0xf1, 0x3a, 0xcc, 0x78, 0x4d,
-	0x48, 0xb3, 0x6f, 0xef, 0x40, 0xa9, 0x61, 0xb4, 0x2c, 0xad, 0xab, 0x19, 0x69, 0x74, 0x4e, 0x84,
-	0x29, 0xdd, 0x85, 0xa3, 0x1d, 0xcc, 0xf0, 0x6e, 0xf8, 0x62, 0xf1, 0x5b, 0x30, 0x1b, 0xa8, 0x32,
-	0xcd, 0x18, 0x71, 0x0a, 0xa6, 0x0c, 0x6d, 0x5f, 0xf6, 0xdd, 0xeb, 0xd6, 0x9e, 0xc3, 0x62, 0xea,
-	0x54, 0xf1, 0xeb, 0x30, 0xbd, 0xae, 0x75, 0x34, 0x47, 0x4b, 0x21, 0xce, 0x6d, 0x43, 0xd1, 0xc5,
-	0x4a, 0x73, 0x48, 0x7e, 0x25, 0x00, 0xe2, 0xb8, 0x8a, 0xb1, 0x97, 0x42, 0x43, 0xd1, 0xd3, 0x30,
-	0xdf, 0x55, 0x0e, 0x64, 0xec, 0x6f, 0x4b, 0xd7, 0x6c, 0xd9, 0x31, 0x65, 0x95, 0xe2, 0x87, 0x7c,
-	0x84, 0xb0, 0x4a, 0x9d, 0x69, 0x34, 0x4d, 0x56, 0x3f, 0x3a, 0x03, 0x79, 0x4b, 0x73, 0xfa, 0x96,
-	0x21, 0xdf, 0xd4, 0x6e, 0xdb, 0xa1, 0x48, 0x06, 0xac, 0xe0, 0x65, 0x2c, 0x17, 0xf7, 0xe1, 0x68,
-	0xa8, 0xc1, 0x69, 0x8e, 0xe9, 0x49, 0x18, 0xa7, 0x75, 0x8f, 0x2d, 0x66, 0xce, 0x17, 0x6a, 0x93,
-	0xf7, 0xee, 0x56, 0x33, 0xb8, 0x4e, 0x89, 0x0a, 0x45, 0x13, 0xf2, 0x5b, 0x2d, 0xc5, 0x48, 0xc1,
-	0x45, 0xb8, 0xa7, 0xc4, 0x45, 0x96, 0x66, 0xf7, 0x3b, 0x8e, 0x1d, 0x72, 0x0c, 0xe0, 0x02, 0x89,
-	0xc9, 0xc5, 0xf7, 0x04, 0x28, 0xb0, 0x1a, 0xd3, 0xec, 0xe3, 0x53, 0x30, 0x6e, 0x99, 0xfb, 0xac,
-	0x8f, 0xf9, 0x95, 0x93, 0x31, 0x10, 0xb8, 0xcb, 0xc1, 0xa0, 0x40, 0xd5, 0xc5, 0x5b, 0x80, 0x24,
-	0xed, 0x96, 0x66, 0xd9, 0xda, 0x7f, 0xd6, 0x09, 0x3f, 0x11, 0xe0, 0x68, 0xa8, 0xe2, 0xff, 0x02,
-	0x5f, 0xec, 0xc3, 0xf1, 0xb5, 0xb6, 0xd6, 0xba, 0x89, 0x79, 0xc0, 0xd6, 0x6d, 0x47, 0x33, 0x5a,
-	0xb7, 0x53, 0x70, 0x08, 0x0e, 0x28, 0xfb, 0xba, 0xd3, 0x96, 0x55, 0x7d, 0x77, 0x97, 0xba, 0xc3,
-	0x9d, 0xfd, 0x39, 0x22, 0x5e, 0xc7, 0x52, 0x51, 0x86, 0x72, 0xb4, 0xe2, 0x34, 0xc3, 0xc1, 0xcf,
-	0xb0, 0xb7, 0xd7, 0xda, 0x64, 0x61, 0xbd, 0x64, 0x99, 0xdf, 0xd4, 0xd2, 0x18, 0x67, 0x9c, 0x9b,
-	0xec, 0x52, 0xac, 0x50, 0x9f, 0xb8, 0x0c, 0x9d, 0x83, 0x42, 0xb7, 0x6f, 0x3b, 0x32, 0x19, 0x60,
-	0x4c, 0xa8, 0x74, 0xd5, 0x4f, 0x71, 0x9d, 0x3c, 0x29, 0xb9, 0xce, 0x0a, 0xc4, 0x8f, 0xc7, 0x60,
-	0x2e, 0xdc, 0xb2, 0x34, 0x27, 0xc2, 0xe3, 0x30, 0x63, 0x11, 0x6c, 0x5b, 0x56, 0x76, 0x77, 0xb5,
-	0x96, 0xa3, 0xa9, 0xa1, 0x09, 0x59, 0x64, 0x85, 0xab, 0xbc, 0x0c, 0x3d, 0x06, 0xd3, 0x5d, 0xdd,
-	0x90, 0x6d, 0x47, 0xb1, 0x1c, 0x12, 0xad, 0x68, 0xb3, 0x0b, 0xb5, 0x1c, 0x0e, 0x18, 0xe3, 0x12,
-	0x89, 0x18, 0x79, 0x5c, 0xbc, 0x45, 0x4a, 0xf1, 0x0f, 0xb4, 0x0b, 0x13, 0xb6, 0x63, 0xe2, 0x89,
-	0x8e, 0xd3, 0x09, 0x32, 0xcf, 0x9e, 0x8c, 0x69, 0x61, 0x5c, 0xd7, 0x96, 0xb6, 0xa8, 0x15, 0x89,
-	0x93, 0xb7, 0x6b, 0x27, 0x48, 0x43, 0xde, 0xfd, 0xa4, 0x3a, 0x49, 0x85, 0x8d, 0xf5, 0xf7, 0x3e,
-	0xa9, 0x4e, 0x6c, 0x98, 0x2a, 0xfe, 0x92, 0x38, 0x7a, 0xe5, 0x59, 0x1c, 0xa0, 0x7c, 0x0b, 0x54,
-	0x82, 0x0c, 0x69, 0x1a, 0xf1, 0x4a, 0x56, 0x22, 0x9f, 0x68, 0x2e, 0x98, 0x0d, 0x64, 0x39, 0xdb,
-	0x3f, 0x37, 0xf6, 0x8c, 0x20, 0x36, 0xe1, 0x78, 0x4d, 0xdb, 0xd3, 0x8d, 0x60, 0x9e, 0xfe, 0xd9,
-	0x39, 0x0b, 0x4f, 0xd7, 0x28, 0x6a, 0x9a, 0xd3, 0xf5, 0x77, 0x63, 0x30, 0x5f, 0x37, 0xd4, 0x54,
-	0x5b, 0x4d, 0x26, 0x6c, 0xcb, 0xec, 0x76, 0x75, 0x27, 0x3c, 0x61, 0x99, 0x0c, 0x3d, 0x03, 0x39,
-	0x15, 0xeb, 0x79, 0xc9, 0x76, 0x7e, 0xe5, 0xa1, 0xb8, 0xfd, 0x8e, 0xde, 0xc5, 0xad, 0x50, 0xba,
-	0x3d, 0xc9, 0xd3, 0x46, 0xdf, 0x80, 0xe3, 0xde, 0x46, 0x8d, 0x81, 0xc9, 0x98, 0x00, 0xf7, 0xf6,
-	0x70, 0x1b, 0xc7, 0x29, 0xd0, 0xf9, 0x18, 0xa0, 0x06, 0xb7, 0x58, 0xa3, 0x06, 0x4d, 0xa6, 0x2f,
-	0xcd, 0xeb, 0x71, 0x62, 0xf4, 0x22, 0x14, 0x48, 0x81, 0xe1, 0xc8, 0x64, 0x0f, 0x67, 0x97, 0xb3,
-	0x74, 0xba, 0x25, 0x76, 0x9d, 0xaf, 0x32, 0x66, 0x42, 0x24, 0xb6, 0xf8, 0x17, 0x01, 0x8e, 0x0d,
-	0x3a, 0x34, 0xcd, 0x75, 0x86, 0x83, 0x3e, 0xef, 0xfa, 0xbe, 0xa2, 0x87, 0x93, 0x36, 0x60, 0x05,
-	0xaf, 0x62, 0x39, 0x5a, 0xc6, 0x1c, 0x5f, 0xdf, 0x94, 0xea, 0x6b, 0xab, 0xcd, 0xfa, 0x3a, 0xa1,
-	0x08, 0xb3, 0x73, 0x0b, 0x2f, 0xc9, 0x0c, 0xa1, 0x65, 0x09, 0xa9, 0x5e, 0x91, 0xc4, 0x4b, 0xf0,
-	0x86, 0xad, 0x64, 0x1a, 0x9a, 0xdc, 0x6b, 0x2b, 0xb6, 0xc6, 0x9d, 0x1b, 0xca, 0xdd, 0x8b, 0xb8,
-	0x74, 0x93, 0x14, 0x32, 0x87, 0x89, 0x0e, 0xcc, 0xae, 0xaa, 0x64, 0x8d, 0xf6, 0x3a, 0x7a, 0x1a,
-	0xa9, 0xe8, 0x69, 0x98, 0xb2, 0x09, 0x14, 0x0d, 0x06, 0x63, 0x34, 0x18, 0x78, 0xd9, 0x43, 0x8e,
-	0x96, 0xe0, 0x2f, 0xf1, 0x35, 0x40, 0xc1, 0x5a, 0xd3, 0x5c, 0x09, 0x1b, 0xbc, 0x43, 0xaf, 0x68,
-	0x56, 0x1a, 0x59, 0x9c, 0xd7, 0x54, 0x8e, 0x97, 0x66, 0x53, 0x7f, 0x8b, 0x53, 0x4e, 0x9a, 0xbb,
-	0x5d, 0x31, 0xcd, 0x9b, 0xfd, 0x5e, 0x0a, 0xde, 0x7f, 0x04, 0x80, 0xa6, 0x12, 0x34, 0x48, 0xb3,
-	0xe0, 0xe6, 0xee, 0x04, 0x48, 0x26, 0x41, 0xc5, 0x78, 0x4e, 0x95, 0x5a, 0x84, 0x36, 0xb1, 0x81,
-	0xcc, 0xa6, 0x7c, 0x38, 0xc7, 0x9c, 0x71, 0x4b, 0x1b, 0xac, 0x10, 0x2d, 0xc0, 0xa4, 0xc5, 0x12,
-	0x8f, 0xd0, 0x54, 0x72, 0x85, 0xe2, 0xdf, 0x49, 0x66, 0x12, 0xec, 0x47, 0x9a, 0x0b, 0xe5, 0x45,
-	0x98, 0xf0, 0xba, 0x43, 0x16, 0xb1, 0x18, 0x07, 0x42, 0x14, 0xd6, 0x35, 0xbb, 0x65, 0xe9, 0x3d,
-	0x1c, 0xf7, 0xdd, 0x40, 0xc5, 0xec, 0xd0, 0x36, 0xcc, 0xf6, 0x2c, 0x6d, 0x57, 0x73, 0x5a, 0x6d,
-	0x4d, 0x75, 0x7d, 0x93, 0xb9, 0x4f, 0xb0, 0x92, 0x0f, 0xc1, 0xdc, 0x28, 0x7e, 0x1f, 0xf7, 0x1a,
-	0xb7, 0xda, 0x72, 0x76, 0x34, 0xc5, 0x69, 0x1e, 0x18, 0xa9, 0x6c, 0x52, 0x33, 0x86, 0xb9, 0xcf,
-	0xb7, 0xa8, 0x87, 0x46, 0x53, 0xde, 0x2a, 0xa2, 0x2e, 0xbe, 0x01, 0x73, 0xe1, 0x76, 0xa4, 0x39,
-	0x47, 0xff, 0x2a, 0xc0, 0xd4, 0xa5, 0xb5, 0x14, 0xfa, 0xf6, 0x55, 0xbe, 0xa3, 0x48, 0x76, 0xbc,
-	0x57, 0x0d, 0xfe, 0xc2, 0x41, 0xc2, 0x4d, 0x34, 0x89, 0x55, 0x45, 0x85, 0x2c, 0x15, 0xa2, 0x13,
-	0x3e, 0x97, 0x07, 0x22, 0x0b, 0x25, 0xf5, 0x17, 0x61, 0xca, 0x71, 0xfd, 0x73, 0x1f, 0x3e, 0xf4,
-	0x8d, 0xc4, 0x6b, 0x00, 0xa4, 0x11, 0x69, 0xfa, 0xef, 0x07, 0x19, 0x28, 0x6e, 0xf6, 0xed, 0x76,
-	0x3a, 0x13, 0x64, 0x0d, 0xa0, 0x87, 0xc1, 0xf0, 0xc2, 0x25, 0xa7, 0x8c, 0x63, 0xa3, 0x9c, 0x32,
-	0xba, 0xbd, 0x64, 0x76, 0xb8, 0x19, 0xe8, 0x6b, 0x1c, 0x44, 0x93, 0xfd, 0xa3, 0xca, 0x4a, 0x1c,
-	0xc8, 0x01, 0x0e, 0x7a, 0x8e, 0x12, 0x02, 0xd0, 0x08, 0xc0, 0xf3, 0x30, 0x49, 0x7e, 0xe0, 0x1d,
-	0x2d, 0xe7, 0xeb, 0x51, 0xdc, 0x3c, 0x41, 0x4c, 0x9a, 0xa6, 0x3b, 0xc7, 0xb3, 0xf7, 0x35, 0xc7,
-	0xd1, 0x2a, 0x4c, 0xb1, 0x2a, 0x6f, 0xf7, 0xb4, 0xf2, 0x04, 0xb6, 0x2d, 0xc6, 0xf6, 0x9b, 0x7b,
-	0xba, 0x89, 0xb5, 0xdc, 0x2d, 0x03, 0xad, 0x16, 0xff, 0x16, 0x7f, 0x21, 0xc0, 0x8c, 0x37, 0x12,
-	0x69, 0x46, 0xa8, 0xb5, 0x90, 0x3f, 0xef, 0x7f, 0x50, 0x88, 0x4f, 0xc5, 0x7f, 0x08, 0x30, 0xc7,
-	0x49, 0x9c, 0x85, 0xdd, 0x14, 0x66, 0x0b, 0x1e, 0x68, 0x9e, 0x05, 0xf9, 0x0d, 0x1b, 0x61, 0xa0,
-	0x99, 0x0d, 0x19, 0xe8, 0x1a, 0xc9, 0xd7, 0x15, 0xa7, 0xcf, 0xf8, 0xa1, 0xb8, 0x72, 0xfa, 0xf0,
-	0x5e, 0x6d, 0x51, 0x5d, 0x77, 0xbc, 0x99, 0x25, 0x49, 0x22, 0x7b, 0xa6, 0x6e, 0xe3, 0x1d, 0x4d,
-	0x90, 0x3b, 0xb8, 0x4c, 0x7c, 0x13, 0xe6, 0x07, 0x7a, 0x9d, 0xe6, 0xe2, 0xfb, 0xa7, 0x00, 0x27,
-	0xc2, 0xf0, 0x29, 0x1d, 0xed, 0xfc, 0x0f, 0x78, 0xb6, 0x08, 0x85, 0x0d, 0xd3, 0xf4, 0xc8, 0x58,
-	0x9c, 0x86, 0x3c, 0xfb, 0x4d, 0x3b, 0x2f, 0x2a, 0x50, 0x89, 0xf3, 0x4c, 0x9a, 0xde, 0xff, 0x0e,
-	0x14, 0x52, 0x4a, 0xc2, 0x1e, 0xf0, 0xf4, 0xb6, 0x09, 0xd3, 0x9f, 0x43, 0xd6, 0xf6, 0x4b, 0x9c,
-	0xb5, 0x35, 0xad, 0xbe, 0xd1, 0x52, 0x1c, 0x9c, 0xf0, 0xec, 0xa5, 0xd0, 0xbb, 0x0a, 0x64, 0x75,
-	0x43, 0xd5, 0x0e, 0x68, 0xef, 0xc6, 0xdd, 0x3e, 0x50, 0x11, 0x7a, 0x0a, 0x72, 0x34, 0x63, 0x91,
-	0x75, 0x95, 0x4e, 0x95, 0x4c, 0xad, 0x42, 0x8a, 0x3f, 0xbd, 0x5b, 0x9d, 0xa4, 0x43, 0xd6, 0x58,
-	0xbf, 0xe7, 0x7f, 0xe2, 0x94, 0x8c, 0x7e, 0xa8, 0xe2, 0xeb, 0x70, 0x34, 0xd4, 0xc6, 0x34, 0x1d,
-	0xf0, 0x3d, 0xec, 0x80, 0x2b, 0xf4, 0x13, 0xff, 0x6f, 0xa7, 0x34, 0xbc, 0x1d, 0x02, 0x75, 0xc8,
-	0xf0, 0xd2, 0xaa, 0x5c, 0xd7, 0x50, 0x65, 0xd2, 0xc7, 0x50, 0x33, 0xd2, 0xec, 0xe3, 0xbf, 0x04,
-	0x72, 0xb9, 0xd1, 0xed, 0xf5, 0x1d, 0x8d, 0x9e, 0x33, 0xd9, 0xfd, 0x6e, 0x0a, 0xfd, 0xc4, 0x89,
-	0xb4, 0x7b, 0xbc, 0x43, 0x7a, 0x3a, 0xed, 0x26, 0xd2, 0x5c, 0x88, 0x76, 0xf1, 0xa6, 0x90, 0xd7,
-	0xe6, 0x8e, 0x77, 0xa1, 0x56, 0x27, 0x3a, 0x7f, 0xb8, 0x5b, 0x5d, 0xde, 0xd3, 0x9d, 0x76, 0x7f,
-	0x07, 0xd7, 0xd6, 0x5d, 0xf6, 0x6a, 0x54, 0x77, 0x96, 0x07, 0x2e, 0x2f, 0xfb, 0x7d, 0x5d, 0x5d,
-	0xda, 0xde, 0x6e, 0xac, 0xe3, 0x29, 0x02, 0x6e, 0xdb, 0xf1, 0xd4, 0x00, 0x17, 0xb9, 0xa1, 0xa2,
-	0x45, 0xc8, 0xd9, 0x86, 0xd2, 0xb3, 0xdb, 0x66, 0x78, 0x73, 0xe8, 0x49, 0xc5, 0xb7, 0xe1, 0x78,
-	0xa4, 0xfb, 0x69, 0xfa, 0xf7, 0xc3, 0x31, 0x98, 0xbf, 0xae, 0x59, 0xfa, 0xee, 0xed, 0xff, 0x43,
-	0xf7, 0x56, 0x20, 0xe7, 0xfe, 0xa2, 0xee, 0x2d, 0x48, 0xde, 0x6f, 0xcc, 0x1c, 0xbe, 0xeb, 0x59,
-	0x0e, 0xf4, 0x48, 0xec, 0x1e, 0x64, 0xd7, 0xd9, 0xe2, 0x6a, 0xeb, 0x8a, 0xa3, 0x04, 0x46, 0xe6,
-	0x2d, 0x38, 0x36, 0xe8, 0xb8, 0x54, 0xf3, 0xd5, 0x19, 0x28, 0xf0, 0xa1, 0xd8, 0x36, 0x88, 0xd3,
-	0x96, 0x21, 0xb3, 0xa7, 0x39, 0x1c, 0xf2, 0xe1, 0xb8, 0xb4, 0xdd, 0xbb, 0xbd, 0x96, 0x88, 0x26,
-	0x31, 0xc0, 0xf3, 0x86, 0x2f, 0xe5, 0x87, 0x63, 0x93, 0x34, 0xdf, 0x00, 0x6b, 0xa2, 0x6b, 0x40,
-	0x76, 0x9c, 0xee, 0x3d, 0xa2, 0x4c, 0x8c, 0x33, 0x89, 0xc7, 0x40, 0xb1, 0xd7, 0xa9, 0x52, 0xb1,
-	0x15, 0x12, 0x93, 0x74, 0xd1, 0xbf, 0x10, 0x1b, 0x4f, 0x74, 0xf3, 0xe0, 0x1d, 0x5c, 0xe0, 0xbe,
-	0x0c, 0x3d, 0x03, 0x13, 0xfc, 0xba, 0x86, 0x0d, 0xd3, 0x62, 0x8c, 0x7d, 0xe8, 0x4e, 0x4b, 0xe2,
-	0xfa, 0xe8, 0x32, 0x14, 0xd8, 0x17, 0xdb, 0x6b, 0xd2, 0x74, 0x35, 0xbf, 0x72, 0x26, 0xd9, 0x3e,
-	0x90, 0x94, 0x48, 0x79, 0xd5, 0x97, 0xa1, 0x15, 0x18, 0xb7, 0x5b, 0x8a, 0x51, 0x9e, 0x4c, 0xcc,
-	0x29, 0x03, 0x57, 0x10, 0x12, 0xd5, 0x45, 0xaf, 0xc2, 0xec, 0x0e, 0x39, 0x6a, 0x94, 0x1d, 0x3f,
-	0x7d, 0x28, 0xe7, 0x28, 0xc0, 0xc5, 0x18, 0x80, 0x84, 0xc3, 0x4e, 0xa9, 0xb4, 0x33, 0x50, 0x40,
-	0x86, 0x49, 0x33, 0xd4, 0x10, 0xec, 0x54, 0xe2, 0x30, 0xc5, 0x9e, 0x45, 0x4a, 0x45, 0x2d, 0x24,
-	0x46, 0x75, 0xc8, 0x2b, 0x2a, 0x3d, 0x3f, 0x26, 0xe7, 0x40, 0x65, 0xa0, 0x70, 0x71, 0xa9, 0x50,
-	0xe4, 0x88, 0x4a, 0x02, 0xc5, 0x13, 0xf9, 0x30, 0x5d, 0xc2, 0xf6, 0xe5, 0xfc, 0xe1, 0x30, 0xc1,
-	0x9c, 0x84, 0xc3, 0x50, 0x11, 0x7a, 0x19, 0xa6, 0xdb, 0xee, 0x3e, 0x9a, 0xe6, 0x75, 0x05, 0x0a,
-	0x74, 0x36, 0x06, 0x28, 0x66, 0xdf, 0x2f, 0x15, 0xda, 0x01, 0x21, 0x7a, 0x0c, 0xc6, 0xf6, 0x5a,
-	0xe5, 0xe9, 0xc4, 0x5d, 0x8e, 0xb7, 0xd9, 0x95, 0xb0, 0x1e, 0xde, 0x1c, 0xe7, 0xd8, 0xf6, 0x06,
-	0xd7, 0x5a, 0x4c, 0x5c, 0xbc, 0xe1, 0x7d, 0xa4, 0x44, 0x37, 0x61, 0xa4, 0x2e, 0x3c, 0xe1, 0x58,
-	0x8e, 0xd0, 0xa1, 0xe7, 0x2f, 0xe5, 0x99, 0xc4, 0x09, 0x17, 0x3d, 0x6d, 0x92, 0xf2, 0x96, 0x2f,
-	0x43, 0x1b, 0x50, 0xe4, 0x67, 0x8c, 0xfc, 0x64, 0xa8, 0x5c, 0xa2, 0x58, 0xe7, 0xe2, 0x43, 0x49,
-	0x64, 0xb7, 0x22, 0x4d, 0x5b, 0x41, 0x29, 0x7a, 0x1b, 0xe6, 0xc2, 0x78, 0x7c, 0x49, 0xcc, 0x52,
-	0xd4, 0xc7, 0x86, 0xa2, 0x06, 0x57, 0x06, 0xb2, 0x22, 0x45, 0x38, 0x3b, 0xca, 0xb2, 0x31, 0x47,
-	0x14, 0xb0, 0x1a, 0x03, 0x18, 0x1a, 0x6e, 0xa6, 0x4d, 0x1c, 0xe6, 0xf0, 0xec, 0x08, 0xfb, 0x6c,
-	0xaf, 0x7c, 0x34, 0xd1, 0x61, 0xd1, 0x44, 0x4f, 0xca, 0x3b, 0xbe, 0x8c, 0x20, 0x75, 0x68, 0xe0,
-	0x94, 0x59, 0x02, 0x33, 0x97, 0x88, 0x14, 0xcd, 0x98, 0xa4, 0x7c, 0xc7, 0x97, 0xd1, 0x41, 0x64,
-	0xe7, 0x69, 0x32, 0x5d, 0xf3, 0xf3, 0xc9, 0x83, 0x18, 0xb9, 0x7d, 0xc4, 0x83, 0xe8, 0xcb, 0x50,
-	0x93, 0x9c, 0xef, 0x51, 0xee, 0x96, 0x3d, 0x1a, 0x3a, 0x46, 0xd1, 0x2e, 0xc4, 0x06, 0xd4, 0xb8,
-	0x2c, 0x87, 0x1c, 0x02, 0x86, 0xe4, 0x64, 0xf9, 0xdf, 0xa2, 0xbc, 0xe3, 0x83, 0x1e, 0x4f, 0x5c,
-	0xfe, 0xb1, 0xd4, 0x2e, 0x15, 0x6f, 0x85, 0xc4, 0x24, 0x54, 0x51, 0x2c, 0xb9, 0xe5, 0xdf, 0xe2,
-	0x95, 0xcb, 0x89, 0xa1, 0x2a, 0xe1, 0xa6, 0x51, 0x2a, 0xb5, 0x06, 0x0a, 0x48, 0xdc, 0x34, 0xf0,
-	0x5e, 0xa7, 0x7c, 0x22, 0x31, 0x6e, 0x06, 0xb6, 0x42, 0x12, 0xd5, 0x25, 0x4b, 0x50, 0x37, 0x74,
-	0x87, 0xd2, 0x4f, 0x25, 0x71, 0x09, 0x86, 0x1f, 0xa4, 0x48, 0x93, 0x3a, 0xfb, 0x4d, 0x62, 0x47,
-	0x8b, 0x5e, 0x5c, 0xc9, 0xfc, 0x8a, 0xef, 0x64, 0x62, 0xec, 0x88, 0xb9, 0x55, 0x94, 0x0a, 0xad,
-	0x80, 0xf0, 0xb9, 0xf1, 0x3b, 0xef, 0x57, 0x05, 0xf1, 0x83, 0x19, 0x98, 0x76, 0xe9, 0x9a, 0x51,
-	0xf1, 0x13, 0x41, 0x2a, 0x5e, 0x48, 0xa2, 0x62, 0x66, 0xc1, 0xb8, 0xf8, 0x89, 0x20, 0x17, 0x2f,
-	0x24, 0x71, 0xb1, 0x6b, 0x41, 0xc8, 0x58, 0x4a, 0x22, 0xe3, 0x0b, 0x23, 0x90, 0x31, 0x07, 0x1a,
-	0x64, 0xe3, 0x5a, 0x94, 0x8d, 0x4f, 0x1f, 0xce, 0xc6, 0x1c, 0x28, 0x40, 0xc7, 0xcf, 0x0e, 0xd0,
-	0xf1, 0xa9, 0x43, 0xe8, 0x98, 0x5b, 0xbb, 0x7c, 0xdc, 0x88, 0xe5, 0xe3, 0xb3, 0xc3, 0xf8, 0x98,
-	0xa3, 0x84, 0x08, 0xf9, 0xc9, 0x10, 0x21, 0x57, 0x13, 0x09, 0x99, 0xdb, 0x32, 0x46, 0xbe, 0x91,
-	0xcc, 0xc8, 0x8f, 0x8e, 0xc4, 0xc8, 0x1c, 0x2d, 0x4a, 0xc9, 0x52, 0x12, 0x25, 0x5f, 0x18, 0x81,
-	0x92, 0xdd, 0xc1, 0x1a, 0xe0, 0xe4, 0x97, 0xe2, 0x38, 0xf9, 0xcc, 0x10, 0x4e, 0xe6, 0x58, 0x41,
-	0x52, 0x7e, 0x29, 0x8e, 0x94, 0xcf, 0x0c, 0x21, 0xe5, 0x10, 0x0e, 0x63, 0xe5, 0x2b, 0xf1, 0xac,
-	0x7c, 0x6e, 0x28, 0x2b, 0x73, 0xac, 0x30, 0x2d, 0x3f, 0x1e, 0xa0, 0xe5, 0x87, 0x13, 0x68, 0x99,
-	0x1b, 0x12, 0x5e, 0x7e, 0x21, 0xc2, 0xcb, 0xe2, 0x61, 0xbc, 0xcc, 0x2d, 0x3d, 0x62, 0x6e, 0xc4,
-	0x12, 0xf3, 0xd9, 0x61, 0xc4, 0xec, 0xce, 0xbc, 0x20, 0x33, 0x5f, 0x4d, 0x60, 0xe6, 0xf3, 0xc3,
-	0x99, 0x99, 0xc3, 0x0d, 0x50, 0xb3, 0x7c, 0x28, 0x35, 0x3f, 0x3e, 0x22, 0x35, 0x73, 0xec, 0x38,
-	0x6e, 0xfe, 0x4a, 0x98, 0x9b, 0x17, 0x93, 0xb9, 0x99, 0x83, 0x70, 0x72, 0x6e, 0xc4, 0x92, 0xf3,
-	0xd9, 0x61, 0xe4, 0xec, 0x3a, 0x2d, 0xc8, 0xce, 0x8d, 0x58, 0x76, 0x3e, 0x3b, 0x8c, 0x9d, 0x5d,
-	0xa8, 0x20, 0x3d, 0x37, 0x62, 0xe9, 0xf9, 0xec, 0x30, 0x7a, 0xf6, 0x86, 0x32, 0xc0, 0xcf, 0xdb,
-	0x89, 0xfc, 0x7c, 0x71, 0x14, 0x7e, 0xe6, 0x90, 0x11, 0x82, 0x96, 0x92, 0x08, 0xfa, 0xc2, 0x08,
-	0x04, 0xed, 0x06, 0x83, 0x01, 0x86, 0xbe, 0x91, 0xcc, 0xd0, 0x8f, 0x8e, 0xc4, 0xd0, 0x6e, 0xe8,
-	0x8a, 0x50, 0xf4, 0x93, 0x21, 0x8a, 0xae, 0x26, 0x52, 0xb4, 0x1b, 0x49, 0x29, 0x47, 0xbf, 0x10,
-	0xe1, 0x68, 0xf1, 0x30, 0x8e, 0x76, 0x97, 0xa3, 0x4b, 0xd2, 0x57, 0xe2, 0x49, 0xfa, 0xdc, 0x88,
-	0xaf, 0x50, 0x62, 0x59, 0xfa, 0x6f, 0x19, 0x98, 0xb8, 0xec, 0xde, 0x54, 0x06, 0xee, 0x9f, 0x84,
-	0x07, 0xb8, 0x7f, 0x42, 0xeb, 0xe4, 0xa2, 0x15, 0x47, 0xcf, 0x96, 0xc2, 0x29, 0xfb, 0x74, 0xec,
-	0xfc, 0xa2, 0x1a, 0x91, 0x1b, 0x4a, 0xd7, 0xf4, 0x01, 0x8f, 0x0c, 0x31, 0xc3, 0x4e, 0xf7, 0x6d,
-	0xbc, 0x54, 0x7a, 0x96, 0x6e, 0x5a, 0xba, 0x73, 0x9b, 0x32, 0xb5, 0x50, 0x9b, 0x23, 0xb6, 0xd8,
-	0xa0, 0xb0, 0x8d, 0x0b, 0x37, 0x79, 0x99, 0x54, 0xe8, 0x07, 0x7e, 0xb9, 0xaf, 0xde, 0xb3, 0x23,
-	0xbf, 0x7a, 0xc7, 0xa9, 0x5f, 0xc9, 0xc2, 0x5e, 0x0b, 0xcd, 0x2b, 0x76, 0xad, 0x13, 0xbf, 0xa4,
-	0x14, 0x35, 0x30, 0x79, 0x02, 0xd7, 0x3b, 0x33, 0x56, 0xb8, 0x08, 0xa7, 0x7e, 0x59, 0xf2, 0x7c,
-	0x5f, 0xe3, 0x14, 0x1d, 0x1c, 0x00, 0x72, 0x7e, 0xb3, 0xc4, 0xdf, 0xf6, 0xd3, 0x23, 0x24, 0x89,
-	0xa9, 0x92, 0x37, 0x13, 0xe4, 0xd6, 0x9c, 0xac, 0x6b, 0xef, 0x15, 0x5e, 0x2e, 0xf8, 0xe8, 0x09,
-	0x97, 0xf2, 0xe5, 0x4c, 0x5f, 0xe2, 0xfd, 0x54, 0x80, 0x42, 0x4d, 0x71, 0x5a, 0x6d, 0xf7, 0xcc,
-	0xea, 0xf9, 0x81, 0x93, 0x97, 0x13, 0xf1, 0xe4, 0x14, 0x7f, 0x7d, 0xb4, 0x8a, 0x87, 0x8b, 0xe1,
-	0xb8, 0x57, 0xdc, 0xd5, 0x58, 0x17, 0xf8, 0x67, 0x32, 0xee, 0x69, 0x9d, 0x6b, 0xf6, 0xdc, 0xf8,
-	0xcf, 0xdf, 0xaf, 0x1e, 0x11, 0x7f, 0x9d, 0x81, 0x69, 0xde, 0x2c, 0x7e, 0x22, 0xd4, 0x18, 0x68,
-	0x57, 0xdc, 0x4c, 0x0f, 0x59, 0x24, 0xb7, 0x72, 0x1d, 0xa6, 0x2c, 0xae, 0xe4, 0x36, 0x73, 0xf1,
-	0x90, 0xf3, 0xa5, 0x60, 0x3b, 0x7d, 0xc3, 0xca, 0x8f, 0xc6, 0xbc, 0xd5, 0xb2, 0x04, 0x59, 0xfa,
-	0xd7, 0x1c, 0xbc, 0x69, 0x71, 0x67, 0xbe, 0x75, 0x52, 0x2e, 0x31, 0x35, 0xb2, 0xba, 0x9a, 0x9f,
-	0xe9, 0x76, 0xf7, 0xfe, 0xff, 0x36, 0x03, 0x9d, 0x23, 0xc9, 0x70, 0xa7, 0x43, 0x9f, 0xba, 0xf1,
-	0x97, 0x44, 0xe3, 0xf4, 0xe5, 0x4d, 0xd1, 0x13, 0xd3, 0xd7, 0x42, 0x0f, 0x76, 0xa9, 0xc9, 0x87,
-	0xed, 0x23, 0x01, 0xf2, 0xe4, 0xbc, 0x8f, 0x3c, 0xc8, 0x51, 0x0c, 0x35, 0xb4, 0x7c, 0x85, 0xd1,
-	0x97, 0xef, 0x35, 0x28, 0xe2, 0xc5, 0x48, 0xd2, 0xcc, 0x07, 0x0f, 0x21, 0xd3, 0x0c, 0x81, 0x17,
-	0xa3, 0xa7, 0x21, 0xd3, 0xea, 0xaa, 0xdc, 0x61, 0xd5, 0xe4, 0xb9, 0x43, 0x67, 0xa1, 0xdb, 0x31,
-	0x6c, 0x21, 0x7e, 0x1b, 0x10, 0x7d, 0x7f, 0xc7, 0x8b, 0xf8, 0x88, 0x7f, 0x09, 0x26, 0x0d, 0x53,
-	0xf5, 0xfa, 0x95, 0xad, 0x95, 0x79, 0xbf, 0xf8, 0xf3, 0xbd, 0x7b, 0x77, 0xfd, 0x87, 0x7c, 0x44,
-	0xb1, 0x41, 0x7d, 0x41, 0x9f, 0xf4, 0x11, 0x1b, 0xf6, 0x9a, 0xc5, 0xf3, 0x05, 0x7f, 0xfd, 0x77,
-	0xcf, 0xff, 0x94, 0x26, 0xa9, 0x6e, 0x43, 0x15, 0xdf, 0x84, 0xd9, 0x4d, 0x3c, 0x40, 0xe1, 0x97,
-	0x9b, 0x97, 0x06, 0x16, 0x43, 0x5c, 0x2e, 0x1a, 0x6d, 0x75, 0xcc, 0x11, 0xe9, 0xdb, 0x80, 0x82,
-	0xe8, 0x7c, 0xad, 0x3d, 0x02, 0x60, 0xf4, 0xbb, 0x2e, 0xb3, 0x08, 0xc1, 0x47, 0xf8, 0x58, 0xce,
-	0x94, 0x5d, 0x25, 0xa7, 0xad, 0xec, 0x0f, 0x3c, 0xac, 0x24, 0x4a, 0x4d, 0x2a, 0xbe, 0x78, 0x85,
-	0xbc, 0xf3, 0x8d, 0x04, 0x3c, 0x54, 0x04, 0x58, 0xbb, 0xba, 0xb1, 0xd5, 0xd8, 0x6a, 0xd6, 0x37,
-	0x9a, 0xa5, 0x23, 0x68, 0x1a, 0xa6, 0xc8, 0xef, 0xfa, 0xc6, 0xd6, 0xf6, 0x56, 0x49, 0x40, 0x25,
-	0x28, 0x34, 0x36, 0x02, 0x0a, 0x63, 0x95, 0xf1, 0x1f, 0x7e, 0xb0, 0x70, 0xe4, 0xe2, 0xab, 0xe4,
-	0xef, 0x5a, 0xbc, 0x5b, 0x71, 0x84, 0xa0, 0xb8, 0xb9, 0xbd, 0x75, 0x59, 0x6e, 0x36, 0x5e, 0xa9,
-	0x6f, 0x35, 0x57, 0x5f, 0xd9, 0xc4, 0x48, 0x18, 0x99, 0xca, 0x56, 0x6b, 0x57, 0xa5, 0x26, 0x86,
-	0x72, 0x7f, 0x37, 0xaf, 0x6e, 0xaf, 0x5d, 0x2e, 0x8d, 0x79, 0xbf, 0xaf, 0x6d, 0xd7, 0xa5, 0xd7,
-	0x4a, 0x19, 0x06, 0xbc, 0xf2, 0x1b, 0x01, 0x72, 0xee, 0xa3, 0x3c, 0x4c, 0xad, 0x59, 0x3a, 0x19,
-	0xd0, 0xb0, 0x69, 0x52, 0x59, 0x1c, 0x16, 0x83, 0xc4, 0x23, 0xe8, 0x0d, 0x5c, 0xa1, 0xe7, 0x61,
-	0x14, 0x37, 0x83, 0x23, 0xc3, 0x5b, 0x39, 0x33, 0x44, 0xcb, 0x05, 0x5f, 0xb9, 0x01, 0xb9, 0xfa,
-	0xc1, 0xe7, 0xd1, 0xec, 0xda, 0xa9, 0x3b, 0x7f, 0x5a, 0x38, 0x72, 0xe7, 0xd3, 0x05, 0xe1, 0x23,
-	0xfc, 0xef, 0xf7, 0xf8, 0xdf, 0x1f, 0xf1, 0xbf, 0x1f, 0xff, 0x79, 0xe1, 0xc8, 0xeb, 0x93, 0xdc,
-	0xe4, 0x46, 0xf6, 0xdf, 0x01, 0x00, 0x00, 0xff, 0xff, 0xfd, 0x3b, 0x3f, 0x3c, 0x24, 0x37, 0x00,
-	0x00,
+	// 3668 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x09, 0x6e, 0x88, 0x02, 0xff, 0xdc, 0x5b, 0xdd, 0x6f, 0x1b, 0xd7,
+	0x95, 0xd7, 0xf0, 0x43, 0xa2, 0x0e, 0x3f, 0x44, 0x5f, 0xc9, 0x36, 0x2d, 0xdb, 0xa2, 0x3c, 0xf1,
+	0xf7, 0x07, 0x95, 0x55, 0xe2, 0x4d, 0x9c, 0x4d, 0x76, 0x63, 0x52, 0xb2, 0xcd, 0x48, 0x96, 0xe5,
+	0x11, 0x65, 0x3b, 0xce, 0x26, 0xb3, 0xe3, 0x99, 0x4b, 0x72, 0x60, 0x72, 0x86, 0x99, 0x19, 0x5a,
+	0x52, 0x76, 0xb1, 0x8b, 0x0d, 0x16, 0xbb, 0x9b, 0x00, 0x01, 0x36, 0xc0, 0x02, 0xbb, 0x45, 0x5f,
+	0x82, 0xf6, 0xa5, 0x4f, 0x7d, 0x6c, 0x80, 0x02, 0x7d, 0x2c, 0xe0, 0x3e, 0x35, 0x8f, 0x45, 0x03,
+	0x28, 0xad, 0x8b, 0xfe, 0x05, 0x7d, 0x33, 0xd0, 0xa2, 0xb8, 0x1f, 0x43, 0xce, 0x90, 0x33, 0xa2,
+	0xec, 0x4c, 0x90, 0xa6, 0x2f, 0xb6, 0x78, 0xee, 0x39, 0xbf, 0x7b, 0xef, 0x39, 0xf7, 0xdc, 0xfb,
+	0xbb, 0x1f, 0x03, 0x47, 0x55, 0x53, 0x7d, 0x68, 0x99, 0x8a, 0xda, 0x5c, 0xa0, 0xff, 0x76, 0x1e,
+	0x2c, 0x28, 0x1d, 0xbd, 0xd4, 0xb1, 0x4c, 0xc7, 0x44, 0x07, 0x7a, 0x85, 0x25, 0x5e, 0x38, 0x7b,
+	0x6c, 0x58, 0x5f, 0x53, 0x1c, 0x85, 0x19, 0xcc, 0xce, 0x0d, 0x97, 0x62, 0xcb, 0x32, 0x2d, 0x9b,
+	0x97, 0x9f, 0x1a, 0x2e, 0xd7, 0x0d, 0x07, 0x5b, 0x86, 0xd2, 0x92, 0x2d, 0xa5, 0xee, 0x70, 0xb5,
+	0xf9, 0x61, 0xb5, 0x36, 0x76, 0x14, 0x4f, 0x45, 0x17, 0xfb, 0x1a, 0xb6, 0x63, 0x5a, 0x4a, 0x03,
+	0x2f, 0x60, 0xa3, 0xa1, 0x1b, 0xee, 0x7f, 0xc4, 0xe2, 0x91, 0xaa, 0x72, 0xed, 0x13, 0x7d, 0xed,
+	0xae, 0xa3, 0xb7, 0x16, 0x1c, 0x4b, 0x51, 0x75, 0xa3, 0xb1, 0x60, 0x77, 0x14, 0x83, 0xab, 0x88,
+	0x03, 0x2a, 0xcd, 0x96, 0xba, 0xe0, 0xe8, 0x6d, 0x6c, 0x3b, 0x4a, 0xbb, 0xc3, 0x75, 0x66, 0x1a,
+	0x66, 0xc3, 0xa4, 0x7f, 0x2e, 0x90, 0xbf, 0x98, 0x54, 0x2c, 0x43, 0x4e, 0xc2, 0x76, 0xc7, 0x34,
+	0x6c, 0x7c, 0x03, 0x2b, 0x1a, 0xb6, 0xd0, 0x8b, 0x10, 0x77, 0xb6, 0x8d, 0x42, 0x7c, 0x5e, 0x38,
+	0x9b, 0x5e, 0x9c, 0x2b, 0x0d, 0x39, 0xb1, 0x54, 0xb3, 0x14, 0xc3, 0x56, 0x54, 0x47, 0x37, 0x0d,
+	0x89, 0xa8, 0x8a, 0xd7, 0x01, 0xae, 0x63, 0x47, 0xc2, 0xef, 0x77, 0xb1, 0xed, 0xa0, 0x2b, 0x30,
+	0xde, 0xa4, 0x48, 0x05, 0x81, 0x42, 0x1c, 0x0e, 0x80, 0xd8, 0xe8, 0x28, 0x46, 0x39, 0xf5, 0x78,
+	0xb7, 0x38, 0xf6, 0xc5, 0x6e, 0x51, 0x90, 0xb8, 0x81, 0xf8, 0xa1, 0x00, 0x69, 0x8a, 0xc4, 0x1a,
+	0x84, 0x2a, 0x03, 0x50, 0x27, 0x02, 0xa0, 0xfc, 0xad, 0x1f, 0x06, 0x45, 0x25, 0x48, 0x3e, 0x52,
+	0x5a, 0x5d, 0x5c, 0x88, 0x51, 0x8c, 0x42, 0x00, 0xc6, 0x1d, 0x52, 0x2e, 0x31, 0x35, 0xf1, 0x73,
+	0x01, 0x60, 0xbd, 0x1b, 0x41, 0x77, 0xd0, 0xcb, 0xfb, 0xac, 0xb9, 0x9c, 0x20, 0xa6, 0xbc, 0x7e,
+	0x74, 0x0c, 0xc6, 0x75, 0xa3, 0xa5, 0x1b, 0x98, 0x86, 0x20, 0xc5, 0x0b, 0xb9, 0x0c, 0xcd, 0x42,
+	0xf2, 0x41, 0x4b, 0x37, 0xb4, 0x42, 0xc2, 0x53, 0xc8, 0x44, 0xa2, 0x04, 0x69, 0xda, 0xf0, 0x08,
+	0xbd, 0x27, 0x7e, 0x29, 0xc0, 0xc1, 0x8a, 0x69, 0x68, 0x3a, 0x09, 0xb7, 0xd2, 0xfa, 0x36, 0x1d,
+	0x73, 0x19, 0x26, 0xf1, 0x76, 0x47, 0x66, 0x96, 0xf1, 0x11, 0xc1, 0x4c, 0xe1, 0xed, 0x0e, 0xfd,
+	0x6b, 0x4f, 0x8f, 0xbd, 0x0b, 0x87, 0x06, 0x3b, 0x17, 0xa5, 0xf3, 0xfe, 0x5d, 0x80, 0x5c, 0xd5,
+	0xd0, 0x9d, 0x6f, 0xd1, 0x6b, 0xe2, 0x1d, 0x98, 0xea, 0x35, 0x21, 0xca, 0xbe, 0xbd, 0x0f, 0xf9,
+	0xaa, 0xa1, 0x5a, 0xb8, 0x8d, 0x8d, 0x28, 0x3a, 0x27, 0xc2, 0xa4, 0xee, 0xc2, 0xd1, 0x0e, 0xc6,
+	0x79, 0x37, 0xfa, 0x62, 0xf1, 0x9f, 0xe1, 0x80, 0xa7, 0xca, 0x28, 0xe7, 0x88, 0x13, 0x30, 0x69,
+	0xe0, 0x2d, 0xb9, 0xef, 0x5e, 0xb7, 0xf6, 0x94, 0x81, 0xb7, 0xa8, 0x53, 0xc5, 0xb7, 0x20, 0xbb,
+	0x84, 0x5b, 0xd8, 0xc1, 0x11, 0xcc, 0x73, 0x9b, 0x90, 0x73, 0xb1, 0xa2, 0x0c, 0xc9, 0xbf, 0x00,
+	0xe2, 0xb0, 0x8a, 0xd1, 0x88, 0xa0, 0x9d, 0xe8, 0x14, 0xa4, 0x2d, 0xec, 0x74, 0x2d, 0x43, 0x7e,
+	0x88, 0x77, 0x6c, 0xdf, 0x7c, 0x04, 0xac, 0x60, 0x05, 0xef, 0xd8, 0x6f, 0x25, 0x52, 0xb1, 0x7c,
+	0x5c, 0xdc, 0x82, 0x69, 0x5f, 0xed, 0x51, 0xc6, 0xe7, 0x28, 0x24, 0x68, 0x0b, 0x62, 0xf3, 0xf1,
+	0xb3, 0x99, 0xf2, 0xc4, 0xd3, 0xdd, 0x62, 0x7c, 0x05, 0xef, 0x48, 0x54, 0x28, 0xae, 0x41, 0x7a,
+	0x43, 0x55, 0x8c, 0xaf, 0xdf, 0x5f, 0xde, 0x91, 0x8f, 0x05, 0xc8, 0x30, 0xc0, 0x28, 0xbb, 0x70,
+	0x19, 0x12, 0x96, 0xb9, 0xc5, 0xba, 0x90, 0x5e, 0x3c, 0x1a, 0x00, 0xb1, 0x82, 0x77, 0xbc, 0xf9,
+	0x4b, 0xd5, 0xc5, 0x4d, 0x40, 0x12, 0x7e, 0x84, 0x2d, 0x1b, 0x47, 0xda, 0xc7, 0x4f, 0x05, 0x98,
+	0xf6, 0xe1, 0xfe, 0x05, 0x74, 0x75, 0x0b, 0x0e, 0x57, 0x9a, 0x58, 0x7d, 0x58, 0x31, 0x0d, 0x5b,
+	0xb7, 0x1d, 0x6c, 0xa8, 0x3b, 0x11, 0x8c, 0xe1, 0x13, 0x30, 0xb9, 0xa5, 0x3b, 0x4d, 0x59, 0xd3,
+	0xeb, 0x75, 0x9a, 0xda, 0xee, 0x08, 0x4e, 0x11, 0xf1, 0x92, 0x5e, 0xaf, 0x8b, 0x32, 0x14, 0x86,
+	0x2b, 0x8e, 0x32, 0x31, 0xff, 0x4f, 0x80, 0xe9, 0x4a, 0x93, 0xa4, 0xc5, 0x35, 0xcb, 0xfc, 0x00,
+	0x47, 0x10, 0x46, 0xc2, 0x12, 0xea, 0x14, 0xcb, 0xd7, 0x27, 0x2e, 0x43, 0x67, 0x20, 0xd3, 0xee,
+	0xda, 0x8e, 0x4c, 0x02, 0xac, 0x9b, 0x8c, 0xcc, 0x4d, 0x72, 0x9d, 0x34, 0x29, 0xb9, 0xc3, 0x0a,
+	0xc4, 0x2f, 0x63, 0x30, 0xe3, 0x6f, 0x59, 0x94, 0x03, 0xe1, 0x12, 0x4c, 0x59, 0x04, 0xdb, 0x96,
+	0x95, 0x7a, 0x1d, 0xab, 0x0e, 0xd6, 0x7c, 0x93, 0x6b, 0x8e, 0x15, 0x5e, 0xe5, 0x65, 0xe8, 0x22,
+	0x64, 0xdb, 0xba, 0x21, 0xdb, 0x8e, 0x62, 0x39, 0x64, 0xc6, 0xa1, 0xcd, 0xce, 0x94, 0x53, 0x4f,
+	0x77, 0x8b, 0x09, 0x89, 0xe4, 0x7b, 0xba, 0xad, 0x1b, 0x1b, 0xa4, 0x74, 0x05, 0xef, 0xa0, 0x3a,
+	0x8c, 0x13, 0xf2, 0x8c, 0xed, 0x42, 0x82, 0x8e, 0xb3, 0x97, 0x02, 0x5a, 0x18, 0xd4, 0xb5, 0xd2,
+	0x06, 0xb5, 0x5a, 0x36, 0x1c, 0x6b, 0xa7, 0x7c, 0x84, 0x34, 0xe4, 0xc3, 0xaf, 0x8a, 0x13, 0x54,
+	0x58, 0x5d, 0xfa, 0xf8, 0xab, 0xe2, 0xf8, 0x9a, 0xa9, 0xe1, 0xea, 0x92, 0xc4, 0xd1, 0x67, 0xaf,
+	0x40, 0xda, 0x63, 0x81, 0xf2, 0x10, 0x27, 0x4d, 0x23, 0x5e, 0x49, 0x4a, 0xe4, 0x4f, 0x34, 0xe3,
+	0x5d, 0x97, 0x93, 0x7c, 0xdd, 0x7d, 0x2d, 0xf6, 0xaa, 0x20, 0xd6, 0xe0, 0x70, 0x19, 0x37, 0x74,
+	0xc3, 0xcb, 0x98, 0xbf, 0xfe, 0xea, 0x21, 0x43, 0x61, 0x18, 0x35, 0xca, 0xe1, 0xfa, 0xcb, 0x18,
+	0x1c, 0x5c, 0x36, 0xb4, 0x48, 0x5b, 0x4d, 0x06, 0xac, 0x6a, 0xb6, 0xdb, 0xba, 0xe3, 0x1f, 0xb0,
+	0x4c, 0x86, 0xae, 0x40, 0x4a, 0xc3, 0x8a, 0xd6, 0xa3, 0xbd, 0xe9, 0xc5, 0xe3, 0x1e, 0x68, 0xb2,
+	0xa7, 0x29, 0x35, 0x5b, 0x6a, 0xa9, 0xe6, 0xee, 0x69, 0xa4, 0x9e, 0x3a, 0xfa, 0x27, 0x38, 0xdc,
+	0xdb, 0x85, 0x31, 0x34, 0xd9, 0xb1, 0xf4, 0x46, 0x03, 0x5b, 0x94, 0xf1, 0xa5, 0x17, 0xcf, 0x06,
+	0x34, 0xb2, 0xca, 0x2d, 0x2a, 0xd4, 0xa0, 0xc6, 0xf4, 0xa5, 0x83, 0x7a, 0x90, 0x18, 0xbd, 0x09,
+	0x19, 0x52, 0x60, 0x38, 0x32, 0xd9, 0x72, 0xd9, 0x85, 0x24, 0x1d, 0x6f, 0xa1, 0x7d, 0xe7, 0x69,
+	0xc6, 0x4c, 0x88, 0xc4, 0x16, 0x7f, 0x2f, 0xc0, 0xa1, 0x41, 0x8f, 0x46, 0x99, 0x68, 0xa7, 0x20,
+	0xcd, 0xbb, 0xbe, 0xa5, 0xe8, 0x7e, 0xfe, 0x04, 0xac, 0xe0, 0xae, 0xa2, 0x3b, 0x68, 0x01, 0xa6,
+	0x97, 0x96, 0xd7, 0xa5, 0xe5, 0xca, 0xd5, 0xda, 0xf2, 0x92, 0x6c, 0x61, 0xdb, 0x6c, 0x3d, 0xc2,
+	0x5a, 0x21, 0x4e, 0x56, 0x55, 0x09, 0x69, 0xbd, 0x22, 0x89, 0x97, 0xa0, 0x12, 0xe4, 0x4d, 0x03,
+	0xcb, 0x9d, 0xa6, 0x62, 0x63, 0xee, 0x5c, 0x1f, 0x8d, 0xce, 0x99, 0x06, 0x5e, 0x27, 0x85, 0xcc,
+	0x61, 0xa2, 0x03, 0x07, 0xae, 0x6a, 0x24, 0x49, 0x3b, 0x2d, 0x3d, 0x0a, 0x56, 0x78, 0x12, 0x26,
+	0x6d, 0x02, 0x45, 0x67, 0x83, 0x18, 0x9d, 0x0d, 0x7a, 0x8b, 0x7f, 0x8a, 0x96, 0xac, 0xe0, 0x1d,
+	0xf1, 0x6d, 0x40, 0xde, 0x5a, 0xa3, 0x4c, 0x85, 0x35, 0xde, 0xa1, 0x9b, 0xd8, 0x8a, 0x82, 0x51,
+	0xf5, 0x9a, 0xca, 0xf1, 0xa2, 0x6c, 0xea, 0xbf, 0xc1, 0x11, 0x0a, 0x4d, 0x07, 0x59, 0x1d, 0x5b,
+	0xab, 0x58, 0xb1, 0xa3, 0x20, 0x81, 0x67, 0x60, 0xdc, 0x51, 0xac, 0x06, 0x66, 0xc3, 0x2a, 0x59,
+	0x9e, 0x22, 0x1a, 0x4f, 0x77, 0x7b, 0x53, 0xa6, 0xc4, 0x8b, 0x45, 0x05, 0x66, 0x83, 0x1a, 0x10,
+	0x65, 0x1f, 0x7f, 0x2e, 0x00, 0xa2, 0xf4, 0x72, 0xd5, 0x34, 0x1f, 0x76, 0x3b, 0x11, 0xf4, 0xee,
+	0x05, 0x80, 0xb6, 0xb2, 0x2d, 0xb3, 0x95, 0x88, 0xf7, 0x90, 0x6f, 0x3c, 0xda, 0xca, 0x36, 0xad,
+	0xcb, 0x46, 0x0b, 0x90, 0x57, 0x09, 0x37, 0xd0, 0xb0, 0x25, 0xb3, 0xb4, 0xf6, 0x93, 0xe1, 0x29,
+	0xb7, 0xb4, 0xca, 0x0a, 0xd1, 0x1c, 0x4c, 0x58, 0x8c, 0x5d, 0xf9, 0xd2, 0xc5, 0x15, 0x8a, 0x7f,
+	0x20, 0xf4, 0xcb, 0xdb, 0x8f, 0x28, 0x27, 0x83, 0x37, 0x61, 0xbc, 0xd7, 0x1d, 0x32, 0x51, 0x89,
+	0x41, 0x20, 0x44, 0x61, 0x09, 0xdb, 0xaa, 0xa5, 0x77, 0x1c, 0xd3, 0x72, 0x67, 0x63, 0x66, 0x87,
+	0x36, 0xe1, 0x40, 0xc7, 0xc2, 0x75, 0xec, 0xa8, 0x4d, 0xac, 0xb9, 0xbe, 0x89, 0x3f, 0x23, 0x58,
+	0xbe, 0x0f, 0xc1, 0xdc, 0x28, 0xfe, 0x97, 0x00, 0xd3, 0x37, 0xb0, 0x62, 0x39, 0x0f, 0xb0, 0xe2,
+	0xd4, 0xb6, 0xa3, 0x58, 0x55, 0x2e, 0x43, 0xdc, 0x30, 0xb7, 0xf8, 0x8e, 0x78, 0xef, 0x25, 0x83,
+	0x37, 0x8b, 0xe8, 0x8b, 0xef, 0xc0, 0x8c, 0xbf, 0x21, 0x51, 0x0e, 0xd2, 0x1f, 0xc7, 0x60, 0xf2,
+	0x7a, 0x25, 0x82, 0xce, 0xbd, 0xce, 0x77, 0x3d, 0xe1, 0x9e, 0xef, 0x55, 0x53, 0xba, 0x5e, 0x59,
+	0xc1, 0x3b, 0x2e, 0x9d, 0x26, 0x56, 0xe8, 0x2a, 0x4c, 0x3a, 0x4d, 0x0b, 0xdb, 0x4d, 0xb3, 0xa5,
+	0xf1, 0x95, 0x70, 0x5f, 0x0e, 0xea, 0x5b, 0xcd, 0x62, 0x48, 0x52, 0x5c, 0x74, 0xa4, 0x4f, 0x7a,
+	0x3c, 0x33, 0x30, 0x65, 0x3f, 0xa4, 0x1a, 0x17, 0xe1, 0x59, 0xe2, 0xd0, 0xb7, 0x12, 0x6f, 0x03,
+	0x90, 0x8e, 0x44, 0x19, 0x83, 0xef, 0xc5, 0x21, 0xb7, 0xde, 0xb5, 0x9b, 0xd1, 0x8c, 0xb2, 0x0a,
+	0x40, 0xa7, 0x6b, 0x37, 0xb1, 0x25, 0x3b, 0xdb, 0x06, 0xef, 0xe4, 0x88, 0x93, 0x51, 0xb7, 0x97,
+	0xcc, 0xae, 0xb6, 0x6d, 0xa0, 0x5b, 0x1c, 0x04, 0xcb, 0xfd, 0xe3, 0xd5, 0xf3, 0x1e, 0x10, 0x7e,
+	0x12, 0x5c, 0x62, 0x47, 0xc0, 0x25, 0xf7, 0x24, 0xb8, 0x54, 0xdb, 0x36, 0x6e, 0x62, 0x47, 0xf1,
+	0x01, 0x62, 0x02, 0xf8, 0x3a, 0x4c, 0x90, 0x1f, 0xb2, 0x63, 0x3e, 0x4b, 0x78, 0xc7, 0x89, 0x4d,
+	0xcd, 0x74, 0x33, 0x27, 0xf9, 0x6c, 0x99, 0x43, 0xc2, 0xcd, 0x2a, 0xdd, 0xe9, 0xe0, 0xc2, 0xf8,
+	0xbc, 0x70, 0x36, 0x17, 0xe8, 0x09, 0xee, 0xfb, 0xda, 0x4e, 0xc7, 0xdd, 0xe3, 0xa5, 0x68, 0xbd,
+	0x3b, 0x1d, 0x2c, 0x7e, 0x5f, 0x80, 0xa9, 0x5e, 0x6c, 0xa2, 0x9c, 0xf8, 0x2a, 0x3e, 0x0f, 0x3f,
+	0x7b, 0x98, 0x88, 0x57, 0xc5, 0xff, 0x88, 0xc1, 0x0c, 0xe7, 0x3f, 0x6c, 0x36, 0x8f, 0x60, 0xfc,
+	0xdc, 0x02, 0xe0, 0x04, 0xb2, 0xdf, 0xb0, 0xe7, 0x08, 0x3d, 0xc3, 0x20, 0xa1, 0x2f, 0x93, 0xbd,
+	0x8f, 0xe2, 0x74, 0xd9, 0x32, 0x94, 0x5b, 0x3c, 0xb9, 0x77, 0x2f, 0x37, 0xa8, 0xae, 0x3b, 0x00,
+	0x98, 0x25, 0x21, 0xe4, 0x1d, 0x53, 0xb7, 0x4d, 0xc3, 0xb7, 0x44, 0x71, 0x99, 0xf8, 0x8f, 0x70,
+	0x70, 0xc0, 0x0b, 0x51, 0xa6, 0xe7, 0x47, 0x31, 0x38, 0xe2, 0x87, 0x8f, 0xe8, 0xc4, 0xea, 0x3b,
+	0xe8, 0xe9, 0x1c, 0x64, 0xd6, 0x4c, 0xb3, 0xc7, 0x01, 0xc4, 0x2c, 0xa4, 0xd9, 0x6f, 0xea, 0x0c,
+	0xc2, 0xaa, 0x82, 0x3c, 0x15, 0x2d, 0x73, 0xcc, 0x44, 0xc4, 0x6f, 0x9f, 0xf3, 0x8c, 0xba, 0x06,
+	0xd9, 0x6f, 0x80, 0x10, 0xff, 0x40, 0x00, 0x54, 0xb3, 0xba, 0x86, 0xaa, 0x38, 0x78, 0xd5, 0x6c,
+	0x44, 0xd0, 0xbb, 0x59, 0x48, 0xea, 0x86, 0x86, 0xb7, 0x69, 0xef, 0x12, 0x6e, 0x1f, 0xa8, 0x08,
+	0x5d, 0x86, 0x14, 0x25, 0x4a, 0xb2, 0xae, 0xd1, 0xa1, 0x12, 0x2f, 0xcf, 0x92, 0xe2, 0x27, 0xbb,
+	0xc5, 0x09, 0x1a, 0xb2, 0xea, 0xd2, 0xd3, 0xfe, 0x9f, 0xd2, 0x04, 0xd5, 0xad, 0x6a, 0xe2, 0x7d,
+	0x98, 0xf6, 0xb5, 0x31, 0x4a, 0x07, 0xfc, 0x27, 0x3d, 0xe4, 0xa3, 0xbd, 0x8e, 0x6a, 0x33, 0xf0,
+	0x32, 0x24, 0x5b, 0x04, 0x6a, 0x8f, 0xf8, 0xd2, 0xaa, 0x5c, 0xdf, 0x50, 0x65, 0x42, 0xfc, 0x66,
+	0xa2, 0xde, 0x96, 0x3c, 0x5f, 0x4b, 0xde, 0x21, 0x93, 0xbb, 0xd7, 0x23, 0x51, 0xfa, 0xfb, 0x8f,
+	0x02, 0x1c, 0xaa, 0x98, 0xed, 0x4e, 0xd7, 0xc1, 0xf4, 0x3c, 0xd1, 0xee, 0xb6, 0x23, 0xe8, 0xe8,
+	0x1c, 0x4c, 0xb8, 0xc7, 0x78, 0xa4, 0xab, 0x59, 0x77, 0x2f, 0xc1, 0x85, 0xa8, 0x0e, 0x69, 0x95,
+	0xd7, 0xe6, 0x8e, 0xbd, 0x4c, 0x79, 0x99, 0xe8, 0xfc, 0x7a, 0xb7, 0xb8, 0xd0, 0xd0, 0x9d, 0x66,
+	0xf7, 0x41, 0x49, 0x35, 0xdb, 0x0b, 0xbd, 0x1a, 0xb5, 0x07, 0x0b, 0x03, 0xf7, 0xc5, 0xdd, 0xae,
+	0xae, 0x95, 0x36, 0x37, 0xab, 0x4b, 0x4f, 0x76, 0x8b, 0xe0, 0xb6, 0xbd, 0xba, 0x24, 0x81, 0x8b,
+	0x5c, 0xd5, 0xd0, 0x3c, 0xa4, 0x6c, 0x43, 0xe9, 0xd8, 0x4d, 0xd3, 0x7f, 0x06, 0xd0, 0x93, 0x8a,
+	0xef, 0xc1, 0xe1, 0xa1, 0xee, 0x47, 0xe9, 0xdf, 0xcf, 0x63, 0x70, 0xf0, 0x0e, 0xb6, 0xf4, 0xfa,
+	0xce, 0x5f, 0xa1, 0x7b, 0x67, 0x21, 0xe5, 0xfe, 0xa2, 0xee, 0xcd, 0x48, 0xbd, 0xdf, 0xe8, 0x1f,
+	0x3c, 0xae, 0x67, 0x84, 0xed, 0x85, 0xc0, 0x6d, 0x58, 0xdd, 0xd9, 0xe0, 0x6a, 0x4b, 0x8a, 0xa3,
+	0x78, 0x22, 0xf3, 0x2e, 0x1c, 0x1a, 0x74, 0x5c, 0x94, 0x81, 0xf9, 0x69, 0x1e, 0x32, 0x3c, 0x14,
+	0x9b, 0x06, 0x71, 0xda, 0x02, 0xc4, 0x1b, 0xd8, 0xe1, 0x90, 0xc7, 0x83, 0x36, 0x2e, 0xbd, 0xf7,
+	0x02, 0x12, 0xd1, 0x24, 0x06, 0x9d, 0xae, 0x13, 0xb0, 0x7f, 0xe8, 0x13, 0xca, 0xbe, 0x41, 0xa7,
+	0xeb, 0xa0, 0xdb, 0x40, 0x36, 0xdd, 0xee, 0xcd, 0xad, 0x4c, 0x8c, 0xe3, 0xa1, 0xa7, 0x7d, 0x81,
+	0x17, 0xd8, 0x52, 0x4e, 0xf5, 0x89, 0x09, 0xb5, 0xed, 0x5f, 0x41, 0x26, 0x42, 0xdd, 0x3c, 0x78,
+	0xeb, 0xe9, 0xb9, 0xa1, 0x44, 0xaf, 0xc2, 0xb8, 0x46, 0xef, 0xc0, 0x78, 0x98, 0xe6, 0x03, 0xec,
+	0x7d, 0xb7, 0x88, 0x12, 0xd7, 0x47, 0x37, 0x20, 0xc3, 0xfe, 0x62, 0xdb, 0x6d, 0x4a, 0xad, 0xd3,
+	0x8b, 0xa7, 0xc2, 0xed, 0x3d, 0x84, 0x49, 0x4a, 0x6b, 0x7d, 0x19, 0x5a, 0x84, 0x84, 0xad, 0x2a,
+	0x46, 0x61, 0x22, 0x94, 0xff, 0x7a, 0x6e, 0x92, 0x24, 0xaa, 0x8b, 0xee, 0xc2, 0x81, 0x07, 0xb8,
+	0xa1, 0x1b, 0xb2, 0xd3, 0xa7, 0x32, 0x85, 0xd4, 0x10, 0x7b, 0x72, 0x01, 0x42, 0x0e, 0xb5, 0xa5,
+	0xfc, 0x83, 0x81, 0x02, 0x12, 0x26, 0x6c, 0x68, 0x3e, 0xd8, 0xc9, 0xd0, 0x30, 0x05, 0x9e, 0x39,
+	0x4b, 0x39, 0xec, 0x13, 0xa3, 0x65, 0x48, 0x2b, 0x1a, 0xbd, 0x27, 0xe8, 0xb4, 0x74, 0xa7, 0x00,
+	0x14, 0x2e, 0x88, 0x96, 0x0d, 0x9d, 0x44, 0x4a, 0xa0, 0xf4, 0x44, 0x7d, 0x98, 0x36, 0x61, 0x1e,
+	0x85, 0xf4, 0xde, 0x30, 0x5e, 0x7e, 0xc4, 0x61, 0xa8, 0x08, 0xad, 0x40, 0xb6, 0xe9, 0x9e, 0x24,
+	0x50, 0xce, 0x99, 0xa1, 0x40, 0xa7, 0x03, 0x80, 0x02, 0x8e, 0x3e, 0xa4, 0x4c, 0xd3, 0x23, 0x44,
+	0x17, 0x21, 0xd6, 0x50, 0x0b, 0x59, 0x8a, 0x70, 0x6c, 0xaf, 0xed, 0xbe, 0x14, 0x6b, 0xa8, 0xe8,
+	0x75, 0x48, 0xb1, 0xad, 0xd8, 0xb6, 0x51, 0xc8, 0x85, 0x26, 0xaf, 0x7f, 0x17, 0x2c, 0xd1, 0x2d,
+	0x23, 0xa9, 0xeb, 0x06, 0x64, 0x18, 0x5f, 0x69, 0xd1, 0x23, 0xa8, 0xc2, 0x54, 0xe8, 0x80, 0x1b,
+	0x3e, 0x70, 0x93, 0xd2, 0x56, 0x5f, 0x86, 0xd6, 0x20, 0xc7, 0x8f, 0x92, 0xf9, 0xe1, 0x58, 0x21,
+	0x4f, 0xb1, 0xce, 0x04, 0x4f, 0x25, 0x43, 0x3b, 0x2b, 0x29, 0x6b, 0x79, 0xa5, 0xe8, 0x3d, 0x98,
+	0xf1, 0xe3, 0xf1, 0x94, 0x38, 0x40, 0x51, 0x2f, 0x8e, 0x44, 0xf5, 0x66, 0x06, 0xb2, 0x86, 0x8a,
+	0xd0, 0x65, 0x48, 0xb2, 0x98, 0x23, 0x0a, 0x58, 0x0c, 0x00, 0xf4, 0x85, 0x9b, 0x69, 0x13, 0x87,
+	0x39, 0x9c, 0xa9, 0xc9, 0x2d, 0xb3, 0x51, 0x98, 0x0e, 0x75, 0xd8, 0x30, 0xe9, 0x94, 0xd2, 0x4e,
+	0x5f, 0x46, 0xc6, 0x8c, 0xc5, 0xe4, 0x32, 0xa3, 0x30, 0x33, 0xa1, 0x63, 0x26, 0x80, 0xbe, 0x49,
+	0x19, 0xcb, 0x23, 0xa4, 0x71, 0x64, 0xa7, 0x8a, 0x32, 0x4d, 0xfb, 0x83, 0xe1, 0x71, 0x1c, 0xba,
+	0x47, 0x96, 0xd2, 0x56, 0x5f, 0x86, 0x6a, 0x90, 0x57, 0xd9, 0xf2, 0x2d, 0xf7, 0x56, 0xa2, 0x43,
+	0x14, 0xed, 0x5c, 0xe0, 0x9c, 0x1a, 0x44, 0x74, 0xa4, 0x29, 0xd5, 0x2f, 0x27, 0x33, 0xc0, 0x23,
+	0xba, 0xf4, 0xf4, 0x41, 0x0f, 0x87, 0xce, 0x00, 0x81, 0xab, 0xbb, 0x94, 0x7b, 0xe4, 0x13, 0x93,
+	0xd9, 0x8a, 0x62, 0xc9, 0x6a, 0xff, 0xc2, 0xb6, 0x50, 0x08, 0x9d, 0xad, 0x42, 0x2e, 0x95, 0xa5,
+	0xbc, 0x3a, 0x50, 0x40, 0xa6, 0x4e, 0xc3, 0x34, 0x3b, 0x85, 0x23, 0xa1, 0x53, 0xa7, 0x67, 0x67,
+	0x26, 0x51, 0x5d, 0x92, 0x85, 0xba, 0xa1, 0x3b, 0x74, 0x05, 0x9a, 0x0d, 0xcd, 0x42, 0xff, 0x2b,
+	0x20, 0x69, 0x42, 0x67, 0xbf, 0xc9, 0x50, 0x50, 0xe9, 0x1d, 0xa5, 0xcc, 0x6f, 0x73, 0x8f, 0x86,
+	0x0e, 0x85, 0x80, 0x0b, 0x64, 0x29, 0xa3, 0x7a, 0x84, 0x24, 0x11, 0x1d, 0xce, 0xb2, 0xf9, 0xc0,
+	0x3a, 0x16, 0x9a, 0x88, 0x41, 0x74, 0x5c, 0xca, 0x3a, 0x5e, 0x29, 0x49, 0x44, 0x36, 0x45, 0x0e,
+	0xa0, 0x1e, 0x0f, 0x4d, 0xc4, 0xd0, 0x0b, 0x08, 0x09, 0x29, 0x43, 0x45, 0xaf, 0x25, 0x1e, 0x7f,
+	0x56, 0x14, 0xc4, 0x4f, 0xf2, 0x90, 0x75, 0x19, 0x06, 0x63, 0x0f, 0x2f, 0x7a, 0xd9, 0xc3, 0x5c,
+	0x18, 0x7b, 0x60, 0x16, 0x8c, 0x3e, 0xbc, 0xe8, 0xa5, 0x0f, 0x73, 0x61, 0xf4, 0xc1, 0xb5, 0x20,
+	0xfc, 0x41, 0x0a, 0xe3, 0x0f, 0xe7, 0xf6, 0xc1, 0x1f, 0x38, 0xd0, 0x20, 0x81, 0x28, 0x0f, 0x13,
+	0x88, 0x93, 0x7b, 0x13, 0x08, 0x0e, 0xe4, 0x61, 0x10, 0x57, 0x06, 0x18, 0xc4, 0x89, 0x3d, 0x18,
+	0x04, 0xb7, 0x76, 0x29, 0x44, 0x35, 0x90, 0x42, 0x9c, 0x1e, 0x45, 0x21, 0x38, 0x8a, 0x8f, 0x43,
+	0xbc, 0xe4, 0xe3, 0x10, 0xc5, 0x50, 0x0e, 0xc1, 0x6d, 0x19, 0x89, 0xb8, 0x17, 0x4e, 0x22, 0x2e,
+	0xec, 0x8b, 0x44, 0x70, 0xb4, 0x61, 0x16, 0x21, 0x85, 0xb1, 0x88, 0x73, 0xfb, 0x60, 0x11, 0x6e,
+	0xb0, 0x06, 0x68, 0xc4, 0xb5, 0x20, 0x1a, 0x71, 0x6a, 0x04, 0x8d, 0xe0, 0x58, 0x5e, 0x1e, 0x71,
+	0x2d, 0x88, 0x47, 0x9c, 0x1a, 0xc1, 0x23, 0x7c, 0x38, 0x8c, 0x48, 0xac, 0x06, 0x13, 0x89, 0x33,
+	0x23, 0x89, 0x04, 0xc7, 0xf2, 0x33, 0x89, 0x4b, 0x1e, 0x26, 0x71, 0x3c, 0x84, 0x49, 0x70, 0x43,
+	0x42, 0x25, 0xde, 0x18, 0xa2, 0x12, 0xe2, 0x5e, 0x54, 0x82, 0x5b, 0xf6, 0xb8, 0x44, 0x35, 0x90,
+	0x4b, 0x9c, 0x1e, 0xc5, 0x25, 0xdc, 0x91, 0xe7, 0x25, 0x13, 0xb7, 0x42, 0xc8, 0xc4, 0xd9, 0xd1,
+	0x64, 0x82, 0xc3, 0x0d, 0xb0, 0x09, 0x79, 0x4f, 0x36, 0x71, 0x69, 0x9f, 0x6c, 0x82, 0x63, 0x07,
+	0xd1, 0x89, 0xbf, 0xf5, 0xd3, 0x89, 0xf9, 0x70, 0x3a, 0xc1, 0x41, 0x38, 0x9f, 0xa8, 0x06, 0xf2,
+	0x89, 0xd3, 0xa3, 0xf8, 0x84, 0xeb, 0x34, 0x2f, 0xa1, 0x58, 0x0d, 0x26, 0x14, 0x67, 0x46, 0x12,
+	0x0a, 0x77, 0xec, 0xf8, 0x18, 0x45, 0x35, 0x90, 0x51, 0x9c, 0x1e, 0xc5, 0x28, 0x7a, 0xd1, 0xf4,
+	0x50, 0x8a, 0xcd, 0x50, 0x4a, 0x71, 0x7e, 0x3f, 0x94, 0x82, 0x43, 0x0e, 0x71, 0x0a, 0x29, 0x8c,
+	0x53, 0x9c, 0xdb, 0x07, 0xa7, 0x70, 0xe7, 0x83, 0x01, 0x52, 0x71, 0x2f, 0x9c, 0x54, 0x5c, 0xd8,
+	0x17, 0xa9, 0x70, 0x67, 0xaf, 0x21, 0x56, 0xf1, 0x92, 0x8f, 0x55, 0x14, 0x43, 0x59, 0x85, 0x3b,
+	0x99, 0x52, 0x5a, 0xf1, 0xc6, 0x10, 0xad, 0x10, 0xf7, 0xa2, 0x15, 0x6e, 0x46, 0xba, 0xbc, 0x62,
+	0x35, 0x98, 0x57, 0x9c, 0xd9, 0xe7, 0x1b, 0xa9, 0x01, 0x62, 0x21, 0xef, 0x49, 0x04, 0x2e, 0xed,
+	0x93, 0x08, 0xb8, 0x39, 0x14, 0xc6, 0x04, 0xde, 0x4a, 0xa4, 0x8e, 0xe5, 0x8f, 0x8b, 0x3f, 0x4a,
+	0xc0, 0x38, 0xff, 0x14, 0xc1, 0x77, 0xb7, 0x28, 0x3c, 0xcf, 0xdd, 0x22, 0x5a, 0x82, 0x09, 0x0b,
+	0x77, 0x5a, 0xba, 0xaa, 0x70, 0x76, 0x70, 0x32, 0x70, 0x1c, 0x53, 0x8d, 0xa1, 0x2b, 0x6c, 0xd7,
+	0xf4, 0x39, 0x0f, 0x77, 0xd1, 0x15, 0xc8, 0x76, 0x6d, 0x6c, 0xc9, 0x1d, 0x4b, 0x37, 0x2d, 0xdd,
+	0xd9, 0xa1, 0xa4, 0x40, 0x28, 0xcf, 0xf0, 0x17, 0x14, 0x99, 0x4d, 0x1b, 0x5b, 0xeb, 0xbc, 0x4c,
+	0xca, 0x74, 0x3d, 0xbf, 0xdc, 0xaf, 0x30, 0x92, 0xfb, 0xfe, 0x0a, 0x03, 0xdd, 0x85, 0xbc, 0x85,
+	0x15, 0xcd, 0x37, 0x7e, 0xd9, 0x05, 0x5d, 0x70, 0xea, 0x2a, 0x9a, 0x67, 0x90, 0x7a, 0x2e, 0xea,
+	0xa6, 0x2c, 0x7f, 0x11, 0x5a, 0x84, 0xa4, 0x63, 0x29, 0x2a, 0xe6, 0x6c, 0xe0, 0xd8, 0x60, 0x04,
+	0xf8, 0xf7, 0x28, 0xf4, 0x80, 0x4d, 0x62, 0xaa, 0xe8, 0x15, 0x38, 0xd8, 0x56, 0xb6, 0xe9, 0x7b,
+	0x29, 0xd9, 0x9d, 0x9a, 0xe8, 0x5d, 0x76, 0xca, 0xf3, 0x34, 0x09, 0xb5, 0x95, 0x6d, 0x6a, 0xc4,
+	0x14, 0x56, 0xf0, 0x8e, 0x8d, 0x2e, 0x40, 0x4e, 0xd3, 0x6d, 0x47, 0x37, 0x54, 0xf7, 0xb5, 0xd5,
+	0xa4, 0xe7, 0xac, 0x31, 0xeb, 0x96, 0xb1, 0x67, 0x55, 0xff, 0x2b, 0x40, 0xa6, 0xac, 0x38, 0x6a,
+	0xd3, 0x3d, 0x07, 0xfc, 0xbb, 0x81, 0xd3, 0xac, 0x23, 0xc1, 0xab, 0x67, 0xf0, 0xf5, 0xe1, 0x55,
+	0x48, 0xf1, 0xa6, 0xba, 0x2f, 0x27, 0x8a, 0xe1, 0x13, 0x28, 0x65, 0xaa, 0xee, 0x09, 0xa8, 0x6b,
+	0xf6, 0x5a, 0xe2, 0xff, 0x3f, 0x2b, 0x8e, 0x89, 0x3f, 0x89, 0x43, 0x96, 0x37, 0x8b, 0x9f, 0xb2,
+	0x55, 0x07, 0xda, 0x15, 0x94, 0x87, 0x3e, 0x8b, 0xf0, 0x56, 0x2e, 0xc1, 0xa4, 0xc5, 0x95, 0xdc,
+	0x66, 0xce, 0xef, 0x71, 0x66, 0xe7, 0x6d, 0x67, 0xdf, 0x70, 0xf6, 0x93, 0x58, 0x2f, 0xc9, 0x4a,
+	0x90, 0xa4, 0x5f, 0x39, 0xf1, 0xa6, 0x05, 0x1d, 0xa4, 0x2f, 0x93, 0x72, 0x89, 0xa9, 0x91, 0xa4,
+	0xac, 0x7d, 0xbd, 0x0b, 0xff, 0x67, 0xff, 0xc4, 0x08, 0x9d, 0x21, 0x74, 0xbd, 0xd5, 0xa2, 0xef,
+	0x44, 0xf9, 0xb8, 0x48, 0xd0, 0x57, 0x6b, 0xb9, 0x9e, 0x98, 0x0e, 0x89, 0xe7, 0xbc, 0xd6, 0xe6,
+	0x81, 0xfb, 0x93, 0x00, 0x69, 0x49, 0xa9, 0x3b, 0x15, 0xb3, 0xdd, 0x56, 0x0c, 0xcd, 0x97, 0xf6,
+	0xc2, 0xfe, 0xd3, 0xfe, 0x36, 0xe4, 0x4c, 0x4b, 0x27, 0x4c, 0xf8, 0xf9, 0xa7, 0x9e, 0x2c, 0x43,
+	0xe0, 0xc5, 0xe8, 0x15, 0x88, 0xab, 0x6d, 0x8d, 0x7b, 0xac, 0x18, 0x3e, 0x7a, 0xe8, 0x38, 0x74,
+	0x3b, 0xa6, 0xb6, 0x35, 0x74, 0x11, 0xa6, 0x48, 0x22, 0xd2, 0xf9, 0x5a, 0x66, 0x97, 0x57, 0x09,
+	0xcf, 0xe5, 0x55, 0xb6, 0xad, 0x6c, 0xd3, 0x29, 0xb8, 0x4a, 0x8a, 0xc4, 0x7f, 0x05, 0x44, 0x5f,
+	0x75, 0x71, 0x20, 0x3e, 0x42, 0xfe, 0x06, 0x26, 0x0c, 0x53, 0xeb, 0x79, 0x21, 0x59, 0x2e, 0x70,
+	0x2f, 0xf0, 0xa7, 0xb2, 0x4f, 0x77, 0xfb, 0x8f, 0x66, 0x89, 0x62, 0x95, 0x7a, 0x8e, 0x3e, 0x9f,
+	0x25, 0x36, 0xec, 0x51, 0x55, 0xcf, 0x73, 0xfc, 0xd9, 0x98, 0xf7, 0x05, 0xd9, 0x04, 0xd5, 0xad,
+	0x6a, 0xe2, 0x47, 0x02, 0x1c, 0x58, 0x37, 0x5b, 0x2d, 0xff, 0x33, 0xe9, 0xeb, 0x03, 0xd9, 0x13,
+	0xc4, 0xae, 0x87, 0x9b, 0x1d, 0x90, 0x3b, 0x17, 0xc0, 0x1d, 0x2e, 0x72, 0xc0, 0xe3, 0xe9, 0x2c,
+	0x2f, 0x63, 0x95, 0x8b, 0xf7, 0x01, 0x79, 0x9b, 0xc2, 0x33, 0x99, 0xae, 0x27, 0x76, 0xb7, 0xe5,
+	0xd8, 0x05, 0x81, 0x26, 0xdf, 0x33, 0xae, 0x27, 0xd4, 0x54, 0xfc, 0x59, 0x0c, 0x90, 0x84, 0x6d,
+	0x6c, 0x3d, 0x52, 0xbc, 0xcf, 0x6b, 0x23, 0xeb, 0xe8, 0xdf, 0x43, 0xa6, 0x6e, 0x99, 0x6d, 0xd9,
+	0x0d, 0x1b, 0x0b, 0xc1, 0x31, 0x1e, 0x02, 0xb8, 0x66, 0x99, 0xed, 0xa1, 0xd0, 0x41, 0xdd, 0x95,
+	0x6a, 0xa8, 0x0c, 0x59, 0x6a, 0xdf, 0x8b, 0x61, 0x9c, 0x02, 0xcc, 0x71, 0x80, 0x34, 0x01, 0x08,
+	0x88, 0x63, 0xba, 0xde, 0x93, 0xfb, 0x93, 0x27, 0xb1, 0xff, 0xe4, 0x79, 0x01, 0x80, 0x99, 0xd9,
+	0xfa, 0x07, 0x6c, 0x13, 0xdc, 0xfb, 0x12, 0x88, 0xca, 0x37, 0xf4, 0x0f, 0xb0, 0x78, 0x0f, 0xa6,
+	0x7d, 0xee, 0xe3, 0xc1, 0x99, 0x27, 0x33, 0x38, 0x11, 0x63, 0x36, 0x52, 0x53, 0xfd, 0x09, 0x9a,
+	0x49, 0x51, 0x11, 0xd8, 0x6e, 0x43, 0x56, 0xcd, 0x2e, 0xff, 0xd0, 0x28, 0x29, 0xb1, 0x0a, 0x2b,
+	0x44, 0x72, 0x7e, 0x95, 0x20, 0x0f, 0x2d, 0x8d, 0x28, 0x07, 0x50, 0xb9, 0xb5, 0xb6, 0x51, 0xdd,
+	0xa8, 0x2d, 0xaf, 0xd5, 0xf2, 0x63, 0x28, 0x0b, 0x93, 0xe4, 0xf7, 0xf2, 0xda, 0xc6, 0xe6, 0x46,
+	0x5e, 0x40, 0x79, 0xc8, 0x54, 0xd7, 0x3c, 0x0a, 0xb1, 0xd9, 0xc4, 0x7f, 0xff, 0x70, 0x6e, 0xec,
+	0xfc, 0x5d, 0x48, 0x7b, 0x5e, 0xc2, 0x20, 0x04, 0xb9, 0xf5, 0xcd, 0x8d, 0x1b, 0x72, 0xad, 0x7a,
+	0x73, 0x79, 0xa3, 0x76, 0xf5, 0xe6, 0x7a, 0x7e, 0x8c, 0x20, 0x53, 0xd9, 0xd5, 0xf2, 0x2d, 0xa9,
+	0x96, 0x17, 0x7a, 0xbf, 0x6b, 0xb7, 0x36, 0x2b, 0x37, 0xf2, 0xb1, 0xde, 0xef, 0xdb, 0x9b, 0xcb,
+	0xd2, 0xdb, 0xf9, 0x38, 0x03, 0x5e, 0xfc, 0x34, 0x06, 0x29, 0xf7, 0x0d, 0x33, 0x5a, 0x85, 0x24,
+	0x4d, 0x7f, 0x34, 0x6a, 0x62, 0x98, 0x9d, 0x1f, 0xb5, 0xee, 0x88, 0x63, 0xe8, 0x1d, 0x80, 0xfe,
+	0xb8, 0x47, 0x41, 0xc3, 0x7b, 0x28, 0x43, 0x67, 0x4f, 0x8d, 0xd0, 0xea, 0x81, 0xdf, 0x87, 0x09,
+	0x16, 0x38, 0x8c, 0x82, 0x8f, 0x28, 0x07, 0x73, 0x62, 0xf6, 0xf4, 0x28, 0x35, 0x17, 0x7b, 0xf1,
+	0x1e, 0xa4, 0x96, 0xb7, 0xbf, 0x09, 0x97, 0x2c, 0xfe, 0x82, 0x7e, 0xc7, 0xc7, 0xa0, 0xd9, 0xb7,
+	0x00, 0xdf, 0x59, 0x2f, 0x95, 0x4f, 0x3c, 0xfe, 0xed, 0xdc, 0xd8, 0xe3, 0x27, 0x73, 0xc2, 0x17,
+	0x4f, 0xe6, 0x84, 0x5f, 0x3d, 0x99, 0x13, 0x7e, 0xf3, 0x64, 0x4e, 0xf8, 0x9f, 0xdf, 0xcd, 0x8d,
+	0xdd, 0x9f, 0xe0, 0x86, 0xf7, 0x26, 0xfe, 0x1c, 0x00, 0x00, 0xff, 0xff, 0x43, 0x50, 0x45, 0xa7,
+	0x58, 0x3d, 0x00, 0x00,
 }

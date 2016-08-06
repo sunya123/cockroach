@@ -24,7 +24,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -32,28 +31,33 @@ import (
 
 	"golang.org/x/net/context"
 
-	gwruntime "github.com/gengo/grpc-gateway/runtime"
+	"github.com/elazarl/go-bindata-assetfs"
+	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
 	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/pkg/errors"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 
 	"github.com/cockroachdb/cmux"
 	"github.com/cockroachdb/cockroach/base"
-	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/gossip"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/kv"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/rpc"
+	"github.com/cockroachdb/cockroach/server/serverpb"
 	"github.com/cockroachdb/cockroach/server/status"
 	"github.com/cockroachdb/cockroach/sql"
 	"github.com/cockroachdb/cockroach/sql/distsql"
 	"github.com/cockroachdb/cockroach/sql/pgwire"
 	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/ts"
+	"github.com/cockroachdb/cockroach/ui"
 	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/envutil"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/metric"
+	"github.com/cockroachdb/cockroach/util/netutil"
 	"github.com/cockroachdb/cockroach/util/sdnotify"
 	"github.com/cockroachdb/cockroach/util/stop"
 	"github.com/cockroachdb/cockroach/util/tracing"
@@ -65,52 +69,45 @@ var (
 
 	// GracefulDrainModes is the standard succession of drain modes entered
 	// for a graceful shutdown.
-	GracefulDrainModes = []DrainMode{DrainMode_CLIENT, DrainMode_LEADERSHIP}
+	GracefulDrainModes = []serverpb.DrainMode{serverpb.DrainMode_CLIENT, serverpb.DrainMode_LEASES}
 )
 
 // Server is the cockroach server node.
 type Server struct {
-	Tracer              opentracing.Tracer
-	ctx                 *Context
-	mux                 *http.ServeMux
-	clock               *hlc.Clock
-	rpcContext          *rpc.Context
-	grpc                *grpc.Server
-	gossip              *gossip.Gossip
-	storePool           *storage.StorePool
-	distSender          *kv.DistSender
-	db                  *client.DB
-	kvDB                *kv.DBServer
-	pgServer            *pgwire.Server
-	distSQLServer       *distsql.ServerImpl
-	node                *Node
-	recorder            *status.MetricsRecorder
-	runtime             status.RuntimeStatSampler
-	admin               *adminServer
-	status              *statusServer
-	tsDB                *ts.DB
-	tsServer            *ts.Server
-	raftTransport       *storage.RaftTransport
-	stopper             *stop.Stopper
-	sqlExecutor         *sql.Executor
-	leaseMgr            *sql.LeaseManager
-	schemaChangeManager *sql.SchemaChangeManager
-	parsedUpdatesURL    *url.URL
-	parsedReportingURL  *url.URL
+	Tracer        opentracing.Tracer
+	ctx           Context
+	mux           *http.ServeMux
+	clock         *hlc.Clock
+	rpcContext    *rpc.Context
+	grpc          *grpc.Server
+	gossip        *gossip.Gossip
+	storePool     *storage.StorePool
+	distSender    *kv.DistSender
+	db            *client.DB
+	kvDB          *kv.DBServer
+	pgServer      *pgwire.Server
+	distSQLServer *distsql.ServerImpl
+	node          *Node
+	recorder      *status.MetricsRecorder
+	runtime       status.RuntimeStatSampler
+	admin         adminServer
+	status        *statusServer
+	tsDB          *ts.DB
+	tsServer      ts.Server
+	raftTransport *storage.RaftTransport
+	stopper       *stop.Stopper
+	sqlExecutor   *sql.Executor
+	leaseMgr      *sql.LeaseManager
 }
 
 // NewServer creates a Server from a server.Context.
-func NewServer(ctx *Context, stopper *stop.Stopper) (*Server, error) {
-	if ctx == nil {
-		return nil, util.Errorf("ctx must not be null")
-	}
-
+func NewServer(ctx Context, stopper *stop.Stopper) (*Server, error) {
 	if _, err := net.ResolveTCPAddr("tcp", ctx.Addr); err != nil {
-		return nil, util.Errorf("unable to resolve RPC address %q: %v", ctx.Addr, err)
+		return nil, errors.Errorf("unable to resolve RPC address %q: %v", ctx.Addr, err)
 	}
 
 	if ctx.Insecure {
-		log.Warning("running in insecure mode, this is strongly discouraged. See --insecure.")
+		log.Warning(context.TODO(), "running in insecure mode, this is strongly discouraged. See --insecure.")
 	}
 	// Try loading the TLS configs before anything else.
 	if _, err := ctx.GetServerTLSConfig(); err != nil {
@@ -129,17 +126,26 @@ func NewServer(ctx *Context, stopper *stop.Stopper) (*Server, error) {
 	}
 	s.clock.SetMaxOffset(ctx.MaxOffset)
 
-	s.rpcContext = rpc.NewContext(&ctx.Context, s.clock, stopper)
+	s.rpcContext = rpc.NewContext(ctx.Context, s.clock, s.stopper)
 	s.rpcContext.HeartbeatCB = func() {
 		if err := s.rpcContext.RemoteClocks.VerifyClockOffset(); err != nil {
-			log.Fatal(err)
+			log.Fatal(context.TODO(), err)
 		}
 	}
+	s.grpc = rpc.NewServer(s.rpcContext)
 
-	s.gossip = gossip.New(s.rpcContext, s.ctx.GossipBootstrapResolvers, stopper)
-	s.storePool = storage.NewStorePool(s.gossip, s.clock, ctx.TimeUntilStoreDead, stopper)
+	gossipRegistry := metric.NewRegistry()
+	s.gossip = gossip.New(s.rpcContext, s.grpc, s.ctx.GossipBootstrapResolvers, s.stopper, gossipRegistry)
+	s.storePool = storage.NewStorePool(
+		s.gossip,
+		s.clock,
+		s.rpcContext,
+		ctx.ReservationsEnabled,
+		ctx.TimeUntilStoreDead,
+		s.stopper,
+	)
 
-	// A custom RetryOptions is created which uses stopper.ShouldDrain() as
+	// A custom RetryOptions is created which uses stopper.ShouldQuiesce() as
 	// the Closer. This prevents infinite retry loops from occurring during
 	// graceful server shutdown
 	//
@@ -151,7 +157,7 @@ func NewServer(ctx *Context, stopper *stop.Stopper) (*Server, error) {
 	// succeed because the only server has been shut down; thus, thus the
 	// DistSender needs to know that it should not retry in this situation.
 	retryOpts := base.DefaultRetryOptions()
-	retryOpts.Closer = stopper.ShouldDrain()
+	retryOpts.Closer = s.stopper.ShouldQuiesce()
 	s.distSender = kv.NewDistSender(&kv.DistSenderContext{
 		Clock:           s.clock,
 		RPCContext:      s.rpcContext,
@@ -163,10 +169,9 @@ func NewServer(ctx *Context, stopper *stop.Stopper) (*Server, error) {
 		s.stopper, txnMetrics)
 	s.db = client.NewDB(sender)
 
-	s.grpc = rpc.NewServer(s.rpcContext)
 	s.raftTransport = storage.NewRaftTransport(storage.GossipAddressResolver(s.gossip), s.grpc, s.rpcContext)
 
-	s.kvDB = kv.NewDBServer(&s.ctx.Context, sender, stopper)
+	s.kvDB = kv.NewDBServer(s.ctx.Context, sender, s.stopper)
 	roachpb.RegisterExternalServer(s.grpc, s.kvDB)
 
 	// Set up Lease Manager
@@ -174,15 +179,26 @@ func NewServer(ctx *Context, stopper *stop.Stopper) (*Server, error) {
 	if ctx.TestingKnobs.SQLLeaseManager != nil {
 		lmKnobs = *ctx.TestingKnobs.SQLLeaseManager.(*sql.LeaseManagerTestingKnobs)
 	}
-	s.leaseMgr = sql.NewLeaseManager(0, *s.db, s.clock, lmKnobs)
+	s.leaseMgr = sql.NewLeaseManager(0, *s.db, s.clock, lmKnobs, s.stopper)
 	s.leaseMgr.RefreshLeases(s.stopper, s.db, s.gossip)
+
+	// Set up the DistSQL server
+	distSQLCtx := distsql.ServerContext{
+		Context:    context.Background(),
+		DB:         s.db,
+		RPCContext: s.rpcContext,
+	}
+	s.distSQLServer = distsql.NewServer(distSQLCtx)
+	distsql.RegisterDistSQLServer(s.grpc, s.distSQLServer)
 
 	// Set up Executor
 	eCtx := sql.ExecutorContext{
+		Context:      context.Background(),
 		DB:           s.db,
 		Gossip:       s.gossip,
 		LeaseManager: s.leaseMgr,
 		Clock:        s.clock,
+		DistSQLSrv:   s.distSQLServer,
 	}
 	if ctx.TestingKnobs.SQLExecutor != nil {
 		eCtx.TestingKnobs = ctx.TestingKnobs.SQLExecutor.(*sql.ExecutorTestingKnobs)
@@ -193,13 +209,7 @@ func NewServer(ctx *Context, stopper *stop.Stopper) (*Server, error) {
 	sqlRegistry := metric.NewRegistry()
 	s.sqlExecutor = sql.NewExecutor(eCtx, s.stopper, sqlRegistry)
 
-	s.pgServer = pgwire.MakeServer(&s.ctx.Context, s.sqlExecutor, sqlRegistry)
-
-	distSQLCtx := distsql.ServerContext{
-		DB: s.db,
-	}
-	s.distSQLServer = distsql.NewServer(distSQLCtx)
-	distsql.RegisterDistSQLServer(s.grpc, s.distSQLServer)
+	s.pgServer = pgwire.MakeServer(s.ctx.Context, s.sqlExecutor, sqlRegistry)
 
 	// TODO(bdarnell): make StoreConfig configurable.
 	nCtx := storage.StoreContext{
@@ -230,19 +240,21 @@ func NewServer(ctx *Context, stopper *stop.Stopper) (*Server, error) {
 	s.recorder.AddNodeRegistry("sql.%s", sqlRegistry)
 	s.recorder.AddNodeRegistry("txn.%s", txnRegistry)
 	s.recorder.AddNodeRegistry("clock-offset.%s", s.rpcContext.RemoteClocks.Registry())
+	s.recorder.AddNodeRegistry("gossip.%s", gossipRegistry)
 
 	s.runtime = status.MakeRuntimeStatSampler(s.clock)
 	s.recorder.AddNodeRegistry("sys.%s", s.runtime.Registry())
 
 	s.node = NewNode(nCtx, s.recorder, s.stopper, txnMetrics, sql.MakeEventLogger(s.leaseMgr))
 	roachpb.RegisterInternalServer(s.grpc, s.node)
+	roachpb.RegisterInternalStoresServer(s.grpc, s.node.InternalStoresServer)
 
 	s.tsDB = ts.NewDB(s.db)
-	s.tsServer = ts.NewServer(s.tsDB)
+	s.tsServer = ts.MakeServer(s.tsDB)
 
-	s.admin = newAdminServer(s)
-	s.status = newStatusServer(s.db, s.gossip, s.recorder, s.ctx, s.rpcContext, s.node.stores)
-	for _, gw := range []grpcGatewayServer{s.admin, s.status} {
+	s.admin = makeAdminServer(s)
+	s.status = newStatusServer(s.db, s.gossip, s.recorder, s.ctx.Context, s.rpcContext, s.node.stores)
+	for _, gw := range []grpcGatewayServer{&s.admin, s.status, &s.tsServer} {
 		gw.RegisterService(s.grpc)
 	}
 
@@ -256,20 +268,23 @@ type grpcGatewayServer interface {
 	RegisterGateway(
 		ctx context.Context,
 		mux *gwruntime.ServeMux,
-		addr string,
-		opts []grpc.DialOption,
+		conn *grpc.ClientConn,
 	) error
 }
 
 // Start starts the server on the specified port, starts gossip and
 // initializes the node using the engines from the server's context.
 func (s *Server) Start() error {
-	s.initHTTP()
-
 	tlsConfig, err := s.ctx.GetServerTLSConfig()
 	if err != nil {
 		return err
 	}
+
+	httpServer := netutil.MakeServer(s.stopper, tlsConfig, s)
+	plainRedirectServer := netutil.MakeServer(s.stopper, tlsConfig, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// TODO(tamird): s/308/http.StatusPermanentRedirect/ when it exists.
+		http.Redirect(w, r, "https://"+r.Host+r.RequestURI, 308)
+	}))
 
 	// The following code is a specialization of util/net.go's ListenAndServe
 	// which adds pgwire support. A single port is used to serve all protocols
@@ -301,14 +316,7 @@ func (s *Server) Start() error {
 		return err
 	}
 	s.ctx.Addr = unresolvedAddr.String()
-	s.rpcContext.SetLocalInternalServer(s.node, s.ctx.Addr)
-
-	s.stopper.RunWorker(func() {
-		<-s.stopper.ShouldDrain()
-		if err := ln.Close(); err != nil {
-			log.Fatal(err)
-		}
-	})
+	s.rpcContext.SetLocalInternalServer(s.node)
 
 	m := cmux.New(ln)
 	pgL := m.Match(pgwire.Match)
@@ -325,39 +333,47 @@ func (s *Server) Start() error {
 	s.ctx.HTTPAddr = unresolvedHTTPAddr.String()
 
 	s.stopper.RunWorker(func() {
-		<-s.stopper.ShouldDrain()
+		<-s.stopper.ShouldQuiesce()
 		if err := httpLn.Close(); err != nil {
-			log.Fatal(err)
+			log.Fatal(context.TODO(), err)
 		}
 	})
 
 	if tlsConfig != nil {
 		httpMux := cmux.New(httpLn)
-		clearL := httpMux.Match(cmux.HTTP1Fast())
+		clearL := httpMux.Match(cmux.HTTP1())
 		tlsL := httpMux.Match(cmux.Any())
 
 		s.stopper.RunWorker(func() {
-			util.FatalIfUnexpected(httpMux.Serve())
+			netutil.FatalIfUnexpected(httpMux.Serve())
 		})
 
-		util.ServeHandler(s.stopper, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// TODO(tamird): s/308/http.StatusPermanentRedirect/ when it exists.
-			http.Redirect(w, r, "https://"+r.Host+r.RequestURI, 308)
-		}), clearL, tlsConfig)
+		s.stopper.RunWorker(func() {
+			netutil.FatalIfUnexpected(plainRedirectServer.Serve(clearL))
+		})
 
 		httpLn = tls.NewListener(tlsL, tlsConfig)
 	}
 
-	serveConn := util.ServeHandler(s.stopper, s, httpLn, tlsConfig)
-
 	s.stopper.RunWorker(func() {
-		util.FatalIfUnexpected(s.grpc.Serve(anyL))
+		netutil.FatalIfUnexpected(httpServer.Serve(httpLn))
 	})
 
 	s.stopper.RunWorker(func() {
-		util.FatalIfUnexpected(serveConn(pgL, func(conn net.Conn) {
-			if err := s.pgServer.ServeConn(conn); err != nil && !util.IsClosedConnection(err) {
-				log.Error(err)
+		<-s.stopper.ShouldQuiesce()
+		netutil.FatalIfUnexpected(anyL.Close())
+		<-s.stopper.ShouldStop()
+		s.grpc.Stop()
+	})
+
+	s.stopper.RunWorker(func() {
+		netutil.FatalIfUnexpected(s.grpc.Serve(anyL))
+	})
+
+	s.stopper.RunWorker(func() {
+		netutil.FatalIfUnexpected(httpServer.ServeWith(s.stopper, pgL, func(conn net.Conn) {
+			if err := s.pgServer.ServeConn(conn); err != nil && !netutil.IsClosedConnection(err) {
+				log.Error(context.TODO(), err)
 			}
 		}))
 	})
@@ -370,24 +386,26 @@ func (s *Server) Start() error {
 		}
 
 		s.stopper.RunWorker(func() {
-			<-s.stopper.ShouldDrain()
+			<-s.stopper.ShouldQuiesce()
 			if err := unixLn.Close(); err != nil {
-				log.Fatal(err)
+				log.Fatal(context.TODO(), err)
 			}
 		})
 
 		s.stopper.RunWorker(func() {
-			util.FatalIfUnexpected(serveConn(unixLn, func(conn net.Conn) {
-				if err := s.pgServer.ServeConn(conn); err != nil && !util.IsClosedConnection(err) {
-					log.Error(err)
+			netutil.FatalIfUnexpected(httpServer.ServeWith(s.stopper, unixLn, func(conn net.Conn) {
+				if err := s.pgServer.ServeConn(conn); err != nil &&
+					!netutil.IsClosedConnection(err) {
+					log.Error(context.TODO(), err)
 				}
 			}))
 		})
 	}
 
-	s.gossip.Start(s.grpc, unresolvedAddr)
+	s.gossip.Start(unresolvedAddr)
 
-	if err := s.node.start(unresolvedAddr, s.ctx.Engines, s.ctx.NodeAttributes); err != nil {
+	ctx := context.Background()
+	if err := s.node.start(ctx, unresolvedAddr, s.ctx.Engines, s.ctx.NodeAttributes); err != nil {
 		return err
 	}
 
@@ -401,93 +419,115 @@ func (s *Server) Start() error {
 	s.node.startWriteSummaries(s.ctx.MetricsSampleInterval)
 
 	s.sqlExecutor.SetNodeID(s.node.Descriptor.NodeID)
+	s.distSQLServer.SetNodeID(s.node.Descriptor.NodeID)
+
 	// Create and start the schema change manager only after a NodeID
 	// has been assigned.
-	testingKnobs := &sql.SchemaChangeManagerTestingKnobs{}
+	testingKnobs := new(sql.SchemaChangeManagerTestingKnobs)
 	if s.ctx.TestingKnobs.SQLSchemaChangeManager != nil {
-		testingKnobs =
-			s.ctx.TestingKnobs.SQLSchemaChangeManager.(*sql.SchemaChangeManagerTestingKnobs)
+		testingKnobs = s.ctx.TestingKnobs.SQLSchemaChangeManager.(*sql.SchemaChangeManagerTestingKnobs)
 	}
-	s.schemaChangeManager = sql.NewSchemaChangeManager(testingKnobs, *s.db, s.gossip, s.leaseMgr)
-	s.schemaChangeManager.Start(s.stopper)
+	sql.NewSchemaChangeManager(testingKnobs, *s.db, s.gossip, s.leaseMgr).Start(s.stopper)
 
-	s.periodicallyCheckForUpdates()
-
-	log.Infof("starting %s server at %s", s.ctx.HTTPRequestScheme(), unresolvedHTTPAddr)
-	log.Infof("starting grpc/postgres server at %s", unresolvedAddr)
+	log.Infof(context.TODO(), "starting %s server at %s", s.ctx.HTTPRequestScheme(), unresolvedHTTPAddr)
+	log.Infof(context.TODO(), "starting grpc/postgres server at %s", unresolvedAddr)
 	if len(s.ctx.SocketFile) != 0 {
-		log.Infof("starting postgres server at unix:%s", s.ctx.SocketFile)
+		log.Infof(context.TODO(), "starting postgres server at unix:%s", s.ctx.SocketFile)
 	}
 
 	s.stopper.RunWorker(func() {
-		util.FatalIfUnexpected(m.Serve())
+		netutil.FatalIfUnexpected(m.Serve())
 	})
 
 	// Initialize grpc-gateway mux and context.
-	jsonpb := new(util.JSONPb)
+	jsonpb := &util.JSONPb{
+		EnumsAsInts:  true,
+		EmitDefaults: true,
+		Indent:       "  ",
+	}
 	protopb := new(util.ProtoPb)
 	gwMux := gwruntime.NewServeMux(
 		gwruntime.WithMarshalerOption(gwruntime.MIMEWildcard, jsonpb),
+		gwruntime.WithMarshalerOption(util.JSONContentType, jsonpb),
+		gwruntime.WithMarshalerOption(util.AltJSONContentType, jsonpb),
 		gwruntime.WithMarshalerOption(util.ProtoContentType, protopb),
 		gwruntime.WithMarshalerOption(util.AltProtoContentType, protopb),
 	)
-	gwCtx, gwCancel := context.WithCancel(context.Background())
+	gwCtx, gwCancel := context.WithCancel(ctx)
 	s.stopper.AddCloser(stop.CloserFn(gwCancel))
 
 	// Setup HTTP<->gRPC handlers.
-	var opts []grpc.DialOption
-	if s.ctx.Insecure {
-		opts = append(opts, grpc.WithInsecure())
-	} else {
-		tlsConfig, err := s.ctx.GetClientTLSConfig()
-		if err != nil {
-			return err
-		}
-		opts = append(
-			opts,
-			// TODO(tamird): remove this timeout. It is currently necessary because
-			// GRPC will not actually bail on a bad certificate error - it will just
-			// retry indefinitely. See https://github.com/grpc/grpc-go/issues/622.
-			grpc.WithTimeout(base.NetworkTimeout),
-			grpc.WithBlock(),
-			grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
-		)
+	conn, err := s.rpcContext.GRPCDial(s.ctx.Addr)
+	if err != nil {
+		return errors.Errorf("error constructing grpc-gateway: %s; are your certificates valid?", err)
 	}
 
-	for _, gw := range []grpcGatewayServer{s.admin, s.status} {
-		if err := gw.RegisterGateway(gwCtx, gwMux, s.ctx.Addr, opts); err != nil {
+	for _, gw := range []grpcGatewayServer{&s.admin, s.status, &s.tsServer} {
+		if err := gw.RegisterGateway(gwCtx, gwMux, conn); err != nil {
 			return err
 		}
 	}
+
+	var uiFileSystem http.FileSystem
+	uiDebug := envutil.EnvOrDefaultBool("debug_ui", false)
+	if uiDebug {
+		uiFileSystem = http.Dir("ui")
+	} else {
+		uiFileSystem = &assetfs.AssetFS{
+			Asset:     ui.Asset,
+			AssetDir:  ui.AssetDir,
+			AssetInfo: ui.AssetInfo,
+		}
+	}
+	uiFileServer := http.FileServer(uiFileSystem)
+
+	s.mux.HandleFunc("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			if uiDebug {
+				r.URL.Path = "debug.html"
+			} else {
+				r.URL.Path = "release.html"
+			}
+		}
+		uiFileServer.ServeHTTP(w, r)
+	}))
+
+	// TODO(marc): when cookie-based authentication exists,
+	// apply it for all web endpoints.
+	s.mux.HandleFunc(debugEndpoint, http.HandlerFunc(handleDebug))
+	s.mux.Handle(adminEndpoint, gwMux)
+	s.mux.Handle(ts.URLPrefix, gwMux)
+	s.mux.Handle(statusPrefix, s.status)
+	s.mux.Handle(healthEndpoint, s.status)
 
 	if err := sdnotify.Ready(); err != nil {
-		log.Errorf("failed to signal readiness using systemd protocol: %s", err)
+		log.Errorf(context.TODO(), "failed to signal readiness using systemd protocol: %s", err)
 	}
 
 	return nil
 }
 
-func (s *Server) doDrain(modes []DrainMode, setTo bool) ([]DrainMode, error) {
+func (s *Server) doDrain(modes []serverpb.DrainMode, setTo bool) ([]serverpb.DrainMode, error) {
 	for _, mode := range modes {
 		var err error
 		switch {
-		case mode == DrainMode_CLIENT:
+		case mode == serverpb.DrainMode_CLIENT:
 			err = s.pgServer.SetDraining(setTo)
-		case mode == DrainMode_LEADERSHIP:
+		case mode == serverpb.DrainMode_LEASES:
 			err = s.node.SetDraining(setTo)
 		default:
-			err = util.Errorf("unknown drain mode: %v (%d)", mode, mode)
+			err = errors.Errorf("unknown drain mode: %v (%d)", mode, mode)
 		}
 		if err != nil {
 			return nil, err
 		}
 	}
-	var nowOn []DrainMode
+	var nowOn []serverpb.DrainMode
 	if s.pgServer.IsDraining() {
-		nowOn = append(nowOn, DrainMode_CLIENT)
+		nowOn = append(nowOn, serverpb.DrainMode_CLIENT)
 	}
 	if s.node.IsDraining() {
-		nowOn = append(nowOn, DrainMode_LEADERSHIP)
+		nowOn = append(nowOn, serverpb.DrainMode_LEASES)
 	}
 	return nowOn, nil
 }
@@ -499,14 +539,14 @@ func (s *Server) doDrain(modes []DrainMode, setTo bool) ([]DrainMode, error) {
 // On success, returns all active drain modes after carrying out the request.
 // On failure, the system may be in a partially drained state and should be
 // recovered by calling Undrain() with the same (or a larger) slice of modes.
-func (s *Server) Drain(on []DrainMode) ([]DrainMode, error) {
+func (s *Server) Drain(on []serverpb.DrainMode) ([]serverpb.DrainMode, error) {
 	return s.doDrain(on, true)
 }
 
 // Undrain idempotently deactivates the given DrainModes on the Server in the
 // order in which they are supplied.
 // On success, returns any remaining active drain modes.
-func (s *Server) Undrain(off []DrainMode) []DrainMode {
+func (s *Server) Undrain(off []serverpb.DrainMode) []serverpb.DrainMode {
 	nowActive, err := s.doDrain(off, false)
 	if err != nil {
 		panic(fmt.Sprintf("error returned to Undrain: %s", err))
@@ -530,22 +570,6 @@ func (s *Server) startSampleEnvironment(frequency time.Duration) {
 			}
 		}
 	})
-}
-
-var uiFileSystem http.FileSystem
-
-// initHTTP registers http prefixes.
-func (s *Server) initHTTP() {
-	s.mux.Handle("/", http.FileServer(uiFileSystem))
-
-	// The admin server handles both /debug/ and /_admin/
-	// TODO(marc): when cookie-based authentication exists,
-	// apply it for all web endpoints.
-	s.mux.Handle(adminEndpoint, s.admin)
-	s.mux.Handle(debugEndpoint, s.admin)
-	s.mux.Handle(statusPrefix, s.status)
-	s.mux.Handle(healthEndpoint, s.status)
-	s.mux.Handle(ts.URLPrefix, s.tsServer)
 }
 
 // Stop stops the server.
@@ -576,6 +600,11 @@ type gzipResponseWriter struct {
 	io.WriteCloser
 	http.ResponseWriter
 }
+
+// Flush implements http.Flusher as required by grpc-gateway for clients
+// which access streaming endpoints (as exercised by the acceptance tests
+// at time of writing).
+func (*gzipResponseWriter) Flush() {}
 
 func newGzipResponseWriter(w http.ResponseWriter) *gzipResponseWriter {
 	var gz *gzip.Writer

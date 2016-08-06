@@ -19,9 +19,11 @@ package storage
 import (
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/config"
 	"github.com/cockroachdb/cockroach/gossip"
-	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 )
 
@@ -46,31 +48,27 @@ type verifyQueue struct {
 }
 
 // newVerifyQueue returns a new instance of verifyQueue.
-func newVerifyQueue(gossip *gossip.Gossip, countFn rangeCountFn) *verifyQueue {
+func newVerifyQueue(store *Store, gossip *gossip.Gossip, countFn rangeCountFn) *verifyQueue {
 	vq := &verifyQueue{countFn: countFn}
-	vq.baseQueue = makeBaseQueue("verify", vq, gossip, verifyQueueMaxSize)
+	vq.baseQueue = makeBaseQueue("verify", vq, store, gossip, queueConfig{
+		maxSize:              verifyQueueMaxSize,
+		needsLease:           false,
+		acceptsUnsplitRanges: true,
+	})
 	return vq
-}
-
-func (*verifyQueue) needsLeaderLease() bool {
-	return false
-}
-
-func (*verifyQueue) acceptsUnsplitRanges() bool {
-	return true
 }
 
 // shouldQueue determines whether a range should be queued for
 // verification scanning, and if so, at what priority. Returns true
 // for shouldQ in the event that it's been longer since the last scan
 // than the verification interval.
-func (*verifyQueue) shouldQueue(now roachpb.Timestamp, rng *Replica,
+func (*verifyQueue) shouldQueue(now hlc.Timestamp, rng *Replica,
 	_ config.SystemConfig) (shouldQ bool, priority float64) {
 
 	// Get last verification timestamp.
 	lastVerify, err := rng.getLastVerificationTimestamp()
 	if err != nil {
-		log.Errorf("unable to fetch last verification timestamp: %s", err)
+		log.Errorf(context.TODO(), "unable to fetch last verification timestamp: %s", err)
 		return
 	}
 	verifyScore := float64(now.WallTime-lastVerify.WallTime) / float64(verificationInterval.Nanoseconds())
@@ -84,11 +82,15 @@ func (*verifyQueue) shouldQueue(now roachpb.Timestamp, rng *Replica,
 // process iterates through all keys and values in a range. The very
 // act of scanning keys verifies on-disk checksums, as each block
 // checksum is checked on load.
-func (*verifyQueue) process(now roachpb.Timestamp, rng *Replica,
-	_ config.SystemConfig) error {
+func (*verifyQueue) process(
+	ctx context.Context,
+	now hlc.Timestamp,
+	rng *Replica,
+	_ config.SystemConfig,
+) error {
 
 	snap := rng.store.Engine().NewSnapshot()
-	iter := newReplicaDataIterator(rng.Desc(), snap, false /* !replicatedOnly */)
+	iter := NewReplicaDataIterator(rng.Desc(), snap, false /* !replicatedOnly */)
 	defer iter.Close()
 	defer snap.Close()
 
@@ -101,7 +103,7 @@ func (*verifyQueue) process(now roachpb.Timestamp, rng *Replica,
 		// TODO(spencer): do something other than fatal error here. We
 		// want to quarantine this range, make it a non-participating raft
 		// follower until it can be replaced and then destroyed.
-		log.Fatalf("unhandled failure when scanning range %s; probable data corruption: %s", rng, iter.Error())
+		log.Fatalf(ctx, "unhandled failure when scanning range %s; probable data corruption: %s", rng, iter.Error())
 	}
 
 	// Store current timestamp as last verification for this range.

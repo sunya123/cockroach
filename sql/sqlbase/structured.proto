@@ -19,7 +19,7 @@ syntax = "proto2";
 package cockroach.sql.sqlbase;
 option go_package = "sqlbase";
 
-import "cockroach/roachpb/data.proto";
+import "cockroach/util/hlc/timestamp.proto";
 import "cockroach/sql/sqlbase/privilege.proto";
 import weak "gogoproto/gogo.proto";
 
@@ -46,9 +46,10 @@ message ColumnType {
   optional int32 precision = 3 [(gogoproto.nullable) = false];
 }
 
-message TableAndIndexID {
-  optional uint32 table = 1 [(gogoproto.nullable) = false, (gogoproto.casttype) = "ID"] ;
+message ForeignKeyReference {
+  optional uint32 table = 1 [(gogoproto.nullable) = false, (gogoproto.casttype) = "ID"];
   optional uint32 index = 2 [(gogoproto.nullable) = false, (gogoproto.casttype) = "IndexID"];
+  optional string name = 3 [(gogoproto.nullable) = false];
 }
 
 message ColumnDescriptor {
@@ -57,11 +58,73 @@ message ColumnDescriptor {
       (gogoproto.customname) = "ID", (gogoproto.casttype) = "ColumnID"];
   optional ColumnType type = 3 [(gogoproto.nullable) = false];
   optional bool nullable = 4 [(gogoproto.nullable) = false];
+  optional string nullable_constraint_name = 8 [(gogoproto.nullable) = false];
   // Default expression to use to populate the column on insert if no
   // value is provided.
   optional string default_expr = 5;
+  optional string default_expr_constraint_name = 9 [(gogoproto.nullable) = false];
   optional bool hidden = 6 [(gogoproto.nullable) = false];
   reserved 7;
+}
+
+// ColumnFamilyDescriptor is set of columns stored together in one kv entry.
+message ColumnFamilyDescriptor {
+  optional string name = 1 [(gogoproto.nullable) = false];
+  optional uint32 id = 2 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "ID", (gogoproto.casttype) = "FamilyID"];
+
+  // A list of column names of which the family is comprised. This list
+  // parallels the column_ids list. If duplicating the storage of the column
+  // names here proves to be prohibitive, we could clear this field before
+  // saving and reconstruct it after loading.
+  repeated string column_names = 3;
+  // A list of column ids of which the family is comprised. This list parallels
+  // the column_names list.
+  repeated uint32 column_ids = 4 [(gogoproto.customname) = "ColumnIDs",
+      (gogoproto.casttype) = "ColumnID"];
+
+  // If nonzero, the column involved in the single column optimization.
+  //
+  // Families store colums in a ValueType_TUPLE as repeated <colid><data>
+  // entries. As a space optimization and for backward compatibility, a single
+  // column is written without the columnid prefix. Because more columns could
+  // be added, it would be ambiguous which column was stored when read back in,
+  // so this field supplies it.
+  optional uint32 default_column_id = 5 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "DefaultColumnID", (gogoproto.casttype) = "ColumnID"];
+}
+
+// InterleaveDescriptor represents an index (either primary or secondary) that
+// is interleaved into another table's data.
+//
+// Example:
+// Table 1 -> /a/b
+// Table 2 -> /a/b/c
+// Table 3 -> /a/b/c/d
+//
+// There are two components (table 2 is the parent and table 1 is the
+// grandparent) with shared lengths 2 and 1.
+message InterleaveDescriptor {
+  message Ancestor {
+    // TableID the ID of the table being interleaved into.
+    optional uint32 table_id = 1 [(gogoproto.nullable) = false,
+        (gogoproto.customname) = "TableID", (gogoproto.casttype) = "ID"];
+    // IndexID is the ID of the parent index being interleaved into.
+    optional uint32 index_id = 2 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "IndexID", (gogoproto.casttype) = "IndexID"];
+    // SharedPrefixLen is how many fields are shared between a parent and child
+    // being interleaved, excluding any fields shared between parent and
+    // grandparent. Thus, the sum of SharedPrefixLens in the components of an
+    // InterleaveDescriptor is always strictly less than the number of fields
+    // in the index being interleaved.
+    optional uint32 shared_prefix_len = 3 [(gogoproto.nullable) = false,
+        (gogoproto.customname) = "SharedPrefixLen"];
+  }
+
+  // Ancestors contains the nesting of interleaves in the order they appear in
+  // an encoded key. This means they are always in the far-to-near ancestor
+  // order (e.g. grand-grand-parent, grand-parent, parent).
+  repeated Ancestor ancestors = 1 [(gogoproto.nullable) = false];
 }
 
 message IndexDescriptor {
@@ -101,8 +164,15 @@ message IndexDescriptor {
   repeated uint32 implicit_column_ids = 7 [(gogoproto.customname) = "ImplicitColumnIDs",
       (gogoproto.casttype) = "ColumnID"];
 
-  optional TableAndIndexID foreign_key = 9;
-  repeated TableAndIndexID referenced_by = 10;
+  optional ForeignKeyReference foreign_key = 9 [(gogoproto.nullable) = false];
+  repeated ForeignKeyReference referenced_by = 10 [(gogoproto.nullable) = false];
+
+  // Interleave, if it's not the zero value, describes how this index's data is
+  // interleaved into another index's data.
+  optional InterleaveDescriptor interleave = 11 [(gogoproto.nullable) = false];
+  // InterleavedBy contains a reference to every table/index that is interleaved
+  // into this one.
+  repeated ForeignKeyReference interleaved_by = 12  [(gogoproto.nullable) = false];
 }
 
 // A DescriptorMutation represents a column or an index that
@@ -228,11 +298,15 @@ message TableDescriptor {
   // See comment above.
   optional bool up_version = 6 [(gogoproto.nullable) = false];
   // Last modification time of the table descriptor.
-  optional roachpb.Timestamp modification_time = 7 [(gogoproto.nullable) = false];
+  optional util.hlc.Timestamp modification_time = 7 [(gogoproto.nullable) = false];
   repeated ColumnDescriptor columns = 8 [(gogoproto.nullable) = false];
   // next_column_id is used to ensure that deleted column ids are not reused.
   optional uint32 next_column_id = 9 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "NextColumnID", (gogoproto.casttype) = "ColumnID"];
+  repeated ColumnFamilyDescriptor families = 22 [(gogoproto.nullable) = false];
+  // next_family_id is used to ensure that deleted family ids are not reused.
+  optional uint32 next_family_id = 23 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "NextFamilyID", (gogoproto.casttype) = "FamilyID"];
   optional IndexDescriptor primary_index = 10 [(gogoproto.nullable) = false];
   // indexes are all the secondary indexes.
   repeated IndexDescriptor indexes = 11 [(gogoproto.nullable) = false];
@@ -291,8 +365,8 @@ message TableDescriptor {
   message RenameInfo{
     // The database that the table belonged to before the rename (tables can be
     // renamed from one db to another).
-    optional uint32 old_parent_id = 1 [(gogoproto.nullable) = false, 
-      (gogoproto.customname) = "OldParentID"];
+    optional uint32 old_parent_id = 1 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "OldParentID", (gogoproto.casttype) = "ID"];
     optional string old_name = 2 [(gogoproto.nullable) = false];
   }
 

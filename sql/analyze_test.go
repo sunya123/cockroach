@@ -47,7 +47,7 @@ func testTableDesc() *sqlbase.TableDescriptor {
 			ColumnDirections: []sqlbase.IndexDescriptor_Direction{sqlbase.IndexDescriptor_ASC},
 		},
 		Privileges:    sqlbase.NewDefaultPrivilegeDescriptor(),
-		FormatVersion: sqlbase.BaseFormatVersion,
+		FormatVersion: sqlbase.FamilyFormatVersion,
 	}
 }
 
@@ -71,7 +71,8 @@ func parseAndNormalizeExpr(t *testing.T, sql string) (parser.TypedExpr, qvalMap)
 	if err != nil {
 		t.Fatalf("%s: %v", sql, err)
 	}
-	if typedExpr, err = (parser.EvalContext{}).NormalizeExpr(typedExpr); err != nil {
+	ctx := &parser.EvalContext{}
+	if typedExpr, err = ctx.NormalizeExpr(typedExpr); err != nil {
 		t.Fatalf("%s: %v", sql, err)
 	}
 	return typedExpr, sel.qvals
@@ -91,11 +92,12 @@ func checkEquivExpr(a, b parser.TypedExpr, qvals qvalMap) error {
 		for _, q := range qvals {
 			q.datum = v
 		}
-		da, err := a.Eval(parser.EvalContext{})
+		ctx := &parser.EvalContext{}
+		da, err := a.Eval(ctx)
 		if err != nil {
 			return fmt.Errorf("%s: %v", a, err)
 		}
-		db, err := b.Eval(parser.EvalContext{})
+		db, err := b.Eval(ctx)
 		if err != nil {
 			return fmt.Errorf("%s: %v", b, err)
 		}
@@ -177,12 +179,12 @@ func TestSimplifyExpr(t *testing.T) {
 		{`a < 1 OR length(i) > 0`, `true`, false},
 		{`a <= 5 AND a IN (4, 5, 6)`, `a IN (4, 5)`, true},
 
-		{`a = NULL`, `false`, true},
-		{`a != NULL`, `false`, true},
-		{`a > NULL`, `false`, true},
-		{`a >= NULL`, `false`, true},
-		{`a < NULL`, `false`, true},
-		{`a <= NULL`, `false`, true},
+		{`a = NULL`, `NULL`, true},
+		{`a != NULL`, `NULL`, true},
+		{`a > NULL`, `NULL`, true},
+		{`a >= NULL`, `NULL`, true},
+		{`a < NULL`, `NULL`, true},
+		{`a <= NULL`, `NULL`, true},
 		{`a IN (NULL)`, `false`, true},
 
 		{`f < false`, `false`, true},
@@ -253,10 +255,10 @@ func TestSimplifyExpr(t *testing.T) {
 		expr, _ := parseAndNormalizeExpr(t, d.expr)
 		expr, equiv := simplifyExpr(expr)
 		if s := expr.String(); d.expected != s {
-			t.Errorf("%s: expected %s, but found %s", d.expr, d.expected, s)
+			t.Errorf("%s: structure: expected %s, but found %s", d.expr, d.expected, s)
 		}
 		if d.isEquiv != equiv {
-			t.Fatalf("%s: expected %v, but found %v", d.expr, d.isEquiv, equiv)
+			t.Fatalf("%s: equivalence: expected %v, but found %v", d.expr, d.isEquiv, equiv)
 		}
 	}
 }

@@ -30,6 +30,8 @@ import (
 	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/cli/cliflags"
 	"github.com/cockroachdb/cockroach/security"
+	"github.com/cockroachdb/cockroach/server"
+	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util/envutil"
 	"github.com/cockroachdb/cockroach/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/util/log/logflags"
@@ -38,12 +40,19 @@ import (
 var maxResults int64
 
 var connURL string
-var connUser, connHost, connPort, httpPort, connDBName string
+var connUser, connHost, connPort, httpPort, httpAddr, connDBName, zoneConfig string
 var startBackground bool
 var undoFreezeCluster bool
 
-// cliContext is the CLI Context used for the command-line client.
-var cliContext = NewContext()
+var serverCtx = server.MakeContext()
+var baseCtx = serverCtx.Context
+var cliCtx = cliContext{Context: baseCtx}
+var sqlCtx = sqlContext{cliContext: &cliCtx}
+var debugCtx = debugContext{
+	startKey: engine.NilKey,
+	endKey:   engine.MVCCKeyMax,
+}
+
 var cacheSize *bytesValue
 var insecure *insecureValue
 
@@ -61,6 +70,9 @@ nodes. For example:`) + `
 
   --attrs=us-west-1b:gpu
 `,
+
+	cliflags.ZoneConfigName: wrapText(`
+File to read the zone configuration from. Specify "-" to read from standard input.`),
 
 	cliflags.BackgroundName: wrapText(`
 Start the server in the background. This is similar to appending "&"
@@ -83,6 +95,9 @@ Database server port to connect to.`),
 	forClient(cliflags.HTTPPortName): wrapText(`
 Database server port to connect to for HTTP requests.`),
 
+	forClient(cliflags.HTTPAddrName): wrapText(`
+Database server (hostname or IP address) to connect to for HTTP requests.`),
+
 	cliflags.DatabaseName: wrapText(`
 The name of the database to connect to.`),
 
@@ -96,12 +111,26 @@ separated statements. If an error occurs in any statement, the command exits
 with a non-zero status code and further statements are not executed. The
 results of each SQL statement are printed on the standard output.`),
 
+	cliflags.PrettyName: wrapText(`
+Causes table rows to be formatted as tables using ASCII art.
+When not specified, table rows are printed as tab-separated values (TSV).`),
+
 	cliflags.JoinName: wrapText(`
-A comma-separated list of addresses to use when a new node is joining
-an existing cluster. For the first node in a cluster, --join should
-NOT be specified. Each address in the list has an optional type:
-[type=]<address>. An unspecified type means ip address or dns. Type
-is one of:`) + `
+The address of node which acts as bootstrap when a new node is
+joining an existing cluster. This flag can be specified
+separately for each address, for example:`) + `
+
+  --join=localhost:1234 --join=localhost:2345
+
+` + wrapText(`
+Or can be specified as a comma separated list in single flag,
+or both forms can be used together, for example:`) + `
+
+  --join=localhost:1234,localhost:2345 --join=localhost:3456
+
+` + wrapText(`
+Each address in the list has an optional type: [type=]<address>.
+An unspecified type means ip address or dns. Type is one of:`) + `
 
   - tcp: (default if type is omitted): plain ip address or hostname.
   - http-lb: HTTP load balancer: we query
@@ -117,6 +146,9 @@ The port to bind to.`),
 
 	forServer(cliflags.HTTPPortName): wrapText(`
 The port to bind to for HTTP requests.`),
+
+	forServer(cliflags.HTTPAddrName): wrapText(`
+The hostname or IP address to bind to for HTTP requests.`),
 
 	cliflags.SocketName: wrapText(`
 Unix socket file, postgresql protocol only.
@@ -213,16 +245,18 @@ database, insecure, certs).`),
 Database user name.`),
 
 	cliflags.FromName: wrapText(`
-Start key in pretty-printed format. See also --raw.`),
+Start key and format as [<format>:]<key>. Supported formats:
+`) + fmt.Sprintf("\n%+v", keyTypes()),
 
 	cliflags.ToName: wrapText(`
-Exclusive end key in pretty-printed format. See also --raw.`),
-
-	cliflags.RawName: wrapText(`
-Interpret keys as raw bytes.`),
+Exclusive end key and format as [<format>:]<key>. Supported formats:
+`) + fmt.Sprintf("\n%+v", keyTypes()),
 
 	cliflags.ValuesName: wrapText(`
 Print values along with their associated key.`),
+
+	cliflags.SizesName: wrapText(`
+Print key and value sizes along with their associated key.`),
 
 	cliflags.RaftTickIntervalName: wrapText(`
 The resolution of the Raft timer; other raft timeouts are
@@ -301,12 +335,12 @@ func (b *bytesValue) String() string {
 }
 
 type insecureValue struct {
-	val   *bool
+	ctx   *base.Context
 	isSet bool
 }
 
-func newInsecureValue(val *bool) *insecureValue {
-	return &insecureValue{val: val}
+func newInsecureValue(ctx *base.Context) *insecureValue {
+	return &insecureValue{ctx: ctx}
 }
 
 func (b *insecureValue) IsBoolFlag() bool {
@@ -319,15 +353,15 @@ func (b *insecureValue) Set(s string) error {
 		return err
 	}
 	b.isSet = true
-	*b.val = v
-	if *b.val {
+	b.ctx.Insecure = v
+	if b.ctx.Insecure {
 		// If --insecure is specified, clear any of the existing security flags if
 		// they were set. This allows composition of command lines where a later
 		// specification of --insecure clears an earlier security specification.
-		cliContext.SSLCA = ""
-		cliContext.SSLCAKey = ""
-		cliContext.SSLCert = ""
-		cliContext.SSLCertKey = ""
+		b.ctx.SSLCA = ""
+		b.ctx.SSLCAKey = ""
+		b.ctx.SSLCert = ""
+		b.ctx.SSLCertKey = ""
 	}
 	return nil
 }
@@ -337,13 +371,10 @@ func (b *insecureValue) Type() string {
 }
 
 func (b *insecureValue) String() string {
-	return fmt.Sprint(*b.val)
+	return fmt.Sprint(b.ctx.Insecure)
 }
 
-// initFlags sets the cli.Context values to flag values.
-// Keep in sync with "server/context.go". Values in Context should be
-// settable here.
-func initFlags(ctx *Context) {
+func init() {
 	// Change the logging defaults for the main cockroach binary.
 	if err := flag.Lookup(logflags.LogToStderrName).Value.Set("false"); err != nil {
 		panic(err)
@@ -353,7 +384,12 @@ func initFlags(ctx *Context) {
 	// top-level cockroach command.
 	pf := cockroachCmd.PersistentFlags()
 	flag.VisitAll(func(f *flag.Flag) {
-		pf.AddFlag(pflag.PFlagFromGoFlag(f))
+		flag := pflag.PFlagFromGoFlag(f)
+		// TODO(peter): Decide if we want to make the lightstep flags visible.
+		if strings.HasPrefix(flag.Name, "lightstep_") {
+			flag.Hidden = true
+		}
+		pf.AddFlag(flag)
 	})
 
 	// The --log-dir default changes depending on the command. Avoid confusion by
@@ -362,6 +398,10 @@ func initFlags(ctx *Context) {
 	// If no value is specified for --alsologtostderr output everything.
 	pf.Lookup(logflags.AlsoLogToStderrName).NoOptDefVal = "INFO"
 
+	// Security flags.
+	baseCtx.Insecure = true
+	insecure = newInsecureValue(baseCtx)
+
 	{
 		f := startCmd.Flags()
 
@@ -369,51 +409,50 @@ func initFlags(ctx *Context) {
 		f.StringVar(&connHost, cliflags.HostName, "", usageNoEnv(forServer(cliflags.HostName)))
 		f.StringVarP(&connPort, cliflags.PortName, "p", base.DefaultPort, usageNoEnv(forServer(cliflags.PortName)))
 		f.StringVar(&httpPort, cliflags.HTTPPortName, base.DefaultHTTPPort, usageNoEnv(forServer(cliflags.HTTPPortName)))
-		f.StringVar(&ctx.Attrs, cliflags.AttrsName, ctx.Attrs, usageNoEnv(cliflags.AttrsName))
-		f.VarP(&ctx.Stores, cliflags.StoreName, "s", usageNoEnv(cliflags.StoreName))
-		f.DurationVar(&ctx.RaftTickInterval, cliflags.RaftTickIntervalName, base.DefaultRaftTickInterval, usageNoEnv(cliflags.RaftTickIntervalName))
+		f.StringVar(&httpAddr, cliflags.HTTPAddrName, "", usageNoEnv(forServer(cliflags.HTTPAddrName)))
+		f.StringVar(&serverCtx.Attrs, cliflags.AttrsName, serverCtx.Attrs, usageNoEnv(cliflags.AttrsName))
+		f.VarP(&serverCtx.Stores, cliflags.StoreName, "s", usageNoEnv(cliflags.StoreName))
+		f.DurationVar(&serverCtx.RaftTickInterval, cliflags.RaftTickIntervalName, base.DefaultRaftTickInterval, usageNoEnv(cliflags.RaftTickIntervalName))
 		f.BoolVar(&startBackground, cliflags.BackgroundName, false, usageNoEnv(cliflags.BackgroundName))
 
 		// Usage for the unix socket is odd as we use a real file, whereas
 		// postgresql and clients consider it a directory and build a filename
 		// inside it using the port.
 		// Thus, we keep it hidden and use it for testing only.
-		f.StringVar(&ctx.SocketFile, cliflags.SocketName, "", usageEnv(cliflags.SocketName))
+		f.StringVar(&serverCtx.SocketFile, cliflags.SocketName, "", usageEnv(cliflags.SocketName))
 		_ = f.MarkHidden(cliflags.SocketName)
 
-		// Security flags.
-		ctx.Insecure = true
-		insecure = newInsecureValue(&ctx.Insecure)
-		insecureF := f.VarPF(insecure, cliflags.InsecureName, "", usageNoEnv(cliflags.InsecureName))
-		insecureF.NoOptDefVal = "true"
-		// Certificates.
-		f.StringVar(&ctx.SSLCA, cliflags.CACertName, ctx.SSLCA, usageNoEnv(cliflags.CACertName))
-		f.StringVar(&ctx.SSLCert, cliflags.CertName, ctx.SSLCert, usageNoEnv(cliflags.CertName))
-		f.StringVar(&ctx.SSLCertKey, cliflags.KeyName, ctx.SSLCertKey, usageNoEnv(cliflags.KeyName))
+		insecureF := f.VarPF(insecure, cliflags.InsecureName, "", usageEnv(cliflags.InsecureName))
+		insecureF.NoOptDefVal = envutil.EnvOrDefaultString(cliflags.InsecureName, "true")
+
+		// Certificate flags.
+		f.StringVar(&baseCtx.SSLCA, cliflags.CACertName, baseCtx.SSLCA, usageNoEnv(cliflags.CACertName))
+		f.StringVar(&baseCtx.SSLCert, cliflags.CertName, baseCtx.SSLCert, usageNoEnv(cliflags.CertName))
+		f.StringVar(&baseCtx.SSLCertKey, cliflags.KeyName, baseCtx.SSLCertKey, usageNoEnv(cliflags.KeyName))
 
 		// Cluster joining flags.
-		f.StringVar(&ctx.JoinUsing, cliflags.JoinName, ctx.JoinUsing, usageNoEnv(cliflags.JoinName))
+		f.VarP(&serverCtx.JoinList, cliflags.JoinName, "j", usageNoEnv(cliflags.JoinName))
 
 		// Engine flags.
-		setDefaultCacheSize(&ctx.Context)
-		cacheSize = newBytesValue(&ctx.CacheSize)
+		setDefaultCacheSize(&serverCtx)
+		cacheSize = newBytesValue(&serverCtx.CacheSize)
 		f.Var(cacheSize, cliflags.CacheName, usageNoEnv(cliflags.CacheName))
 	}
 
 	for _, cmd := range certCmds {
 		f := cmd.Flags()
 		// Certificate flags.
-		f.StringVar(&ctx.SSLCA, cliflags.CACertName, ctx.SSLCA, usageNoEnv(cliflags.CACertName))
-		f.StringVar(&ctx.SSLCAKey, cliflags.CAKeyName, ctx.SSLCAKey, usageNoEnv(cliflags.CAKeyName))
-		f.StringVar(&ctx.SSLCert, cliflags.CertName, ctx.SSLCert, usageNoEnv(cliflags.CertName))
-		f.StringVar(&ctx.SSLCertKey, cliflags.KeyName, ctx.SSLCertKey, usageNoEnv(cliflags.KeyName))
+		f.StringVar(&baseCtx.SSLCA, cliflags.CACertName, baseCtx.SSLCA, usageNoEnv(cliflags.CACertName))
+		f.StringVar(&baseCtx.SSLCAKey, cliflags.CAKeyName, baseCtx.SSLCAKey, usageNoEnv(cliflags.CAKeyName))
+		f.StringVar(&baseCtx.SSLCert, cliflags.CertName, baseCtx.SSLCert, usageNoEnv(cliflags.CertName))
+		f.StringVar(&baseCtx.SSLCertKey, cliflags.KeyName, baseCtx.SSLCertKey, usageNoEnv(cliflags.KeyName))
 		f.IntVar(&keySize, cliflags.KeySizeName, defaultKeySize, usageNoEnv(cliflags.KeySizeName))
 	}
 
 	setUserCmd.Flags().StringVar(&password, cliflags.PasswordName, envutil.EnvOrDefaultString(cliflags.PasswordName, ""), usageEnv(cliflags.PasswordName))
 
 	clientCmds := []*cobra.Command{
-		sqlShellCmd, quitCmd, freezeClusterCmd, /* startCmd is covered above */
+		sqlShellCmd, quitCmd, freezeClusterCmd, dumpCmd, /* startCmd is covered above */
 	}
 	clientCmds = append(clientCmds, kvCmds...)
 	clientCmds = append(clientCmds, rangeCmds...)
@@ -422,19 +461,28 @@ func initFlags(ctx *Context) {
 	clientCmds = append(clientCmds, nodeCmds...)
 	for _, cmd := range clientCmds {
 		f := cmd.PersistentFlags()
-		insecureF := f.VarPF(insecure, cliflags.InsecureName, "", usageEnv(cliflags.InsecureName))
-		insecureF.NoOptDefVal = envutil.EnvOrDefaultString(cliflags.InsecureName, "true")
 		f.StringVar(&connHost, cliflags.HostName, envutil.EnvOrDefaultString(cliflags.HostName, ""), usageEnv(forClient(cliflags.HostName)))
 
-		// Certificate flags.
-		f.StringVar(&ctx.SSLCA, cliflags.CACertName, envutil.EnvOrDefaultString(cliflags.CACertName, ctx.SSLCA), usageEnv(cliflags.CACertName))
-		f.StringVar(&ctx.SSLCert, cliflags.CertName, envutil.EnvOrDefaultString(cliflags.CertName, ctx.SSLCert), usageEnv(cliflags.CertName))
-		f.StringVar(&ctx.SSLCertKey, cliflags.KeyName, envutil.EnvOrDefaultString(cliflags.KeyName, ctx.SSLCertKey), usageEnv(cliflags.KeyName))
-	}
+		insecureF := f.VarPF(insecure, cliflags.InsecureName, "", usageEnv(cliflags.InsecureName))
+		insecureF.NoOptDefVal = envutil.EnvOrDefaultString(cliflags.InsecureName, "true")
 
+		// Certificate flags.
+		f.StringVar(&baseCtx.SSLCA, cliflags.CACertName, envutil.EnvOrDefaultString(cliflags.CACertName, baseCtx.SSLCA), usageEnv(cliflags.CACertName))
+		f.StringVar(&baseCtx.SSLCert, cliflags.CertName, envutil.EnvOrDefaultString(cliflags.CertName, baseCtx.SSLCert), usageEnv(cliflags.CertName))
+		f.StringVar(&baseCtx.SSLCertKey, cliflags.KeyName, envutil.EnvOrDefaultString(cliflags.KeyName, baseCtx.SSLCertKey), usageEnv(cliflags.KeyName))
+
+		// By default, client commands print their output as
+		// pretty-formatted tables on terminals, and TSV when redirected
+		// to a file. The user can override with --pretty.
+		f.BoolVar(&cliCtx.prettyFmt, cliflags.PrettyName, isInteractive, usageNoEnv(cliflags.PrettyName))
+	}
+	{
+		f := setZoneCmd.Flags()
+		f.StringVarP(&zoneConfig, cliflags.ZoneConfigName, "f", "", usageNoEnv(cliflags.ZoneConfigName))
+	}
 	{
 		f := sqlShellCmd.Flags()
-		f.VarP(&ctx.execStmts, cliflags.ExecuteName, "e", usageNoEnv(cliflags.ExecuteName))
+		f.VarP(&sqlCtx.execStmts, cliflags.ExecuteName, "e", usageNoEnv(cliflags.ExecuteName))
 	}
 	{
 		f := freezeClusterCmd.PersistentFlags()
@@ -452,7 +500,7 @@ func initFlags(ctx *Context) {
 	}
 
 	// Commands that establish a SQL connection.
-	sqlCmds := []*cobra.Command{sqlShellCmd}
+	sqlCmds := []*cobra.Command{sqlShellCmd, dumpCmd}
 	sqlCmds = append(sqlCmds, zoneCmds...)
 	sqlCmds = append(sqlCmds, userCmds...)
 	for _, cmd := range sqlCmds {
@@ -473,31 +521,33 @@ func initFlags(ctx *Context) {
 	// Debug commands.
 	{
 		f := debugKeysCmd.Flags()
-		f.StringVar(&cliContext.debug.startKey, cliflags.FromName, "", usageNoEnv(cliflags.FromName))
-		f.StringVar(&cliContext.debug.endKey, cliflags.ToName, "", usageNoEnv(cliflags.ToName))
-		f.BoolVar(&cliContext.debug.raw, cliflags.RawName, false, usageNoEnv(cliflags.RawName))
-		f.BoolVar(&cliContext.debug.values, cliflags.ValuesName, false, usageNoEnv(cliflags.ValuesName))
+		f.Var((*mvccKey)(&debugCtx.startKey), cliflags.FromName, usageNoEnv(cliflags.FromName))
+		f.Var((*mvccKey)(&debugCtx.endKey), cliflags.ToName, usageNoEnv(cliflags.ToName))
+		f.BoolVar(&debugCtx.values, cliflags.ValuesName, false, usageNoEnv(cliflags.ValuesName))
+		f.BoolVar(&debugCtx.sizes, cliflags.SizesName, false, usageNoEnv(cliflags.SizesName))
 	}
 
 	{
 		f := versionCmd.Flags()
 		f.BoolVar(&versionIncludesDeps, cliflags.DepsName, false, usageNoEnv(cliflags.DepsName))
 	}
+
+	cobra.OnInitialize(extraFlagInit)
 }
 
-func init() {
-	initFlags(cliContext)
+// extraFlagInit is a standalone function so we can test more easily.
+func extraFlagInit() {
+	// If any of the security flags have been set, clear the insecure
+	// setting. Note that we do the inverse when the --insecure flag is
+	// set. See insecureValue.Set().
+	if baseCtx.SSLCA != "" || baseCtx.SSLCAKey != "" ||
+		baseCtx.SSLCert != "" || baseCtx.SSLCertKey != "" {
+		baseCtx.Insecure = false
+	}
 
-	cobra.OnInitialize(func() {
-		// If any of the security flags have been set, clear the insecure
-		// setting. Note that we do the inverse when the --insecure flag is
-		// set. See insecureValue.Set().
-		if cliContext.SSLCA != "" || cliContext.SSLCAKey != "" ||
-			cliContext.SSLCert != "" || cliContext.SSLCertKey != "" {
-			cliContext.Insecure = false
-		}
-
-		cliContext.Addr = net.JoinHostPort(connHost, connPort)
-		cliContext.HTTPAddr = net.JoinHostPort(connHost, httpPort)
-	})
+	serverCtx.Addr = net.JoinHostPort(connHost, connPort)
+	if httpAddr == "" {
+		httpAddr = connHost
+	}
+	serverCtx.HTTPAddr = net.JoinHostPort(httpAddr, httpPort)
 }

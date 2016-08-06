@@ -23,6 +23,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/cockroachdb/cockroach/build"
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )
 
@@ -60,7 +61,14 @@ var cockroachCmd = &cobra.Command{
 	Long: `CockroachDB command-line interface and server.`,
 }
 
+// isInteractive indicates whether both stdin and stdout refer to the
+// terminal.
+var isInteractive = isatty.IsTerminal(os.Stdout.Fd()) &&
+	isatty.IsTerminal(os.Stdin.Fd())
+
 func init() {
+	cobra.EnableCommandSorting = false
+
 	cockroachCmd.AddCommand(
 		startCmd,
 		certCmd,
@@ -71,6 +79,7 @@ func init() {
 		userCmd,
 		zoneCmd,
 		nodeCmd,
+		dumpCmd,
 
 		// Miscellaneous commands.
 		// TODO(pmattis): stats

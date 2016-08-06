@@ -19,6 +19,7 @@ package roachpb
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"hash"
 	"hash/crc32"
@@ -28,14 +29,17 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/biogo/store/interval"
 	"github.com/gogo/protobuf/proto"
+	"github.com/pkg/errors"
 	"gopkg.in/inf.v0"
 
-	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/util/duration"
 	"github.com/cockroachdb/cockroach/util/encoding"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/protoutil"
 	"github.com/cockroachdb/cockroach/util/uuid"
 )
@@ -56,6 +60,7 @@ var (
 )
 
 // RKey denotes a Key whose local addressing has been accounted for.
+// A key can be transformed to an RKey by keys.Addr().
 type RKey Key
 
 // AsRawKey returns the RKey as a Key. This is to be used only in select
@@ -188,91 +193,6 @@ func (k Key) Format(f fmt.State, verb rune) {
 	}
 }
 
-// Timestamp constant values.
-var (
-	// MaxTimestamp is the max value allowed for Timestamp.
-	MaxTimestamp = Timestamp{WallTime: math.MaxInt64, Logical: math.MaxInt32}
-	// MinTimestamp is the min value allowed for Timestamp.
-	MinTimestamp = Timestamp{WallTime: 0, Logical: 1}
-	// ZeroTimestamp is an empty timestamp.
-	ZeroTimestamp = Timestamp{WallTime: 0, Logical: 0}
-)
-
-// Less compares two timestamps.
-func (t Timestamp) Less(s Timestamp) bool {
-	return t.WallTime < s.WallTime || (t.WallTime == s.WallTime && t.Logical < s.Logical)
-}
-
-// Equal returns whether two timestamps are the same.
-func (t Timestamp) Equal(s Timestamp) bool {
-	return t.WallTime == s.WallTime && t.Logical == s.Logical
-}
-
-func (t Timestamp) String() string {
-	return fmt.Sprintf("%d.%09d,%d", t.WallTime/1E9, t.WallTime%1E9, t.Logical)
-}
-
-// Add returns a timestamp with the WallTime and Logical components increased.
-func (t Timestamp) Add(wallTime int64, logical int32) Timestamp {
-	return Timestamp{
-		WallTime: t.WallTime + wallTime,
-		Logical:  t.Logical + logical,
-	}
-}
-
-// Next returns the timestamp with the next later timestamp.
-func (t Timestamp) Next() Timestamp {
-	if t.Logical == math.MaxInt32 {
-		if t.WallTime == math.MaxInt64 {
-			panic("cannot take the next value to a max timestamp")
-		}
-		return Timestamp{
-			WallTime: t.WallTime + 1,
-		}
-	}
-	return Timestamp{
-		WallTime: t.WallTime,
-		Logical:  t.Logical + 1,
-	}
-}
-
-// Prev returns the next earliest timestamp.
-func (t Timestamp) Prev() Timestamp {
-	if t.Logical > 0 {
-		return Timestamp{
-			WallTime: t.WallTime,
-			Logical:  t.Logical - 1,
-		}
-	} else if t.WallTime > 0 {
-		return Timestamp{
-			WallTime: t.WallTime - 1,
-			Logical:  math.MaxInt32,
-		}
-	}
-	panic("cannot take the previous value to a zero timestamp")
-}
-
-// Forward updates the timestamp from the one given, if that moves it
-// forwards in time.
-func (t *Timestamp) Forward(s Timestamp) {
-	if t.Less(s) {
-		*t = s
-	}
-}
-
-// Backward updates the timestamp from the one given, if that moves it
-// backwards in time.
-func (t *Timestamp) Backward(s Timestamp) {
-	if s.Less(*t) {
-		*t = s
-	}
-}
-
-// GoTime converts the timestamp to a time.Time.
-func (t Timestamp) GoTime() time.Time {
-	return time.Unix(0, t.WallTime)
-}
-
 const (
 	checksumUninitialized = 0
 	checksumSize          = 4
@@ -360,7 +280,7 @@ func MakeValueFromBytes(bs []byte) Value {
 
 // MakeValueFromBytesAndTimestamp returns a value with bytes, timestamp and
 // tag set.
-func MakeValueFromBytesAndTimestamp(bs []byte, t Timestamp) Value {
+func MakeValueFromBytesAndTimestamp(bs []byte, t hlc.Timestamp) Value {
 	v := Value{Timestamp: t}
 	v.SetBytes(bs)
 	return v
@@ -404,6 +324,19 @@ func (v *Value) SetFloat(f float64) {
 	v.RawBytes = make([]byte, headerSize+8)
 	encoding.EncodeUint64Ascending(v.RawBytes[headerSize:headerSize], math.Float64bits(f))
 	v.setTag(ValueType_FLOAT)
+}
+
+// SetBool encodes the specified bool value into the bytes field of the
+// receiver, sets the tag and clears the checksum.
+func (v *Value) SetBool(b bool) {
+	// 0 or 1 will always encode to a 1-byte long varint.
+	v.RawBytes = make([]byte, headerSize+1)
+	i := int64(0)
+	if b {
+		i = 1
+	}
+	_ = binary.PutVarint(v.RawBytes[headerSize:], i)
+	v.setTag(ValueType_INT)
 }
 
 // SetInt encodes the specified int64 value into the bytes field of the
@@ -463,6 +396,16 @@ func (v *Value) SetDecimal(dec *inf.Dec) error {
 	return nil
 }
 
+// SetTuple sets the tuple bytes and tag field of the receiver and clears the
+// checksum.
+func (v *Value) SetTuple(data []byte) {
+	// TODO(dan): Reuse this and stop allocating on every SetTuple call. Same for
+	// the other SetFoos.
+	v.RawBytes = make([]byte, headerSize+len(data))
+	copy(v.dataBytes(), data)
+	v.setTag(ValueType_TUPLE)
+}
+
 // GetBytes returns the bytes field of the receiver. If the tag is not
 // BYTES an error will be returned.
 func (v Value) GetBytes() ([]byte, error) {
@@ -488,6 +431,23 @@ func (v Value) GetFloat() (float64, error) {
 		return 0, err
 	}
 	return math.Float64frombits(u), nil
+}
+
+// GetBool decodes a bool value from the bytes field of the receiver. If the
+// tag is not INT (the tag used for bool values) or the value cannot be decoded
+// an error will be returned.
+func (v Value) GetBool() (bool, error) {
+	if tag := v.GetTag(); tag != ValueType_INT {
+		return false, fmt.Errorf("value type is not %s: %s", ValueType_INT, tag)
+	}
+	i, n := binary.Varint(v.dataBytes())
+	if n <= 0 {
+		return false, fmt.Errorf("int64 varint decoding failed: %d", n)
+	}
+	if i > 1 || i < 0 {
+		return false, fmt.Errorf("invalid bool: %d", i)
+	}
+	return i != 0, nil
 }
 
 // GetInt decodes an int64 value from the bytes field of the receiver. If the
@@ -557,6 +517,15 @@ func (v Value) GetTimeseries() (InternalTimeSeriesData, error) {
 	return ts, v.GetProto(&ts)
 }
 
+// GetTuple returns the tuple bytes of the receiver. If the tag is not TUPLE an
+// error will be returned.
+func (v Value) GetTuple() ([]byte, error) {
+	if tag := v.GetTag(); tag != ValueType_TUPLE {
+		return nil, fmt.Errorf("value type is not %s: %s", ValueType_TUPLE, tag)
+	}
+	return v.dataBytes(), nil
+}
+
 var crc32Pool = sync.Pool{
 	New: func() interface{} {
 		return crc32.NewIEEE()
@@ -588,6 +557,78 @@ func (v Value) computeChecksum(key []byte) uint32 {
 	return sum
 }
 
+// PrettyPrint returns the value in a human readable format.
+// e.g. `Put /Table/51/1/1/0 -> /TUPLE/2:2:Int/7/1:3:Float/6.28`
+// In `1:3:Float/6.28`, the `1` is the column id diff as stored, `3` is the
+// computed (i.e. not stored) actual column id, `Float` is the type, and `6.28`
+// is the encoded value.
+func (v Value) PrettyPrint() string {
+	var buf bytes.Buffer
+	t := v.GetTag()
+	buf.WriteRune('/')
+	buf.WriteString(t.String())
+	buf.WriteRune('/')
+
+	var err error
+	switch t {
+	case ValueType_TUPLE:
+		b := v.dataBytes()
+		var colID uint32
+		for i := 0; len(b) > 0; i++ {
+			if i != 0 {
+				buf.WriteRune('/')
+			}
+			_, _, colIDDiff, typ, err := encoding.DecodeValueTag(b)
+			if err != nil {
+				break
+			}
+			colID += colIDDiff
+			var s string
+			b, s, err = encoding.PrettyPrintValueEncoded(b)
+			if err != nil {
+				break
+			}
+			fmt.Fprintf(&buf, "%d:%d:%s/%s", colIDDiff, colID, typ, s)
+		}
+	case ValueType_INT:
+		var i int64
+		i, err = v.GetInt()
+		buf.WriteString(strconv.FormatInt(i, 10))
+	case ValueType_FLOAT:
+		var f float64
+		f, err = v.GetFloat()
+		buf.WriteString(strconv.FormatFloat(f, 'g', -1, 64))
+	case ValueType_BYTES:
+		var data []byte
+		data, err = v.GetBytes()
+		printable := len(bytes.TrimLeftFunc(data, unicode.IsPrint)) == 0
+		if printable {
+			buf.WriteString(string(data))
+		} else {
+			buf.WriteString(hex.EncodeToString(data))
+		}
+	case ValueType_TIME:
+		var t time.Time
+		t, err = v.GetTime()
+		buf.WriteString(t.UTC().Format(time.RFC3339Nano))
+	case ValueType_DECIMAL:
+		var d *inf.Dec
+		d, err = v.GetDecimal()
+		buf.WriteString(d.String())
+	case ValueType_DURATION:
+		var d duration.Duration
+		d, err = v.GetDuration()
+		buf.WriteString(d.String())
+	default:
+		err = errors.Errorf("unknown tag: %s", t)
+	}
+	if err != nil {
+		// Ignore the contents of buf and return directly.
+		return fmt.Sprintf("/<err: %s>", err)
+	}
+	return buf.String()
+}
+
 // NewTransaction creates a new transaction. The transaction key is
 // composed using the specified baseKey (for locality with data
 // affected by the transaction) and a random ID to guarantee
@@ -596,7 +637,7 @@ func (v Value) computeChecksum(key []byte) uint32 {
 // write conflicts in a way that avoids starvation of long-running
 // transactions (see Replica.PushTxn).
 func NewTransaction(name string, baseKey Key, userPriority UserPriority,
-	isolation IsolationType, now Timestamp, maxOffset int64) *Transaction {
+	isolation enginepb.IsolationType, now hlc.Timestamp, maxOffset int64) *Transaction {
 	// Compute priority by adjusting based on userPriority factor.
 	priority := MakePriority(userPriority)
 	// Compute timestamp and max timestamp.
@@ -604,7 +645,7 @@ func NewTransaction(name string, baseKey Key, userPriority UserPriority,
 	max.WallTime += maxOffset
 
 	return &Transaction{
-		TxnMeta: TxnMeta{
+		TxnMeta: enginepb.TxnMeta{
 			Key:       baseKey,
 			ID:        uuid.NewV4(),
 			Isolation: isolation,
@@ -620,7 +661,7 @@ func NewTransaction(name string, baseKey Key, userPriority UserPriority,
 
 // LastActive returns the last timestamp at which client activity definitely
 // occurred, i.e. the maximum of OrigTimestamp and LastHeartbeat.
-func (t Transaction) LastActive() Timestamp {
+func (t Transaction) LastActive() hlc.Timestamp {
 	candidate := t.OrigTimestamp
 	if t.LastHeartbeat != nil && candidate.Less(*t.LastHeartbeat) {
 		candidate = *t.LastHeartbeat
@@ -638,7 +679,7 @@ func (t Transaction) Clone() Transaction {
 	}
 	mt := t.ObservedTimestamps
 	if mt != nil {
-		t.ObservedTimestamps = make(map[NodeID]Timestamp)
+		t.ObservedTimestamps = make(map[NodeID]hlc.Timestamp)
 		for k, v := range mt {
 			t.ObservedTimestamps[k] = v
 		}
@@ -758,7 +799,7 @@ func TxnIDEqual(a, b *uuid.UUID) bool {
 // incremented for an in-place restart. The timestamp of the
 // transaction on restart is set to the maximum of the transaction's
 // timestamp and the specified timestamp.
-func (t *Transaction) Restart(userPriority UserPriority, upgradePriority int32, timestamp Timestamp) {
+func (t *Transaction) Restart(userPriority UserPriority, upgradePriority int32, timestamp hlc.Timestamp) {
 	t.Epoch++
 	if t.Timestamp.Less(timestamp) {
 		t.Timestamp = timestamp
@@ -800,7 +841,7 @@ func (t *Transaction) Update(o *Transaction) {
 	t.MaxTimestamp.Forward(o.MaxTimestamp)
 	if o.LastHeartbeat != nil {
 		if t.LastHeartbeat == nil {
-			t.LastHeartbeat = &Timestamp{}
+			t.LastHeartbeat = &hlc.Timestamp{}
 		}
 		t.LastHeartbeat.Forward(*o.LastHeartbeat)
 	}
@@ -846,7 +887,7 @@ func (t Transaction) String() string {
 		fmt.Fprintf(&buf, "%q ", t.Name)
 	}
 	fmt.Fprintf(&buf, "id=%s key=%s rw=%t pri=%.8f iso=%s stat=%s epo=%d ts=%s orig=%s max=%s wto=%t rop=%t",
-		t.ID.Short(), t.Key, t.Writing, floatPri, t.Isolation, t.Status, t.Epoch, t.Timestamp,
+		t.ID.Short(), Key(t.Key), t.Writing, floatPri, t.Isolation, t.Status, t.Epoch, t.Timestamp,
 		t.OrigTimestamp, t.MaxTimestamp, t.WriteTooOld, t.RetryOnPush)
 	return buf.String()
 }
@@ -860,9 +901,9 @@ func (t *Transaction) ResetObservedTimestamps() {
 // UpdateObservedTimestamp stores a timestamp off a node's clock for future
 // operations in the transaction. When multiple calls are made for a single
 // nodeID, the lowest timestamp prevails.
-func (t *Transaction) UpdateObservedTimestamp(nodeID NodeID, maxTS Timestamp) {
+func (t *Transaction) UpdateObservedTimestamp(nodeID NodeID, maxTS hlc.Timestamp) {
 	if t.ObservedTimestamps == nil {
-		t.ObservedTimestamps = make(map[NodeID]Timestamp)
+		t.ObservedTimestamps = make(map[NodeID]hlc.Timestamp)
 	}
 	if ts, ok := t.ObservedTimestamps[nodeID]; !ok || maxTS.Less(ts) {
 		t.ObservedTimestamps[nodeID] = maxTS
@@ -873,7 +914,7 @@ func (t *Transaction) UpdateObservedTimestamp(nodeID NodeID, maxTS Timestamp) {
 // given node's clock during the transaction. The returned boolean is false if
 // no observation about the requested node was found. Otherwise, MaxTimestamp
 // can be lowered to the returned timestamp when reading from nodeID.
-func (t Transaction) GetObservedTimestamp(nodeID NodeID) (Timestamp, bool) {
+func (t Transaction) GetObservedTimestamp(nodeID NodeID) (hlc.Timestamp, bool) {
 	ts, ok := t.ObservedTimestamps[nodeID]
 	return ts, ok
 }
@@ -888,7 +929,11 @@ func (l Lease) String() string {
 
 // Covers returns true if the given timestamp can be served by the Lease.
 // This is the case if the timestamp precedes the Lease's stasis period.
-func (l Lease) Covers(timestamp Timestamp) bool {
+// Note that the fact that a lease convers a timestamp is not enough for the
+// holder of the lease to be able to serve a read with that timestamp;
+// pendingLeaderLeaseRequest.TransferInProgress() should also be consulted to
+// account for possible lease transfers.
+func (l Lease) Covers(timestamp hlc.Timestamp) bool {
 	return timestamp.Less(l.StartStasis)
 }
 
@@ -971,7 +1016,7 @@ func (rs RSpan) ContainsKeyRange(start, end RKey) bool {
 // rs.EndKey is nil. This gives the method unexpected behavior.
 func (rs RSpan) Intersect(desc *RangeDescriptor) (RSpan, error) {
 	if !rs.Key.Less(desc.EndKey) || !desc.StartKey.Less(rs.EndKey) {
-		return rs, util.Errorf("span and descriptor's range do not overlap")
+		return rs, errors.Errorf("span and descriptor's range do not overlap")
 	}
 
 	key := rs.Key

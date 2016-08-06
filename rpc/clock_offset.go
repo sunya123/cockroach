@@ -17,13 +17,15 @@
 package rpc
 
 import (
-	"sync"
 	"time"
 
-	"github.com/cockroachdb/cockroach/util"
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/metric"
+	"github.com/cockroachdb/cockroach/util/syncutil"
+	"github.com/pkg/errors"
 )
 
 type remoteClockMetrics struct {
@@ -38,7 +40,7 @@ type RemoteClockMonitor struct {
 	offsetTTL time.Duration
 
 	mu struct {
-		sync.Mutex
+		syncutil.Mutex
 		offsets map[string]RemoteOffset
 	}
 
@@ -97,7 +99,7 @@ func (r *RemoteClockMonitor) UpdateOffset(addr string, offset RemoteOffset) {
 	}
 
 	if log.V(2) {
-		log.Infof("update offset: %s %v", addr, r.mu.offsets[addr])
+		log.Infof(context.TODO(), "update offset: %s %v", addr, r.mu.offsets[addr])
 	}
 }
 
@@ -129,10 +131,10 @@ func (r *RemoteClockMonitor) VerifyClockOffset() error {
 		r.mu.Unlock()
 
 		if numClocks > 0 && healthyOffsetCount <= numClocks/2 {
-			return util.Errorf("fewer than half the known nodes are within the maximum offset of %s (%d of %d)", maxOffset, healthyOffsetCount, numClocks)
+			return errors.Errorf("fewer than half the known nodes are within the maximum offset of %s (%d of %d)", maxOffset, healthyOffsetCount, numClocks)
 		}
 		if log.V(1) {
-			log.Infof("%d of %d nodes are within the maximum offset of %s", healthyOffsetCount, numClocks, maxOffset)
+			log.Infof(context.TODO(), "%d of %d nodes are within the maximum offset of %s", healthyOffsetCount, numClocks, maxOffset)
 		}
 	}
 
@@ -161,7 +163,7 @@ func (r RemoteOffset) isHealthy(maxOffset time.Duration) bool {
 		// health is ambiguous. For now, we err on the side of not spuriously
 		// killing nodes.
 		if log.V(1) {
-			log.Infof("uncertain remote offset %s for maximum offset %s, treating as healthy", r, maxOffset)
+			log.Infof(context.TODO(), "uncertain remote offset %s for maximum offset %s, treating as healthy", r, maxOffset)
 		}
 		return true
 	}

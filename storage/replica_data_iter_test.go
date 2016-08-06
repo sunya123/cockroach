@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage/engine"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/uuid"
 )
@@ -60,17 +61,23 @@ func fakePrevKey(k []byte) roachpb.Key {
 // the key space. Returns a slice of the encoded keys of all created
 // data.
 func createRangeData(t *testing.T, r *Replica) []engine.MVCCKey {
-	ts0 := roachpb.ZeroTimestamp
-	ts := roachpb.Timestamp{WallTime: 1}
+	ts0 := hlc.ZeroTimestamp
+	ts := hlc.Timestamp{WallTime: 1}
 	desc := r.Desc()
 	keyTSs := []struct {
 		key roachpb.Key
-		ts  roachpb.Timestamp
+		ts  hlc.Timestamp
 	}{
 		{keys.AbortCacheKey(r.RangeID, testTxnID), ts0},
 		{keys.AbortCacheKey(r.RangeID, testTxnID2), ts0},
+		{keys.RangeFrozenStatusKey(r.RangeID), ts0},
+		{keys.RangeLastGCKey(r.RangeID), ts0},
+		{keys.RaftAppliedIndexKey(r.RangeID), ts0},
+		{keys.RaftTruncatedStateKey(r.RangeID), ts0},
+		{keys.LeaseAppliedIndexKey(r.RangeID), ts0},
 		{keys.RangeStatsKey(r.RangeID), ts0},
 		{keys.RaftHardStateKey(r.RangeID), ts0},
+		{keys.RaftLastIndexKey(r.RangeID), ts0},
 		{keys.RaftLogKey(r.RangeID, 1), ts0},
 		{keys.RaftLogKey(r.RangeID, 2), ts0},
 		{keys.RangeLastReplicaGCTimestampKey(r.RangeID), ts0},
@@ -113,15 +120,12 @@ func TestReplicaDataIteratorEmptyRange(t *testing.T) {
 	// records and config entries during the iteration. This is a rather
 	// nasty little hack, but since it's test code, meh.
 	newDesc := *tc.rng.Desc()
-	newDesc.StartKey = roachpb.RKey("a")
-	if err := tc.rng.setDesc(&newDesc); err != nil {
-		t.Fatal(err)
-	}
+	newDesc.RangeID = 125125125
 
-	iter := newReplicaDataIterator(tc.rng.Desc(), tc.rng.store.Engine(), false /* !replicatedOnly */)
+	iter := NewReplicaDataIterator(&newDesc, tc.rng.store.Engine(), false /* !replicatedOnly */)
 	defer iter.Close()
 	for ; iter.Valid(); iter.Next() {
-		t.Error("expected empty iteration")
+		t.Errorf("unexpected: %s", iter.Key())
 	}
 }
 
@@ -162,7 +166,7 @@ func TestReplicaDataIterator(t *testing.T) {
 	postKeys := createRangeData(t, postRng)
 
 	// Verify the contents of the "b"-"c" range.
-	iter := newReplicaDataIterator(tc.rng.Desc(), tc.rng.store.Engine(), false /* !replicatedOnly */)
+	iter := NewReplicaDataIterator(tc.rng.Desc(), tc.rng.store.Engine(), false /* !replicatedOnly */)
 	defer iter.Close()
 	i := 0
 	for ; iter.Valid(); iter.Next() {
@@ -185,7 +189,7 @@ func TestReplicaDataIterator(t *testing.T) {
 
 	// Verify that the replicated-only iterator ignores unreplicated keys.
 	unreplicatedPrefix := keys.MakeRangeIDUnreplicatedPrefix(tc.rng.RangeID)
-	iter = newReplicaDataIterator(tc.rng.Desc(), tc.rng.store.Engine(), true /* replicatedOnly */)
+	iter = NewReplicaDataIterator(tc.rng.Desc(), tc.rng.store.Engine(), true /* replicatedOnly */)
 	defer iter.Close()
 	for ; iter.Valid(); iter.Next() {
 		if err := iter.Error(); err != nil {
@@ -200,7 +204,7 @@ func TestReplicaDataIterator(t *testing.T) {
 	if err := tc.rng.Destroy(*tc.rng.Desc()); err != nil {
 		t.Fatal(err)
 	}
-	iter = newReplicaDataIterator(tc.rng.Desc(), tc.rng.store.Engine(), false /* !replicatedOnly */)
+	iter = NewReplicaDataIterator(tc.rng.Desc(), tc.rng.store.Engine(), false /* !replicatedOnly */)
 	defer iter.Close()
 	if iter.Valid() {
 		// If the range is destroyed, only a tombstone key should be there.
@@ -224,7 +228,7 @@ func TestReplicaDataIterator(t *testing.T) {
 		{preRng, preKeys},
 		{postRng, postKeys},
 	} {
-		iter = newReplicaDataIterator(test.r.Desc(), test.r.store.Engine(), false /* !replicatedOnly */)
+		iter = NewReplicaDataIterator(test.r.Desc(), test.r.store.Engine(), false /* !replicatedOnly */)
 		defer iter.Close()
 		i = 0
 		for ; iter.Valid(); iter.Next() {

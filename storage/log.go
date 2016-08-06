@@ -21,9 +21,11 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/hlc"
+	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/pkg/errors"
 )
 
 // TODO(mrtracy): All of this logic should probably be moved into the SQL
@@ -71,6 +73,16 @@ type rangeLogEvent struct {
 }
 
 func (s *Store) insertRangeLogEvent(txn *client.Txn, event rangeLogEvent) error {
+	// Record range log event to console log.
+	var info string
+	if event.info != nil {
+		info = *event.info
+	}
+	log.Infof(txn.Context, "Range Event: %q, range: %d, info: %s",
+		event.eventType,
+		event.rangeID,
+		info)
+
 	const insertEventTableStmt = `
 INSERT INTO system.rangelog (
   timestamp, rangeID, storeID, eventType, otherRangeID, info
@@ -111,7 +123,7 @@ VALUES(
 		return err
 	}
 	if rows != 1 {
-		return util.Errorf("%d rows affected by log insertion; expected exactly one row affected.", rows)
+		return errors.Errorf("%d rows affected by log insertion; expected exactly one row affected.", rows)
 	}
 	return nil
 }
@@ -170,7 +182,7 @@ func (s *Store) logChange(txn *client.Txn, changeType roachpb.ReplicaChangeType,
 			UpdatedDesc    roachpb.RangeDescriptor
 		}{replica, desc}
 	default:
-		return util.Errorf("unknown replica change type %s", changeType)
+		return errors.Errorf("unknown replica change type %s", changeType)
 	}
 
 	infoBytes, err := json.Marshal(infoStruct)
@@ -195,8 +207,8 @@ func (s *Store) logChange(txn *client.Txn, changeType roachpb.ReplicaChangeType,
 // assigned database timestamp. However, in the case of our tests log events
 // *are* the first action in a transaction, and we must elect to use the store's
 // physical time instead.
-func selectEventTimestamp(s *Store, input roachpb.Timestamp) time.Time {
-	if input == roachpb.ZeroTimestamp {
+func selectEventTimestamp(s *Store, input hlc.Timestamp) time.Time {
+	if input == hlc.ZeroTimestamp {
 		return s.Clock().PhysicalTime()
 	}
 	return input.GoTime()

@@ -23,23 +23,25 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage/engine"
+	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/storage/storagebase"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/uuid"
-	"github.com/gogo/protobuf/proto"
 )
 
 // makeTS creates a new hybrid logical timestamp.
-func makeTS(nanos int64, logical int32) roachpb.Timestamp {
-	return roachpb.Timestamp{
+func makeTS(nanos int64, logical int32) hlc.Timestamp {
+	return hlc.Timestamp{
 		WallTime: nanos,
 		Logical:  logical,
 	}
@@ -62,7 +64,7 @@ func TestGCQueueShouldQueue(t *testing.T) {
 	desc := tc.rng.Desc()
 	zone, err := cfg.GetZoneConfigForKey(desc.StartKey)
 	if err != nil {
-		log.Errorf("could not find GC policy for range %s: %s, got zone %+v",
+		log.Errorf(context.Background(), "could not find GC policy for range %s: %s, got zone %+v",
 			tc.rng, err, zone)
 		return
 	}
@@ -80,7 +82,7 @@ func TestGCQueueShouldQueue(t *testing.T) {
 		gcBytesAge  int64
 		intentCount int64
 		intentAge   int64
-		now         roachpb.Timestamp // at time of shouldQueue
+		now         hlc.Timestamp // at time of shouldQueue
 		shouldQ     bool
 		priority    float64
 	}{
@@ -115,30 +117,37 @@ func TestGCQueueShouldQueue(t *testing.T) {
 		// a later timestamp.
 
 		// One normalized unit of unaged gc'able bytes at time zero.
-		{ttl * bc, 0, 0, 0, roachpb.ZeroTimestamp, true, float64(now.WallTime) / (1E9 * considerThreshold)},
+		{ttl * bc, 0, 0, 0, hlc.ZeroTimestamp, true, float64(now.WallTime) / (1E9 * considerThreshold)},
 
 		// 2 intents aging from zero to now (which is exactly the intent age
 		// normalization).
-		{0, 0, 2, 0, roachpb.ZeroTimestamp, true, 1},
+		{0, 0, 2, 0, hlc.ZeroTimestamp, true, 1},
 	}
 
-	gcQ := newGCQueue(tc.gossip)
+	gcQ := newGCQueue(tc.store, tc.gossip)
 
 	for i, test := range testCases {
 		// Write gc'able bytes as key bytes; since "live" bytes will be
 		// zero, this will translate into non live bytes.  Also write
 		// intent count. Note: the actual accounting on bytes is fictional
 		// in this test.
-		stats := engine.MVCCStats{
+		ms := enginepb.MVCCStats{
 			KeyBytes:        test.gcBytes,
 			IntentCount:     test.intentCount,
 			IntentAge:       test.intentAge * considerThreshold,
 			GCBytesAge:      test.gcBytesAge * considerThreshold,
 			LastUpdateNanos: test.now.WallTime,
 		}
-		if err := tc.rng.stats.SetMVCCStats(tc.rng.store.Engine(), stats); err != nil {
-			t.Fatal(err)
-		}
+		func() {
+			// Hold lock throughout to reduce chance of random commands
+			// leading to inconsistent state.
+			tc.rng.mu.Lock()
+			defer tc.rng.mu.Unlock()
+			if err := setMVCCStats(context.Background(), tc.rng.store.Engine(), tc.rng.RangeID, ms); err != nil {
+				t.Fatal(err)
+			}
+			tc.rng.mu.state.Stats = ms
+		}()
 		shouldQ, priority := gcQ.shouldQueue(now, tc.rng, cfg)
 		if shouldQ != test.shouldQ {
 			t.Errorf("%d: should queue expected %t; got %t", i, test.shouldQ, shouldQ)
@@ -162,6 +171,7 @@ func TestGCQueueProcess(t *testing.T) {
 
 	ts1 := makeTS(now-2*24*60*60*1E9+1, 0)                     // 2d old (add one nanosecond so we're not using zero timestamp)
 	ts2 := makeTS(now-25*60*60*1E9, 0)                         // GC will occur at time=25 hours
+	ts2m1 := ts2.Prev()                                        // ts2 - 1 so we have something not right at the GC time
 	ts3 := makeTS(now-intentAgeThreshold.Nanoseconds(), 0)     // 2h old
 	ts4 := makeTS(now-(intentAgeThreshold.Nanoseconds()-1), 0) // 2h-1ns old
 	ts5 := makeTS(now-1E9, 0)                                  // 1s old
@@ -174,20 +184,22 @@ func TestGCQueueProcess(t *testing.T) {
 	key7 := roachpb.Key("g")
 	key8 := roachpb.Key("h")
 	key9 := roachpb.Key("i")
+	key10 := roachpb.Key("j")
+	key11 := roachpb.Key("k")
 
 	data := []struct {
 		key roachpb.Key
-		ts  roachpb.Timestamp
+		ts  hlc.Timestamp
 		del bool
 		txn bool
 	}{
-		// For key1, we expect first two values to GC.
+		// For key1, we expect first value to GC.
 		{key1, ts1, false, false},
 		{key1, ts2, false, false},
 		{key1, ts5, false, false},
-		// For key2, we expect all values to GC, because most recent is deletion.
+		// For key2, we expect values to GC, even though most recent is deletion.
 		{key2, ts1, false, false},
-		{key2, ts2, false, false},
+		{key2, ts2m1, false, false}, // use a value < the GC time to verify it's kept
 		{key2, ts5, true, false},
 		// For key3, we expect just ts1 to GC, because most recent deletion is intent.
 		{key3, ts1, false, false},
@@ -198,7 +210,7 @@ func TestGCQueueProcess(t *testing.T) {
 		{key4, ts2, false, false},
 		// For key5, expect all values to GC (most recent value deleted).
 		{key5, ts1, false, false},
-		{key5, ts2, true, false},
+		{key5, ts2, true, false}, // deleted, so GC
 		// For key6, expect no values to GC because most recent value is intent.
 		{key6, ts1, false, false},
 		{key6, ts5, false, true},
@@ -209,7 +221,17 @@ func TestGCQueueProcess(t *testing.T) {
 		{key8, ts2, false, false},
 		{key8, ts3, true, true},
 		// For key9, resolve naked intent with no remaining values.
-		{key9, ts3, true, false},
+		{key9, ts3, false, true},
+		// For key10, GC ts1 because it's a delete but not ts3 because it's above the threshold.
+		{key10, ts1, true, false},
+		{key10, ts3, true, false},
+		{key10, ts4, false, false},
+		{key10, ts5, false, false},
+		// For key11, we can't GC anything because ts1 isn't a delete.
+		{key11, ts1, false, false},
+		{key11, ts3, true, false},
+		{key11, ts4, true, false},
+		{key11, ts5, true, false},
 	}
 
 	for i, datum := range data {
@@ -217,7 +239,7 @@ func TestGCQueueProcess(t *testing.T) {
 			dArgs := deleteArgs(datum.key)
 			var txn *roachpb.Transaction
 			if datum.txn {
-				txn = newTransaction("test", datum.key, 1, roachpb.SERIALIZABLE, tc.clock)
+				txn = newTransaction("test", datum.key, 1, enginepb.SERIALIZABLE, tc.clock)
 				txn.OrigTimestamp = datum.ts
 				txn.Timestamp = datum.ts
 			}
@@ -231,7 +253,7 @@ func TestGCQueueProcess(t *testing.T) {
 			pArgs := putArgs(datum.key, []byte("value"))
 			var txn *roachpb.Transaction
 			if datum.txn {
-				txn = newTransaction("test", datum.key, 1, roachpb.SERIALIZABLE, tc.clock)
+				txn = newTransaction("test", datum.key, 1, enginepb.SERIALIZABLE, tc.clock)
 				txn.OrigTimestamp = datum.ts
 				txn.Timestamp = datum.ts
 			}
@@ -250,27 +272,37 @@ func TestGCQueueProcess(t *testing.T) {
 	}
 
 	// Process through a scan queue.
-	gcQ := newGCQueue(tc.gossip)
-	if err := gcQ.process(tc.clock.Now(), tc.rng, cfg); err != nil {
+	gcQ := newGCQueue(tc.store, tc.gossip)
+	if err := gcQ.process(context.Background(), tc.clock.Now(), tc.rng, cfg); err != nil {
 		t.Fatal(err)
 	}
 
 	expKVs := []struct {
 		key roachpb.Key
-		ts  roachpb.Timestamp
+		ts  hlc.Timestamp
 	}{
 		{key1, ts5},
-		{key3, roachpb.ZeroTimestamp},
+		{key1, ts2},
+		{key2, ts5},
+		{key2, ts2m1},
+		{key3, hlc.ZeroTimestamp},
 		{key3, ts5},
 		{key3, ts2},
 		{key4, ts2},
-		{key6, roachpb.ZeroTimestamp},
+		{key6, hlc.ZeroTimestamp},
 		{key6, ts5},
 		{key6, ts1},
-		{key7, roachpb.ZeroTimestamp},
+		{key7, hlc.ZeroTimestamp},
 		{key7, ts4},
 		{key7, ts2},
 		{key8, ts2},
+		{key10, ts5},
+		{key10, ts4},
+		{key10, ts3},
+		{key11, ts5},
+		{key11, ts4},
+		{key11, ts3},
+		{key11, ts1},
 	}
 	// Read data directly from engine to avoid intent errors from MVCC.
 	kvs, err := engine.Scan(tc.store.Engine(), engine.MakeMVCCMetadataKey(key1),
@@ -280,7 +312,7 @@ func TestGCQueueProcess(t *testing.T) {
 	}
 	for i, kv := range kvs {
 		if log.V(1) {
-			log.Infof("%d: %s", i, kv.Key)
+			log.Infof(context.Background(), "%d: %s", i, kv.Key)
 		}
 	}
 	if len(kvs) != len(expKVs) {
@@ -294,7 +326,7 @@ func TestGCQueueProcess(t *testing.T) {
 			t.Errorf("%d: expected ts=%s; got %s", i, expKVs[i].ts, kv.Key.Timestamp)
 		}
 		if log.V(1) {
-			log.Infof("%d: %s", i, kv.Key)
+			log.Infof(context.Background(), "%d: %s", i, kv.Key)
 		}
 	}
 
@@ -417,7 +449,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 				// We've special cased one test case. Note that the intent is still
 				// counted in `resolved`.
 				if testCases[id].failResolve {
-					return roachpb.NewErrorWithTxn(util.Errorf("boom"), filterArgs.Hdr.Txn)
+					return roachpb.NewErrorWithTxn(errors.Errorf("boom"), filterArgs.Hdr.Txn)
 				}
 			}
 			return nil
@@ -433,19 +465,19 @@ func TestGCQueueTransactionTable(t *testing.T) {
 	for strKey, test := range testCases {
 		baseKey := roachpb.Key(strKey)
 		txnClock := hlc.NewClock(hlc.NewManualClock(int64(test.orig)).UnixNano)
-		txn := newTransaction("txn1", baseKey, 1, roachpb.SERIALIZABLE, txnClock)
+		txn := newTransaction("txn1", baseKey, 1, enginepb.SERIALIZABLE, txnClock)
 		txn.Status = test.status
 		txn.Intents = testIntents
 		if test.hb > 0 {
-			txn.LastHeartbeat = &roachpb.Timestamp{WallTime: int64(test.hb)}
+			txn.LastHeartbeat = &hlc.Timestamp{WallTime: int64(test.hb)}
 		}
 		// Set a high Timestamp to make sure it does not matter. Only
 		// OrigTimestamp (and heartbeat) are used for GC decisions.
-		txn.Timestamp.Forward(roachpb.MaxTimestamp)
+		txn.Timestamp.Forward(hlc.MaxTimestamp)
 		txns[strKey] = *txn
 		for _, addrKey := range []roachpb.Key{baseKey, outsideKey} {
 			key := keys.TransactionKey(addrKey, txn.ID)
-			if err := engine.MVCCPutProto(context.Background(), tc.engine, nil, key, roachpb.ZeroTimestamp, nil, txn); err != nil {
+			if err := engine.MVCCPutProto(context.Background(), tc.engine, nil, key, hlc.ZeroTimestamp, nil, txn); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -456,13 +488,13 @@ func TestGCQueueTransactionTable(t *testing.T) {
 	}
 
 	// Run GC.
-	gcQ := newGCQueue(tc.gossip)
+	gcQ := newGCQueue(tc.store, tc.gossip)
 	cfg, ok := tc.gossip.GetSystemConfig()
 	if !ok {
 		t.Fatal("config not set")
 	}
 
-	if err := gcQ.process(tc.clock.Now(), tc.rng, cfg); err != nil {
+	if err := gcQ.process(context.Background(), tc.clock.Now(), tc.rng, cfg); err != nil {
 		t.Fatal(err)
 	}
 
@@ -470,7 +502,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 		for strKey, sp := range testCases {
 			txn := &roachpb.Transaction{}
 			key := keys.TransactionKey(roachpb.Key(strKey), txns[strKey].ID)
-			ok, err := engine.MVCCGetProto(context.Background(), tc.engine, key, roachpb.ZeroTimestamp, true, nil, txn)
+			ok, err := engine.MVCCGetProto(context.Background(), tc.engine, key, hlc.ZeroTimestamp, true, nil, txn)
 			if err != nil {
 				return err
 			}
@@ -494,7 +526,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if (abortExists == false) != sp.expAbortGC {
+			if abortExists == sp.expAbortGC {
 				return fmt.Errorf("%s: expected abort cache gc: %t, found %+v", strKey, sp.expAbortGC, entry)
 			}
 		}
@@ -504,7 +536,7 @@ func TestGCQueueTransactionTable(t *testing.T) {
 	outsideTxnPrefix := keys.TransactionKey(outsideKey, uuid.EmptyUUID)
 	outsideTxnPrefixEnd := keys.TransactionKey(outsideKey.Next(), uuid.EmptyUUID)
 	var count int
-	if _, err := engine.MVCCIterate(context.Background(), tc.store.Engine(), outsideTxnPrefix, outsideTxnPrefixEnd, roachpb.ZeroTimestamp,
+	if _, err := engine.MVCCIterate(context.Background(), tc.store.Engine(), outsideTxnPrefix, outsideTxnPrefixEnd, hlc.ZeroTimestamp,
 		true, nil, false, func(roachpb.KeyValue) (bool, error) {
 			count++
 			return false, nil
@@ -529,8 +561,8 @@ func TestGCQueueIntentResolution(t *testing.T) {
 	tc.manualClock.Set(now)
 
 	txns := []*roachpb.Transaction{
-		newTransaction("txn1", roachpb.Key("0-00000"), 1, roachpb.SERIALIZABLE, tc.clock),
-		newTransaction("txn2", roachpb.Key("1-00000"), 1, roachpb.SERIALIZABLE, tc.clock),
+		newTransaction("txn1", roachpb.Key("0-00000"), 1, enginepb.SERIALIZABLE, tc.clock),
+		newTransaction("txn2", roachpb.Key("1-00000"), 1, enginepb.SERIALIZABLE, tc.clock),
 	}
 	intentResolveTS := makeTS(now-intentAgeThreshold.Nanoseconds(), 0)
 	txns[0].OrigTimestamp = intentResolveTS
@@ -559,13 +591,13 @@ func TestGCQueueIntentResolution(t *testing.T) {
 	}
 
 	// Process through a scan queue.
-	gcQ := newGCQueue(tc.gossip)
-	if err := gcQ.process(tc.clock.Now(), tc.rng, cfg); err != nil {
+	gcQ := newGCQueue(tc.store, tc.gossip)
+	if err := gcQ.process(context.Background(), tc.clock.Now(), tc.rng, cfg); err != nil {
 		t.Fatal(err)
 	}
 
 	// Iterate through all values to ensure intents have been fully resolved.
-	meta := &engine.MVCCMetadata{}
+	meta := &enginepb.MVCCMetadata{}
 	err := tc.store.Engine().Iterate(engine.MakeMVCCMetadataKey(roachpb.KeyMin),
 		engine.MakeMVCCMetadataKey(roachpb.KeyMax), func(kv engine.MVCCKeyValue) (bool, error) {
 			if !kv.Key.IsValue() {
@@ -573,7 +605,7 @@ func TestGCQueueIntentResolution(t *testing.T) {
 					return false, err
 				}
 				if meta.Txn != nil {
-					return false, util.Errorf("non-nil Txn after GC for key %s", kv.Key)
+					return false, errors.Errorf("non-nil Txn after GC for key %s", kv.Key)
 				}
 			}
 			return false, nil

@@ -20,8 +20,12 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/client"
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/sql/parser"
+	"github.com/cockroachdb/cockroach/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/util/encoding"
 	"github.com/opentracing/basictracer-go"
 	"github.com/opentracing/opentracing-go"
 )
@@ -32,6 +36,7 @@ type explainTraceNode struct {
 	plan planNode
 	txn  *client.Txn
 	// Internal state, not to be initialized.
+	earliest  time.Time
 	exhausted bool
 	rows      []parser.DTuple
 	lastTS    time.Time
@@ -46,31 +51,55 @@ var traceColumns = append([]ResultColumn{
 	{Name: "Event", Typ: parser.TypeString},
 }, debugColumns...)
 
+var traceOrdering = sqlbase.ColumnOrdering{
+	{ColIdx: len(traceColumns), Direction: encoding.Ascending}, /* Start time */
+	{ColIdx: 2, Direction: encoding.Ascending},                 /* Span pos */
+}
+
+func makeTraceNode(plan planNode, txn *client.Txn) planNode {
+	return &selectTopNode{
+		source: &explainTraceNode{
+			plan: plan,
+			txn:  txn,
+		},
+		sort: &sortNode{
+			// Don't use the planner context: this sort node is sorting the
+			// trace events themselves; we don't want any events from this sort
+			// node to show up in the EXPLAIN TRACE output.
+			ctx:      context.Background(),
+			ordering: traceOrdering,
+			columns:  traceColumns,
+		},
+	}
+}
+
 func (*explainTraceNode) Columns() []ResultColumn { return traceColumns }
 func (*explainTraceNode) Ordering() orderingInfo  { return orderingInfo{} }
 
-func (n *explainTraceNode) Err() error { return nil }
 func (n *explainTraceNode) expandPlan() error {
 	if err := n.plan.expandPlan(); err != nil {
 		return err
 	}
+
 	n.plan.MarkDebug(explainDebug)
 	return nil
 }
+
 func (n *explainTraceNode) Start() error { return n.plan.Start() }
 
-func (n *explainTraceNode) Next() bool {
+func (n *explainTraceNode) Next() (bool, error) {
 	first := n.rows == nil
 	if first {
 		n.rows = []parser.DTuple{}
 	}
 	for !n.exhausted && len(n.rows) <= 1 {
 		var vals debugValues
-		if !n.plan.Next() {
+		if next, err := n.plan.Next(); !next {
 			n.exhausted = true
 			sp := opentracing.SpanFromContext(n.txn.Context)
-			if err := n.Err(); err != nil {
+			if err != nil {
 				sp.LogEvent(err.Error())
+				return false, err
 			}
 			sp.LogEvent("tracing completed")
 			sp.Finish()
@@ -83,8 +112,7 @@ func (n *explainTraceNode) Next() bool {
 		if len(n.txn.CollectedSpans) == 0 {
 			if !n.exhausted {
 				n.txn.CollectedSpans = append(n.txn.CollectedSpans, basictracer.RawSpan{
-					Context: basictracer.Context{},
-					Logs:    []opentracing.LogData{{Timestamp: n.lastTS}},
+					Logs: []opentracing.LogData{{Timestamp: n.lastTS}},
 				})
 			}
 			basePos = n.lastPos + 1
@@ -94,18 +122,18 @@ func (n *explainTraceNode) Next() bool {
 		var earliest time.Time
 		for _, sp := range n.txn.CollectedSpans {
 			for _, entry := range sp.Logs {
-				if earliest.IsZero() || entry.Timestamp.Before(earliest) {
-					earliest = entry.Timestamp
+				if n.earliest.IsZero() || entry.Timestamp.Before(earliest) {
+					n.earliest = entry.Timestamp
 				}
 			}
 		}
 
 		for _, sp := range n.txn.CollectedSpans {
 			for i, entry := range sp.Logs {
-				commulativeDuration := fmt.Sprintf("%.3fms", time.Duration(entry.Timestamp.Sub(earliest)).Seconds()*1000)
+				commulativeDuration := fmt.Sprintf("%.3fms", entry.Timestamp.Sub(n.earliest).Seconds()*1000)
 				var duration string
 				if i > 0 {
-					duration = fmt.Sprintf("%.3fms", time.Duration(entry.Timestamp.Sub(n.lastTS)).Seconds()*1000)
+					duration = fmt.Sprintf("%.3fms", entry.Timestamp.Sub(n.lastTS).Seconds()*1000)
 				}
 				cols := append(parser.DTuple{
 					parser.NewDString(commulativeDuration),
@@ -116,7 +144,7 @@ func (n *explainTraceNode) Next() bool {
 				}, vals.AsRow()...)
 
 				// Timestamp is added for sorting, but will be removed after sort.
-				n.rows = append(n.rows, append(cols, &parser.DTimestamp{Time: entry.Timestamp}))
+				n.rows = append(n.rows, append(cols, parser.MakeDTimestamp(entry.Timestamp, time.Nanosecond)))
 				n.lastTS, n.lastPos = entry.Timestamp, i
 			}
 		}
@@ -124,33 +152,25 @@ func (n *explainTraceNode) Next() bool {
 	}
 
 	if first {
-		return len(n.rows) > 0
+		return len(n.rows) > 0, nil
 	}
 	if len(n.rows) <= 1 {
-		return false
+		return false, nil
 	}
 	n.rows = n.rows[1:]
-	return true
+	return true, nil
 }
 
 func (n *explainTraceNode) ExplainPlan(v bool) (name, description string, children []planNode) {
-	return n.plan.ExplainPlan(v)
+	return "explain", "trace", []planNode{n.plan}
 }
 
-func (n *explainTraceNode) ExplainTypes(fn func(string, string)) {
-	n.plan.ExplainTypes(fn)
-}
+func (n *explainTraceNode) ExplainTypes(fn func(string, string)) {}
 
 func (n *explainTraceNode) Values() parser.DTuple {
 	return n.rows[0]
 }
 
-func (*explainTraceNode) MarkDebug(_ explainMode) {
-	panic("debug mode not implemented in explainDebugNode")
-}
-
-func (*explainTraceNode) DebugValues() debugValues {
-	panic("debug mode not implemented in explainTraceNode")
-}
-
+func (*explainTraceNode) MarkDebug(_ explainMode)      {}
+func (*explainTraceNode) DebugValues() debugValues     { return debugValues{} }
 func (*explainTraceNode) SetLimitHint(_ int64, _ bool) {}

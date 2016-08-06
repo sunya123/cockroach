@@ -20,6 +20,7 @@ option go_package = "roachpb";
 
 import "cockroach/roachpb/metadata.proto";
 import "cockroach/roachpb/data.proto";
+import "cockroach/util/hlc/timestamp.proto";
 import weak "gogoproto/gogo.proto";
 
 // Issue #1246. Commented out because
@@ -28,11 +29,14 @@ import weak "gogoproto/gogo.proto";
 // `String() string`.
 // option (gogoproto.goproto_stringer_all) = false;
 
-// A NotLeaderError indicates that the current range is not the
-// leader. If the leader is known, its Replica is set in the error.
-message NotLeaderError {
-  optional ReplicaDescriptor replica = 1;
-  optional ReplicaDescriptor leader = 2;
+// A NotLeaseHolderError indicates that the current range is not the lease
+// holder. If the lease holder is known, its Replica is set in the error.
+message NotLeaseHolderError {
+  // The replica the error originated from. Used in the error's string
+  // representation.
+  optional ReplicaDescriptor replica = 1 [(gogoproto.nullable) = false];
+  // The lease holder, if known.
+  optional ReplicaDescriptor lease_holder = 2;
   optional int64 range_id = 3 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "RangeID", (gogoproto.casttype) = "RangeID"];
 }
@@ -64,13 +68,13 @@ message RangeKeyMismatchError {
   //   it was sent to was not able to find a corresponding range that
   //   fully contained the request. If no range contains the request's
   //   start key, mismatched_range will be nil. If a range contains the
-  //   request's start key but the request spans multiple ranges, 
+  //   request's start key but the request spans multiple ranges,
   //   mismatched_range will be the descriptor of the range which contains
   //   the start_key of the request.
   optional RangeDescriptor mismatched_range = 3;
   // suggested_range is a hint to the sender of a command about the range
-  // they may be looking for. This suggestion should be the result of a 
-  // best effort lookup, and makes no guarantees about correctness. 
+  // they may be looking for. This suggestion should be the result of a
+  // best effort lookup, and makes no guarantees about correctness.
   optional RangeDescriptor suggested_range = 4;
 }
 
@@ -87,8 +91,8 @@ message RangeFrozenError {
 // lower bound for a new timestamp at which at least the read producing
 // this error would succeed on retry.
 message ReadWithinUncertaintyIntervalError {
-  optional Timestamp read_timestamp = 1 [(gogoproto.nullable) = false];
-  optional Timestamp existing_timestamp = 2 [(gogoproto.nullable) = false];
+  optional util.hlc.Timestamp read_timestamp = 1 [(gogoproto.nullable) = false];
+  optional util.hlc.Timestamp existing_timestamp = 2 [(gogoproto.nullable) = false];
 }
 
 // A TransactionAbortedError indicates that the transaction was
@@ -143,8 +147,8 @@ message WriteIntentError {
 // history. The write is instead done at actual timestamp, which is
 // the timestamp of the existing version+1.
 message WriteTooOldError {
-  optional Timestamp timestamp = 1 [(gogoproto.nullable) = false];
-  optional Timestamp actual_timestamp = 2 [(gogoproto.nullable) = false];
+  optional util.hlc.Timestamp timestamp = 1 [(gogoproto.nullable) = false];
+  optional util.hlc.Timestamp actual_timestamp = 2 [(gogoproto.nullable) = false];
 }
 
 // An OpRequiresTxnError indicates that a command required to be
@@ -163,7 +167,7 @@ message ConditionFailedError {
 }
 
 // A LeaseRejectedError indicates that the requested replica could
-// not acquire the desired lease because of an existing leader lease.
+// not acquire the desired lease because of an existing range lease.
 message LeaseRejectedError {
   optional string message = 1 [(gogoproto.nullable) = false];
   optional Lease requested = 2 [(gogoproto.nullable) = false];
@@ -195,7 +199,7 @@ message ReplicaCorruptionError {
 message ErrorDetail {
   option (gogoproto.onlyone) = true;
 
-  optional NotLeaderError not_leader = 1;
+  optional NotLeaseHolderError not_lease_holder = 1;
   optional RangeNotFoundError range_not_found = 2;
   optional RangeKeyMismatchError range_key_mismatch = 3;
   optional ReadWithinUncertaintyIntervalError read_within_uncertainty_interval = 4;
@@ -273,7 +277,7 @@ message Error {
 
   // now is the current time at the node sending the response,
   // which can be used by the receiver to update its local HLC.
-  optional Timestamp now = 8 [(gogoproto.nullable) = false];
+  optional util.hlc.Timestamp now = 8 [(gogoproto.nullable) = false];
 
   reserved 2;
 }

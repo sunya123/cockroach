@@ -20,19 +20,18 @@ import (
 	"fmt"
 	"io/ioutil"
 	"math"
-	"net/url"
-	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"golang.org/x/net/context"
 
 	"github.com/dustin/go-humanize"
 	"github.com/elastic/gosigar"
 
 	"github.com/cockroachdb/cockroach/base"
-	"github.com/cockroachdb/cockroach/cli/cliflags"
 	"github.com/cockroachdb/cockroach/gossip/resolver"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage/engine"
@@ -45,38 +44,33 @@ import (
 // Context defaults.
 const (
 	defaultCGroupMemPath = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
-	defaultAddr          = ":" + base.DefaultPort
-	defaultHTTPAddr      = ":" + base.DefaultHTTPPort
 	defaultMaxOffset     = 250 * time.Millisecond
 	defaultCacheSize     = 512 << 20 // 512 MB
 	// defaultMemtableBudget controls how much memory can be used for memory
-	// tables. The way we initialize RocksDB, 150% (24 MB) of this setting can be
-	// used for memory tables and each memory table will be 25% of the size (4
+	// tables. The way we initialize RocksDB, 100% (32 MB) of this setting can be
+	// used for memory tables and each memory table will be 25% of the size (8
 	// MB). This corresponds to the default RocksDB memtable size. Note that
 	// larger values do not necessarily improve performance, so benchmark any
 	// changes to this value.
-	defaultMemtableBudget           = 16 << 20 // 16 MB
+	defaultMemtableBudget           = 32 << 20 // 32 MB
 	defaultScanInterval             = 10 * time.Minute
 	defaultConsistencyCheckInterval = 24 * time.Hour
 	defaultScanMaxIdleTime          = 5 * time.Second
 	defaultMetricsSampleInterval    = 10 * time.Second
 	defaultTimeUntilStoreDead       = 5 * time.Minute
+	defaultStorePath                = "cockroach-data"
+	defaultReservationsEnabled      = true
+
+	minimumNetworkFileDescriptors     = 256
+	recommendedNetworkFileDescriptors = 5000
+
+	productionSettingsWebpage = "please see https://www.cockroachlabs.com/docs/recommended-production-settings.html for more details"
 )
 
 // Context holds parameters needed to setup a server.
-// Calling "cli".initFlags(ctx *Context) will initialize Context using
-// command flags. Keep in sync with "cli/flags.go".
 type Context struct {
 	// Embed the base context.
-	base.Context
-
-	// Addr is the host:port to bind.
-	Addr string
-
-	// HTTPAddr is the host:port to bind for HTTP requests. This is temporary,
-	// and will be removed when grpc.(*Server).ServeHTTP performance problems are
-	// addressed upstream. See https://github.com/grpc/grpc-go/issues/586.
-	HTTPAddr string
+	*base.Context
 
 	// Unix socket: for postgres only.
 	SocketFile string
@@ -89,9 +83,10 @@ type Context struct {
 	// in zone configs.
 	Attrs string
 
-	// JoinUsing is a comma-separated list of node addresses that
-	// act as bootstrap hosts for connecting to the gossip network.
-	JoinUsing string
+	// JoinList is a list of node addresses that act as bootstrap hosts for
+	// connecting to the gossip network. Each item in the list can actually be
+	// multiple comma-separated addresses, kept for backward-compatibility.
+	JoinList JoinListType
 
 	// CacheSize is the amount of memory in bytes to use for caching data.
 	// The value is split evenly between the stores if there are more than one.
@@ -127,6 +122,9 @@ type Context struct {
 	// Environment Variable: COCKROACH_MAX_OFFSET
 	MaxOffset time.Duration
 
+	// RaftTickInterval is the resolution of the Raft timer.
+	RaftTickInterval time.Duration
+
 	// MetricsSamplePeriod determines the time between records of
 	// server internal metrics.
 	// Environment Variable: COCKROACH_METRICS_SAMPLE_INTERVAL
@@ -156,6 +154,10 @@ type Context struct {
 	// Environment Variable: COCKROACH_TIME_UNTIL_STORE_DEAD
 	TimeUntilStoreDead time.Duration
 
+	// ReservationsEnabled is a switch used to enable the add replica
+	// reservation system.
+	ReservationsEnabled bool
+
 	// TestingKnobs is used for internal test controls only.
 	TestingKnobs base.TestingKnobs
 }
@@ -177,7 +179,7 @@ func GetTotalMemory() (int64, error) {
 		var buf []byte
 		if buf, err = ioutil.ReadFile(defaultCGroupMemPath); err != nil {
 			if log.V(1) {
-				log.Infof("can't read available memory from cgroups (%s), using system memory %s instead", err,
+				log.Infof(context.TODO(), "can't read available memory from cgroups (%s), using system memory %s instead", err,
 					humanizeutil.IBytes(totalMem))
 			}
 			return totalMem, nil
@@ -185,14 +187,14 @@ func GetTotalMemory() (int64, error) {
 		var cgAvlMem uint64
 		if cgAvlMem, err = strconv.ParseUint(strings.TrimSpace(string(buf)), 10, 64); err != nil {
 			if log.V(1) {
-				log.Infof("can't parse available memory from cgroups (%s), using system memory %s instead", err,
+				log.Infof(context.TODO(), "can't parse available memory from cgroups (%s), using system memory %s instead", err,
 					humanizeutil.IBytes(totalMem))
 			}
 			return totalMem, nil
 		}
 		if cgAvlMem > math.MaxInt64 {
 			if log.V(1) {
-				log.Infof("available memory from cgroups is too large and unsupported %s using system memory %s instead",
+				log.Infof(context.TODO(), "available memory from cgroups is too large and unsupported %s using system memory %s instead",
 					humanize.IBytes(cgAvlMem), humanizeutil.IBytes(totalMem))
 
 			}
@@ -200,7 +202,7 @@ func GetTotalMemory() (int64, error) {
 		}
 		if cgAvlMem > mem.Total {
 			if log.V(1) {
-				log.Infof("available memory from cgroups %s exceeds system memory %s, using system memory",
+				log.Infof(context.TODO(), "available memory from cgroups %s exceeds system memory %s, using system memory",
 					humanize.IBytes(cgAvlMem), humanizeutil.IBytes(totalMem))
 			}
 			return totalMem, nil
@@ -211,40 +213,149 @@ func GetTotalMemory() (int64, error) {
 	return totalMem, nil
 }
 
-// NewContext returns a Context with default values.
-func NewContext() *Context {
-	ctx := &Context{}
-	ctx.InitDefaults()
-	return ctx
+// setOpenFileLimit sets the soft limit for open file descriptors to the hard
+// limit if needed. Returns an error if the hard limit is too low. Returns the
+// value to set maxOpenFiles to for each store.
+// Minimum - 256 per store, 256 saved for networking
+// Constrained - 256 saved for networking, rest divided evenly per store
+// Constrained (network only) - 5000 per store, rest saved for networking
+// Recommended - 5000 per store, 5000 for network
+// Also, please note that current and max limits are commonly referred to as
+// the soft and hard limits respectively.
+func setOpenFileLimit(physicalStoreCount int) (int, error) {
+	minimumOpenFileLimit := uint64(physicalStoreCount*engine.MinimumMaxOpenFiles + minimumNetworkFileDescriptors)
+	networkConstrainedFileLimit := uint64(physicalStoreCount*engine.DefaultMaxOpenFiles + minimumNetworkFileDescriptors)
+	recommendedOpenFileLimit := uint64(physicalStoreCount*engine.DefaultMaxOpenFiles + recommendedNetworkFileDescriptors)
+	// TODO(bram): Test this out on windows.
+	var rLimit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
+		if log.V(1) {
+			log.Infof(context.TODO(), "could not get rlimit; setting maxOpenFiles to the default value %d - %s", engine.DefaultMaxOpenFiles, err)
+		}
+		return engine.DefaultMaxOpenFiles, nil
+	}
+
+	// The max open file descriptor limit is too low.
+	if rLimit.Max < minimumOpenFileLimit {
+		return 0, fmt.Errorf("hard open file descriptor limit of %d is under the minimum required %d\n%s",
+			rLimit.Max,
+			minimumOpenFileLimit,
+			productionSettingsWebpage)
+	}
+
+	// If current open file descriptor limit is higher than the recommended
+	// value, we can just use the default value.
+	if rLimit.Cur > recommendedOpenFileLimit {
+		return engine.DefaultMaxOpenFiles, nil
+	}
+
+	// If the current limit is less than the recommended limit, set the current
+	// limit to the minimum of the max limit or the recommendedOpenFileLimit.
+	var newCurrent uint64
+	if rLimit.Max > recommendedOpenFileLimit {
+		newCurrent = recommendedOpenFileLimit
+	} else {
+		newCurrent = rLimit.Max
+	}
+	if rLimit.Cur < newCurrent {
+		if log.V(1) {
+			log.Infof(context.TODO(), "setting the soft limit for open file descriptors from %d to %d",
+				rLimit.Cur, newCurrent)
+		}
+		rLimit.Cur = newCurrent
+		if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
+			return 0, err
+		}
+		// Sadly, the current limit is not always set as expected, (e.g. OSX)
+		// so fetch the limit again to see the new current limit.
+		if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
+			return 0, err
+		}
+		if log.V(1) {
+			log.Infof(context.TODO(), "soft open file descriptor limit is now %d", rLimit.Cur)
+		}
+	}
+
+	// The current open file descriptor limit is still too low.
+	if rLimit.Cur < minimumOpenFileLimit {
+		return 0, fmt.Errorf("soft open file descriptor limit of %d is under the minimum required %d and cannot be increased\n%s",
+			rLimit.Cur,
+			minimumOpenFileLimit,
+			productionSettingsWebpage)
+	}
+
+	// If we have the desired number, just use the default values.
+	if rLimit.Cur >= recommendedOpenFileLimit {
+		return engine.DefaultMaxOpenFiles, nil
+	}
+
+	// We're still below the recommended amount, we should always show a
+	// warning.
+	log.Warningf(context.TODO(), "soft open file descriptor limit %d is under the recommended limit %d; this may decrease performance\n%s",
+		rLimit.Cur,
+		recommendedOpenFileLimit,
+		productionSettingsWebpage)
+
+	// if we have no physical stores, return 0.
+	if physicalStoreCount == 0 {
+		return 0, nil
+	}
+
+	// If we have more than enough file descriptors to hit the recommend number
+	// for each store, than only constrain the network ones by giving the stores
+	// their full recommended number.
+	if rLimit.Cur >= networkConstrainedFileLimit {
+		return engine.DefaultMaxOpenFiles, nil
+	}
+
+	// Always sacrifice all but the minimum needed network descriptors to be
+	// used by the stores.
+	return int(rLimit.Cur-minimumNetworkFileDescriptors) / physicalStoreCount, nil
 }
 
-// InitDefaults sets up the default values for a Context.
-//
-// Note: This method should only perform simple initialization of fields
-// because it is called very early in the lifetime of a cockroach process at
-// which point we do not know if we are initializing a server or using the
-// cli. Do not call any functions which could log or error. In fact, it is best
-// if you don't call any other functions at all.
-func (ctx *Context) InitDefaults() {
+// SetOpenFileLimitForOneStore sets the soft limit for open file descriptors
+// when there is only one store.
+func SetOpenFileLimitForOneStore() (int, error) {
+	return setOpenFileLimit(1)
+}
+
+// MakeContext returns a Context with default values.
+func MakeContext() Context {
+	ctx := Context{
+		Context:                  new(base.Context),
+		MaxOffset:                defaultMaxOffset,
+		CacheSize:                defaultCacheSize,
+		MemtableBudget:           defaultMemtableBudget,
+		ScanInterval:             defaultScanInterval,
+		ScanMaxIdleTime:          defaultScanMaxIdleTime,
+		ConsistencyCheckInterval: defaultConsistencyCheckInterval,
+		MetricsSampleInterval:    defaultMetricsSampleInterval,
+		TimeUntilStoreDead:       defaultTimeUntilStoreDead,
+		ReservationsEnabled:      defaultReservationsEnabled,
+		Stores: StoreSpecList{
+			Specs: []StoreSpec{{Path: defaultStorePath}},
+		},
+	}
 	ctx.Context.InitDefaults()
-	ctx.Addr = defaultAddr
-	ctx.HTTPAddr = defaultHTTPAddr
-	ctx.MaxOffset = defaultMaxOffset
-	ctx.CacheSize = defaultCacheSize
-	ctx.MemtableBudget = defaultMemtableBudget
-	ctx.ScanInterval = defaultScanInterval
-	ctx.ScanMaxIdleTime = defaultScanMaxIdleTime
-	ctx.ConsistencyCheckInterval = defaultConsistencyCheckInterval
-	ctx.MetricsSampleInterval = defaultMetricsSampleInterval
-	ctx.TimeUntilStoreDead = defaultTimeUntilStoreDead
-	ctx.Stores.Specs = append(ctx.Stores.Specs, StoreSpec{Path: "cockroach-data"})
+	return ctx
 }
 
 // InitStores initializes ctx.Engines based on ctx.Stores.
 func (ctx *Context) InitStores(stopper *stop.Stopper) error {
-	// TODO(peter): The comments and docs say that CacheSize and MemtableBudget
-	// are split evenly if there are multiple stores, but we aren't doing that
-	// currently. See #4979 and #4980.
+	cache := engine.NewRocksDBCache(ctx.CacheSize)
+	defer cache.Release()
+
+	var physicalStores int
+	for _, spec := range ctx.Stores.Specs {
+		if !spec.InMemory {
+			physicalStores++
+		}
+	}
+	openFileLimitPerStore, err := setOpenFileLimit(physicalStores)
+	if err != nil {
+		return err
+	}
+
 	for _, spec := range ctx.Stores.Specs {
 		var sizeInBytes = spec.SizeInBytes
 		if spec.InMemory {
@@ -272,14 +383,25 @@ func (ctx *Context) InitStores(stopper *stop.Stopper) error {
 				return fmt.Errorf("%f%% of %s's total free space is only %s bytes, which is below the minimum requirement of %s",
 					spec.SizePercent, spec.Path, humanizeutil.IBytes(sizeInBytes), humanizeutil.IBytes(minimumStoreSize))
 			}
-			ctx.Engines = append(ctx.Engines, engine.NewRocksDB(spec.Attributes, spec.Path,
-				ctx.CacheSize/int64(len(ctx.Stores.Specs)), ctx.MemtableBudget, sizeInBytes, stopper))
+			ctx.Engines = append(
+				ctx.Engines,
+				engine.NewRocksDB(
+					spec.Attributes,
+					spec.Path,
+					cache,
+					ctx.MemtableBudget,
+					sizeInBytes,
+					openFileLimitPerStore,
+					stopper,
+				),
+			)
 		}
 	}
+
 	if len(ctx.Engines) == 1 {
-		log.Infof("1 storage engine initialized")
+		log.Infof(context.TODO(), "1 storage engine initialized")
 	} else {
-		log.Infof("%d storage engines initialized", len(ctx.Engines))
+		log.Infof(context.TODO(), "%d storage engines initialized", len(ctx.Engines))
 	}
 	return nil
 }
@@ -317,72 +439,26 @@ func (ctx *Context) readEnvironmentVariables() {
 	ctx.ScanMaxIdleTime = envutil.EnvOrDefaultDuration("scan_max_idle_time", ctx.ScanMaxIdleTime)
 	ctx.TimeUntilStoreDead = envutil.EnvOrDefaultDuration("time_until_store_dead", ctx.TimeUntilStoreDead)
 	ctx.ConsistencyCheckInterval = envutil.EnvOrDefaultDuration("consistency_check_interval", ctx.ConsistencyCheckInterval)
+	// TODO(bram): remove ReservationsEnabled once we've completed testing the
+	// feature.
+	ctx.ReservationsEnabled = envutil.EnvOrDefaultBool("reservations_enabled", ctx.ReservationsEnabled)
 }
 
-// AdminURL returns the URL for the admin UI.
-func (ctx *Context) AdminURL() string {
-	return fmt.Sprintf("%s://%s", ctx.HTTPRequestScheme(), ctx.HTTPAddr)
-}
-
-// PGURL returns the URL for the postgres endpoint.
-func (ctx *Context) PGURL(user string) (*url.URL, error) {
-	// Try to convert path to an absolute path. Failing to do so return path
-	// unchanged.
-	absPath := func(path string) string {
-		r, err := filepath.Abs(path)
-		if err != nil {
-			return path
-		}
-		return r
-	}
-
-	options := url.Values{}
-	if ctx.Insecure {
-		options.Add("sslmode", "disable")
-	} else {
-		options.Add("sslmode", "verify-full")
-		requiredFlags := []struct {
-			name     string
-			value    string
-			flagName string
-		}{
-			{"sslcert", ctx.SSLCert, cliflags.CertName},
-			{"sslkey", ctx.SSLCertKey, cliflags.KeyName},
-			{"sslrootcert", ctx.SSLCA, cliflags.CACertName},
-		}
-		for _, c := range requiredFlags {
-			if c.value == "" {
-				return nil, fmt.Errorf("missing --%s flag", c.flagName)
-			}
-			path := absPath(c.value)
-			if _, err := os.Stat(path); err != nil {
-				return nil, fmt.Errorf("file for --%s flag gave error: %v", c.flagName, err)
-			}
-			options.Add(c.name, path)
-		}
-	}
-	return &url.URL{
-		Scheme:   "postgresql",
-		User:     url.User(user),
-		Host:     ctx.Addr,
-		RawQuery: options.Encode(),
-	}, nil
-}
-
-// parseGossipBootstrapResolvers parses a comma-separated list of
-// gossip bootstrap resolvers.
+// parseGossipBootstrapResolvers parses list of gossip bootstrap resolvers.
 func (ctx *Context) parseGossipBootstrapResolvers() ([]resolver.Resolver, error) {
 	var bootstrapResolvers []resolver.Resolver
-	addresses := strings.Split(ctx.JoinUsing, ",")
-	for _, address := range addresses {
-		if len(address) == 0 {
-			continue
+	for _, commaSeparatedAddresses := range ctx.JoinList {
+		addresses := strings.Split(commaSeparatedAddresses, ",")
+		for _, address := range addresses {
+			if len(address) == 0 {
+				continue
+			}
+			resolver, err := resolver.NewResolver(ctx.Context, address)
+			if err != nil {
+				return nil, err
+			}
+			bootstrapResolvers = append(bootstrapResolvers, resolver)
 		}
-		resolver, err := resolver.NewResolver(&ctx.Context, address)
-		if err != nil {
-			return nil, err
-		}
-		bootstrapResolvers = append(bootstrapResolvers, resolver)
 	}
 
 	return bootstrapResolvers, nil

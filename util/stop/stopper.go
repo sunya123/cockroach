@@ -24,8 +24,14 @@ import (
 	"strings"
 	"sync"
 
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util/caller"
+	"github.com/cockroachdb/cockroach/util/syncutil"
 )
+
+var errUnavailable = &roachpb.NodeUnavailableError{}
 
 func register(s *Stopper) {
 	trackedStoppers.Lock()
@@ -47,7 +53,7 @@ func unregister(s *Stopper) {
 }
 
 var trackedStoppers struct {
-	sync.Mutex
+	syncutil.Mutex
 	stoppers []*Stopper
 }
 
@@ -95,8 +101,8 @@ func (k taskKey) String() string {
 // through RunTask() and RunAsyncTask().
 //
 // Stopping occurs in two phases: the first is the request to stop, which moves
-// the stopper into a draining phase. While draining, calls to RunTask() &
-// RunAsyncTask() don't execute the function passed in and return false.
+// the stopper into a quiesceing phase. While quiesceing, calls to RunTask() &
+// RunAsyncTask() don't execute the function passed in and return errUnavailable.
 // When all outstanding tasks have been completed, the stopper
 // closes its stopper channel, which signals all live workers that it's safe to
 // shut down. When all workers have shutdown, the stopper is complete.
@@ -105,29 +111,70 @@ func (k taskKey) String() string {
 // be added to the stopper via AddCloser(), to be closed after the
 // stopper has stopped.
 type Stopper struct {
-	drainer  chan struct{}  // Closed when draining
-	stopper  chan struct{}  // Closed when stopping
-	stopped  chan struct{}  // Closed when stopped completely
-	stop     sync.WaitGroup // Incremented for outstanding workers
-	mu       sync.Mutex     // Protects the fields below
-	drain    *sync.Cond     // Conditional variable to wait for outstanding tasks
-	draining bool           // true when Stop() has been called
-	numTasks int            // number of outstanding tasks
-	tasks    map[taskKey]int
-	closers  []Closer
+	quiescer  chan struct{}     // Closed when quiesceing
+	stopper   chan struct{}     // Closed when stopping
+	stopped   chan struct{}     // Closed when stopped completely
+	onPanic   func(interface{}) // called with recover() on panic on any goroutine
+	stop      sync.WaitGroup    // Incremented for outstanding workers
+	mu        syncutil.Mutex    // Protects the fields below
+	quiesce   *sync.Cond        // Conditional variable to wait for outstanding tasks
+	quiescing bool              // true when Stop() has been called
+	numTasks  int               // number of outstanding tasks
+	tasks     map[taskKey]int
+	closers   []Closer
+	cancels   []func()
+}
+
+// An Option can be passed to NewStopper.
+type Option interface {
+	apply(*Stopper)
+}
+
+type optionPanicHandler func(interface{})
+
+func (oph optionPanicHandler) apply(stopper *Stopper) {
+	stopper.onPanic = oph
+}
+
+// OnPanic is an option which lets the Stopper recover from all panics using
+// the provided panic handler.
+//
+// When Stop() is invoked during stack unwinding, OnPanic is also invoked, but
+// Stop() may not have carried out its duties.
+func OnPanic(handler func(interface{})) Option {
+	return optionPanicHandler(handler)
 }
 
 // NewStopper returns an instance of Stopper.
-func NewStopper() *Stopper {
+func NewStopper(options ...Option) *Stopper {
 	s := &Stopper{
-		drainer: make(chan struct{}),
-		stopper: make(chan struct{}),
-		stopped: make(chan struct{}),
-		tasks:   map[taskKey]int{},
+		quiescer: make(chan struct{}),
+		stopper:  make(chan struct{}),
+		stopped:  make(chan struct{}),
+		tasks:    map[taskKey]int{},
 	}
-	s.drain = sync.NewCond(&s.mu)
+
+	for _, opt := range options {
+		opt.apply(s)
+	}
+
+	s.quiesce = sync.NewCond(&s.mu)
 	register(s)
 	return s
+}
+
+// Recover is used internally be Stopper to provide a hook for recovery of
+// panics on goroutines started by the Stopper. It can also be invoked
+// explicitly (via "defer s.Recover()") on goroutines that are created outside
+// of Stopper.
+func (s *Stopper) Recover() {
+	if r := recover(); r != nil {
+		if s.onPanic != nil {
+			s.onPanic(r)
+			return
+		}
+		panic(r)
+	}
 }
 
 // RunWorker runs the supplied function as a "worker" to be stopped
@@ -135,6 +182,7 @@ func NewStopper() *Stopper {
 func (s *Stopper) RunWorker(f func()) {
 	s.stop.Add(1)
 	go func() {
+		defer s.Recover()
 		defer s.stop.Done()
 		f()
 	}()
@@ -147,83 +195,86 @@ func (s *Stopper) AddCloser(c Closer) {
 	s.closers = append(s.closers, c)
 }
 
-// RunTask adds one to the count of tasks left to drain in the system. Any
+// RunTask adds one to the count of tasks left to quiesce in the system. Any
 // worker which is a "first mover" when starting tasks must call this method
 // before starting work on a new task. First movers include
 // goroutines launched to do periodic work and the kv/db.go gateway which
 // accepts external client requests.
 //
-// Returns false to indicate that the system is currently draining and
+// Returns an error to indicate that the system is currently quiescing and
 // function f was not called.
-func (s *Stopper) RunTask(f func()) bool {
+func (s *Stopper) RunTask(f func()) error {
 	file, line, _ := caller.Lookup(1)
 	key := taskKey{file, line}
 	if !s.runPrelude(key) {
-		return false
+		return errUnavailable
 	}
 	// Call f.
+	defer s.Recover()
 	defer s.runPostlude(key)
 	f()
-	return true
+	return nil
 }
 
-// RunAsyncTask runs function f in a goroutine. It returns false when the
-// Stopper is draining and the function is not executed.
-func (s *Stopper) RunAsyncTask(f func()) bool {
+// RunAsyncTask runs function f in a goroutine. It returns an error when the
+// Stopper is quiescing, in which case the function is not executed.
+func (s *Stopper) RunAsyncTask(f func()) error {
 	file, line, _ := caller.Lookup(1)
 	key := taskKey{file, line}
 	if !s.runPrelude(key) {
-		return false
+		return errUnavailable
 	}
 	// Call f.
 	go func() {
+		defer s.Recover()
 		defer s.runPostlude(key)
 		f()
 	}()
-	return true
+	return nil
 }
 
-// RunLimitedAsyncTask runs function f in a goroutine, using the given
-// channel as a semaphore to limit the number of tasks that are run
-// concurrently to the channel's capacity. Blocks until the semaphore
-// is available in order to push back on callers that may be trying to
-// create many tasks. Returns false if the Stopper is draining and the
-// function is not executed.
-func (s *Stopper) RunLimitedAsyncTask(sem chan struct{}, f func()) bool {
+// RunLimitedAsyncTask runs function f in a goroutine, using the given channel
+// as a semaphore to limit the number of tasks that are run concurrently to
+// the channel's capacity. Blocks until the semaphore is available in order to
+// push back on callers that may be trying to create many tasks. Returns an
+// error if the Stopper is quiescing, in which case the function is not
+// executed.
+func (s *Stopper) RunLimitedAsyncTask(sem chan struct{}, f func()) error {
 	file, line, _ := caller.Lookup(1)
 	key := taskKey{file, line}
 
 	// Wait for permission to run from the semaphore.
 	select {
 	case sem <- struct{}{}:
-	case <-s.ShouldDrain():
-		return false
+	case <-s.ShouldQuiesce():
+		return errUnavailable
 	default:
 		log.Printf("stopper throttling task from %s:%d due to semaphore", file, line)
 		// Retry the select without the default.
 		select {
 		case sem <- struct{}{}:
-		case <-s.ShouldDrain():
-			return false
+		case <-s.ShouldQuiesce():
+			return errUnavailable
 		}
 	}
 
 	if !s.runPrelude(key) {
 		<-sem
-		return false
+		return errUnavailable
 	}
 	go func() {
+		defer s.Recover()
 		defer s.runPostlude(key)
 		defer func() { <-sem }()
 		f()
 	}()
-	return true
+	return nil
 }
 
 func (s *Stopper) runPrelude(key taskKey) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.draining {
+	if s.quiescing {
 		return false
 	}
 	s.numTasks++
@@ -236,7 +287,7 @@ func (s *Stopper) runPostlude(key taskKey) {
 	defer s.mu.Unlock()
 	s.numTasks--
 	s.tasks[key]--
-	s.drain.Broadcast()
+	s.quiesce.Broadcast()
 }
 
 // NumTasks returns the number of active tasks.
@@ -282,6 +333,7 @@ func (s *Stopper) runningTasksLocked() TaskMap {
 // Stop signals all live workers to stop and then waits for each to
 // confirm it has stopped.
 func (s *Stopper) Stop() {
+	defer s.Recover()
 	defer unregister(s)
 	// Don't bother doing stuff cleanly if we're panicking, that would likely
 	// block. Instead, best effort only. This cleans up the stack traces,
@@ -308,18 +360,18 @@ func (s *Stopper) Stop() {
 	close(s.stopped)
 }
 
-// ShouldDrain returns a channel which will be closed when Stop() has been
-// invoked and outstanding tasks should begin to drain.
-func (s *Stopper) ShouldDrain() <-chan struct{} {
+// ShouldQuiesce returns a channel which will be closed when Stop() has been
+// invoked and outstanding tasks should begin to quiesce.
+func (s *Stopper) ShouldQuiesce() <-chan struct{} {
 	if s == nil {
-		// A nil stopper will never signal ShouldDrain, but will also never panic.
+		// A nil stopper will never signal ShouldQuiesce, but will also never panic.
 		return nil
 	}
-	return s.drainer
+	return s.quiescer
 }
 
 // ShouldStop returns a channel which will be closed when Stop() has been
-// invoked and outstanding tasks have drained.
+// invoked and outstanding tasks have quiesceed.
 func (s *Stopper) ShouldStop() <-chan struct{} {
 	if s == nil {
 		// A nil stopper will never signal ShouldStop, but will also never panic.
@@ -338,19 +390,34 @@ func (s *Stopper) IsStopped() <-chan struct{} {
 	return s.stopped
 }
 
-// Quiesce moves the stopper to state draining and waits until all
+// Quiesce moves the stopper to state quiesceing and waits until all
 // tasks complete. This is used from Stop() and unittests.
 func (s *Stopper) Quiesce() {
+	defer s.Recover()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.draining {
-		s.draining = true
-		close(s.drainer)
+	for _, cancel := range s.cancels {
+		cancel()
+	}
+	if !s.quiescing {
+		s.quiescing = true
+		close(s.quiescer)
 	}
 	for s.numTasks > 0 {
 		// Use stdlib "log" instead of "cockroach/util/log" due to import cycles.
-		log.Print("draining; tasks left:\n", s.runningTasksLocked())
+		log.Print("quiesceing; tasks left:\n", s.runningTasksLocked())
 		// Unlock s.mu, wait for the signal, and lock s.mu.
-		s.drain.Wait()
+		s.quiesce.Wait()
 	}
+}
+
+// WithCancel returns a child context which is cancelled when the Stopper
+// begins to quiesce.
+func (s *Stopper) WithCancel(ctx context.Context) context.Context {
+	var cancel func()
+	ctx, cancel = context.WithCancel(ctx)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cancels = append(s.cancels, cancel)
+	return ctx
 }

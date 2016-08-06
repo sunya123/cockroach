@@ -35,18 +35,6 @@ type alterTableNode struct {
 //   notes: postgres requires CREATE on the table.
 //          mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) AlterTable(n *parser.AlterTable) (planNode, error) {
-	if err := n.Table.NormalizeTableName(p.session.Database); err != nil {
-		return nil, err
-	}
-
-	dbDesc, err := p.getDatabaseDesc(n.Table.Database())
-	if err != nil {
-		return nil, err
-	}
-	if dbDesc == nil {
-		return nil, newUndefinedDatabaseError(n.Table.Database())
-	}
-
 	tableDesc, err := p.getTableDesc(n.Table)
 	if err != nil {
 		return nil, err
@@ -55,7 +43,7 @@ func (p *planner) AlterTable(n *parser.AlterTable) (planNode, error) {
 		if n.IfExists {
 			return &emptyNode{}, nil
 		}
-		return nil, newUndefinedTableError(n.Table.String())
+		return nil, sqlbase.NewUndefinedTableError(n.Table.String())
 	}
 
 	if err := p.checkPrivilege(tableDesc, privilege.CREATE); err != nil {
@@ -89,10 +77,22 @@ func (n *alterTableNode) Start() error {
 					n.tableDesc.Mutations[i].Direction == sqlbase.DescriptorMutation_DROP {
 					return fmt.Errorf("column %q being dropped, try again later", col.Name)
 				}
+				if status == sqlbase.DescriptorActive && t.IfNotExists {
+					continue
+				}
 			}
+
 			n.tableDesc.AddColumnMutation(*col, sqlbase.DescriptorMutation_ADD)
 			if idx != nil {
 				n.tableDesc.AddIndexMutation(*idx, sqlbase.DescriptorMutation_ADD)
+			}
+			if t.ColumnDef.Family.Create || len(t.ColumnDef.Family.Name) > 0 {
+				err := n.tableDesc.AddColumnToFamilyMaybeCreate(
+					col.Name, string(t.ColumnDef.Family.Name), t.ColumnDef.Family.Create,
+					t.ColumnDef.Family.IfNotExists)
+				if err != nil {
+					return err
+				}
 			}
 
 		case *parser.AlterTableAddConstraint:
@@ -237,18 +237,35 @@ func (n *alterTableNode) Start() error {
 	if err := n.p.writeTableDesc(n.tableDesc); err != nil {
 		return err
 	}
+
+	// Record this table alteration in the event log. This is an auditable log
+	// event and is recorded in the same transaction as the table descriptor
+	// update.
+	if err := MakeEventLogger(n.p.leaseMgr).InsertEventRecord(n.p.txn,
+		EventLogAlterTable,
+		int32(n.tableDesc.ID),
+		int32(n.p.evalCtx.NodeID),
+		struct {
+			TableName  string
+			Statement  string
+			User       string
+			MutationID uint32
+		}{n.tableDesc.Name, n.n.String(), n.p.session.User, uint32(mutationID)},
+	); err != nil {
+		return err
+	}
+
 	n.p.notifySchemaChange(n.tableDesc.ID, mutationID)
 
 	return nil
 }
 
-func (n *alterTableNode) Next() bool                          { return false }
+func (n *alterTableNode) Next() (bool, error)                 { return false, nil }
 func (n *alterTableNode) Columns() []ResultColumn             { return make([]ResultColumn, 0) }
 func (n *alterTableNode) Ordering() orderingInfo              { return orderingInfo{} }
 func (n *alterTableNode) Values() parser.DTuple               { return parser.DTuple{} }
 func (n *alterTableNode) DebugValues() debugValues            { return debugValues{} }
 func (n *alterTableNode) ExplainTypes(_ func(string, string)) {}
-func (n *alterTableNode) Err() error                          { return nil }
 func (n *alterTableNode) SetLimitHint(_ int64, _ bool)        {}
 func (n *alterTableNode) MarkDebug(mode explainMode)          {}
 func (n *alterTableNode) ExplainPlan(v bool) (string, string, []planNode) {
@@ -262,7 +279,7 @@ func applyColumnMutation(col *sqlbase.ColumnDescriptor, mut parser.ColumnMutatio
 			col.DefaultExpr = nil
 		} else {
 			colDatumType := col.Type.ToDatumType()
-			if err := sqlbase.SanitizeDefaultExpr(t.Default, colDatumType); err != nil {
+			if err := sqlbase.SanitizeVarFreeExpr(t.Default, colDatumType, "DEFAULT"); err != nil {
 				return err
 			}
 			s := t.Default.String()

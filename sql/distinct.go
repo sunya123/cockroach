@@ -25,60 +25,94 @@ import (
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
 )
 
-// distinct constructs a distinctNode.
-func (*planner) distinct(n *parser.SelectClause, p planNode) planNode {
-	if !n.Distinct {
-		return p
-	}
-	d := &distinctNode{
-		plan:       p,
-		suffixSeen: make(map[string]struct{}),
-	}
-	ordering := p.Ordering()
-	if !ordering.isEmpty() {
-		d.columnsInOrder = make([]bool, len(p.Columns()))
-		for colIdx := range ordering.exactMatchCols {
-			if colIdx >= len(d.columnsInOrder) {
-				// If the exact-match column is not part of the output, we can safely ignore it.
-				continue
-			}
-			d.columnsInOrder[colIdx] = true
-		}
-		for _, c := range ordering.ordering {
-			if c.colIdx >= len(d.columnsInOrder) {
-				// Cannot use sort order. This happens when the
-				// columns used for sorting are not part of the output.
-				// e.g. SELECT a FROM t ORDER BY c.
-				d.columnsInOrder = nil
-				break
-			}
-			d.columnsInOrder[c.colIdx] = true
-		}
-	}
-	return d
-}
-
-// distinctNode de-duplicates row returned by a wrapped planNode.
+// distinctNode de-duplicates rows returned by a wrapped planNode.
 type distinctNode struct {
 	plan planNode
+	top  *selectTopNode
 	// All the columns that are part of the Sort. Set to nil if no-sort, or
 	// sort used an expression that was not part of the requested column set.
 	columnsInOrder []bool
-	// encoding of the columnsInOrder columns for the previous row.
+	// Encoding of the columnsInOrder columns for the previous row.
 	prefixSeen []byte
-	// encoding of the non-columnInOrder columns for rows sharing the same
+	// Encoding of the non-columnInOrder columns for rows sharing the same
 	// prefixSeen value.
 	suffixSeen map[string]struct{}
-	err        error
 	explain    explainMode
 	debugVals  debugValues
 }
 
-func (n *distinctNode) expandPlan() error       { return n.plan.expandPlan() }
-func (n *distinctNode) Start() error            { return n.plan.Start() }
-func (n *distinctNode) Columns() []ResultColumn { return n.plan.Columns() }
-func (n *distinctNode) Values() parser.DTuple   { return n.plan.Values() }
-func (n *distinctNode) Ordering() orderingInfo  { return n.plan.Ordering() }
+// distinct constructs a distinctNode.
+func (*planner) Distinct(n *parser.SelectClause) *distinctNode {
+	if !n.Distinct {
+		return nil
+	}
+	return &distinctNode{}
+}
+
+// wrap connects the distinctNode to its source planNode.
+// invoked by selectTopNode.expandPlan() prior
+// to invoking distinctNode.expandPlan() below.
+func (n *distinctNode) wrap(plan planNode) planNode {
+	if n == nil {
+		return plan
+	}
+	n.plan = plan
+	return n
+}
+
+func (n *distinctNode) expandPlan() error {
+	// At this point the selectTopNode has already expanded the plans
+	// upstream of distinctNode.
+	ordering := n.plan.Ordering()
+	if !ordering.isEmpty() {
+		n.columnsInOrder = make([]bool, len(n.plan.Columns()))
+		for colIdx := range ordering.exactMatchCols {
+			if colIdx >= len(n.columnsInOrder) {
+				// If the exact-match column is not part of the output, we can safely ignore it.
+				continue
+			}
+			n.columnsInOrder[colIdx] = true
+		}
+		for _, c := range ordering.ordering {
+			if c.ColIdx >= len(n.columnsInOrder) {
+				// Cannot use sort order. This happens when the
+				// columns used for sorting are not part of the output.
+				// e.g. SELECT a FROM t ORDER BY c.
+				n.columnsInOrder = nil
+				break
+			}
+			n.columnsInOrder[c.ColIdx] = true
+		}
+	}
+	return nil
+}
+
+func (n *distinctNode) Start() error {
+	n.suffixSeen = make(map[string]struct{})
+	return n.plan.Start()
+}
+
+// setTop connects the distinctNode back to the selectTopNode that
+// caused its existence. This is needed because the distinctNode needs
+// to refer to other nodes in the selectTopNode before its
+// expandPlan() method has ran and its child plan is known and
+// connected.
+func (n *distinctNode) setTop(top *selectTopNode) {
+	if n != nil {
+		n.top = top
+	}
+}
+
+func (n *distinctNode) Columns() []ResultColumn {
+	if n.plan != nil {
+		return n.plan.Columns()
+	}
+	// Pre-prepare: not connected yet. Ask the top select node.
+	return n.top.Columns()
+}
+
+func (n *distinctNode) Values() parser.DTuple  { return n.plan.Values() }
+func (n *distinctNode) Ordering() orderingInfo { return n.plan.Ordering() }
 
 func (n *distinctNode) MarkDebug(mode explainMode) {
 	if mode != explainDebug {
@@ -95,22 +129,23 @@ func (n *distinctNode) DebugValues() debugValues {
 	return n.debugVals
 }
 
-func (n *distinctNode) Next() bool {
-	if n.err != nil {
-		return false
-	}
-	for n.plan.Next() {
+func (n *distinctNode) Next() (bool, error) {
+	for {
+		next, err := n.plan.Next()
+		if !next {
+			return false, err
+		}
 		if n.explain == explainDebug {
 			n.debugVals = n.plan.DebugValues()
 			if n.debugVals.output != debugValueRow {
 				// Let the non-row debug values pass through.
-				return true
+				return true, nil
 			}
 		}
 		// Detect duplicates
-		prefix, suffix := n.encodeValues(n.Values())
-		if n.err != nil {
-			return false
+		prefix, suffix, err := n.encodeValues(n.Values())
+		if err != nil {
+			return false, err
 		}
 
 		if !bytes.Equal(prefix, n.prefixSeen) {
@@ -123,7 +158,7 @@ func (n *distinctNode) Next() bool {
 			if suffix != nil {
 				n.suffixSeen[string(suffix)] = struct{}{}
 			}
-			return true
+			return true, nil
 		}
 
 		// The prefix of the row is the same as the last row; check
@@ -132,7 +167,7 @@ func (n *distinctNode) Next() bool {
 			sKey := string(suffix)
 			if _, ok := n.suffixSeen[sKey]; !ok {
 				n.suffixSeen[sKey] = struct{}{}
-				return true
+				return true, nil
 			}
 		}
 
@@ -140,36 +175,31 @@ func (n *distinctNode) Next() bool {
 		if n.explain == explainDebug {
 			// Return as a filtered row.
 			n.debugVals.output = debugValueFiltered
-			return true
+			return true, nil
 		}
 	}
-	n.err = n.plan.Err()
-	return false
 }
 
-func (n *distinctNode) Err() error {
-	return n.err
-}
-
-func (n *distinctNode) encodeValues(values parser.DTuple) ([]byte, []byte) {
+func (n *distinctNode) encodeValues(values parser.DTuple) ([]byte, []byte, error) {
 	var prefix, suffix []byte
+	var err error
 	for i, val := range values {
 		if n.columnsInOrder != nil && n.columnsInOrder[i] {
 			if prefix == nil {
 				prefix = make([]byte, 0, 100)
 			}
-			prefix, n.err = sqlbase.EncodeDatum(prefix, val)
+			prefix, err = sqlbase.EncodeDatum(prefix, val)
 		} else {
 			if suffix == nil {
 				suffix = make([]byte, 0, 100)
 			}
-			suffix, n.err = sqlbase.EncodeDatum(suffix, val)
+			suffix, err = sqlbase.EncodeDatum(suffix, val)
 		}
-		if n.err != nil {
+		if err != nil {
 			break
 		}
 	}
-	return prefix, suffix
+	return prefix, suffix, err
 }
 
 func (n *distinctNode) ExplainPlan(_ bool) (string, string, []planNode) {

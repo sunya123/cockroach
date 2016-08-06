@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/util/caller"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/uuid"
 )
 
@@ -116,7 +117,7 @@ func NewErrorWithTxn(err error, txn *Transaction) *Error {
 // passthrough to fmt.Errorf, with an additional prefix containing the
 // filename and line number.
 func NewErrorf(format string, a ...interface{}) *Error {
-	// Cannot use util.Errorf here due to cyclic dependency.
+	// Cannot use errors.Errorf here due to cyclic dependency.
 	file, line, _ := caller.Lookup(1)
 	s := fmt.Sprintf("%s:%d: ", file, line)
 	return NewError(fmt.Errorf(s+format, a...))
@@ -240,15 +241,15 @@ func (*NodeUnavailableError) message(_ *Error) string {
 
 var _ ErrorDetailInterface = &NodeUnavailableError{}
 
-func (e *NotLeaderError) Error() string {
+func (e *NotLeaseHolderError) Error() string {
 	return e.message(nil)
 }
 
-func (e *NotLeaderError) message(_ *Error) string {
-	return fmt.Sprintf("range %d: replica %s not leader; leader is %s", e.RangeID, e.Replica, e.Leader)
+func (e *NotLeaseHolderError) message(_ *Error) string {
+	return fmt.Sprintf("range %d: replica %s not lease holder; %s is", e.RangeID, e.Replica, e.LeaseHolder)
 }
 
-var _ ErrorDetailInterface = &NotLeaderError{}
+var _ ErrorDetailInterface = &NotLeaseHolderError{}
 
 func (e *LeaseRejectedError) Error() string {
 	return e.message(nil)
@@ -297,7 +298,7 @@ func NewRangeKeyMismatchError(start, end Key, desc *RangeDescriptor) *RangeKeyMi
 	if desc != nil && !desc.IsInitialized() {
 		// We must never send uninitialized ranges back to the client (nil
 		// is fine) guard against regressions of #6027.
-		panic("descriptor is not initialized")
+		panic(fmt.Sprintf("descriptor is not initialized: %+v", desc))
 	}
 	return &RangeKeyMismatchError{
 		RequestStartKey: start,
@@ -466,7 +467,7 @@ func (*WriteTooOldError) canRestartTransaction() TransactionRestart {
 // NewReadWithinUncertaintyIntervalError creates a new uncertainty retry error.
 // The read and existing timestamps are purely informational and used for
 // formatting the error message.
-func NewReadWithinUncertaintyIntervalError(readTS, existingTS Timestamp) *ReadWithinUncertaintyIntervalError {
+func NewReadWithinUncertaintyIntervalError(readTS, existingTS hlc.Timestamp) *ReadWithinUncertaintyIntervalError {
 	return &ReadWithinUncertaintyIntervalError{
 		ReadTimestamp:     readTS,
 		ExistingTimestamp: existingTS,

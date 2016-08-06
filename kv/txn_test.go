@@ -25,15 +25,17 @@ import (
 
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/storage/engine"
+	"github.com/cockroachdb/cockroach/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/testutils"
 	"github.com/cockroachdb/cockroach/testutils/localtestcluster"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
+	"github.com/pkg/errors"
 )
 
 // TestTxnDBBasics verifies that a simple transaction can be run and
@@ -52,7 +54,7 @@ func TestTxnDBBasics(t *testing.T) {
 
 		err := s.DB.Txn(func(txn *client.Txn) error {
 			// Use snapshot isolation so non-transactional read can always push.
-			if err := txn.SetIsolation(roachpb.SNAPSHOT); err != nil {
+			if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
 				return err
 			}
 
@@ -65,18 +67,18 @@ func TestTxnDBBasics(t *testing.T) {
 			if gr, err := s.DB.Get(key); err != nil {
 				return err
 			} else if gr.Exists() {
-				return util.Errorf("expected nil value; got %v", gr.Value)
+				return errors.Errorf("expected nil value; got %v", gr.Value)
 			}
 
 			// Read within the transaction.
 			if gr, err := txn.Get(key); err != nil {
 				return err
 			} else if !gr.Exists() || !bytes.Equal(gr.ValueBytes(), value) {
-				return util.Errorf("expected value %q; got %q", value, gr.Value)
+				return errors.Errorf("expected value %q; got %q", value, gr.Value)
 			}
 
 			if !commit {
-				return util.Errorf("purposefully failing transaction")
+				return errors.Errorf("purposefully failing transaction")
 			}
 			return nil
 		})
@@ -159,7 +161,7 @@ func TestSnapshotIsolationIncrement(t *testing.T) {
 	}()
 
 	if err := s.DB.Txn(func(txn *client.Txn) error {
-		if err := txn.SetIsolation(roachpb.SNAPSHOT); err != nil {
+		if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
 			t.Fatal(err)
 		}
 
@@ -231,7 +233,7 @@ func TestSnapshotIsolationLostUpdate(t *testing.T) {
 	}()
 
 	if err := s.DB.Txn(func(txn *client.Txn) error {
-		if err := txn.SetIsolation(roachpb.SNAPSHOT); err != nil {
+		if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
 			t.Fatal(err)
 		}
 
@@ -312,7 +314,7 @@ func TestPriorityRatchetOnAbortOrPush(t *testing.T) {
 
 	// Try all combinations of read/write and snapshot/serializable isolation.
 	for _, read := range []bool{true, false} {
-		for _, iso := range []roachpb.IsolationType{roachpb.SNAPSHOT, roachpb.SERIALIZABLE} {
+		for _, iso := range []enginepb.IsolationType{enginepb.SNAPSHOT, enginepb.SERIALIZABLE} {
 			var iteration int
 			if err := s.DB.Txn(func(txn *client.Txn) error {
 				defer func() { iteration++ }()
@@ -520,7 +522,7 @@ func TestTxnTimestampRegression(t *testing.T) {
 	keyB := "b"
 	err := s.DB.Txn(func(txn *client.Txn) error {
 		// Use snapshot isolation so non-transactional read can always push.
-		if err := txn.SetIsolation(roachpb.SNAPSHOT); err != nil {
+		if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
 			return err
 		}
 		// Put transactional value.
@@ -564,7 +566,7 @@ func TestTxnLongDelayBetweenWritesWithConcurrentRead(t *testing.T) {
 	go func() {
 		err := s.DB.Txn(func(txn *client.Txn) error {
 			// Use snapshot isolation.
-			if err := txn.SetIsolation(roachpb.SNAPSHOT); err != nil {
+			if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
 				return err
 			}
 			// Put transactional value.
@@ -576,10 +578,7 @@ func TestTxnLongDelayBetweenWritesWithConcurrentRead(t *testing.T) {
 			// Wait for txnB notify us to put(b).
 			<-ch
 			// Write now to keyB.
-			if err := txn.Put(keyB, "value2"); err != nil {
-				return err
-			}
-			return nil
+			return txn.Put(keyB, "value2")
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -594,7 +593,7 @@ func TestTxnLongDelayBetweenWritesWithConcurrentRead(t *testing.T) {
 	s.Manual.Set((storage.MinTSCacheWindow + time.Second).Nanoseconds())
 	err := s.DB.Txn(func(txn *client.Txn) error {
 		// Use snapshot isolation.
-		if err := txn.SetIsolation(roachpb.SNAPSHOT); err != nil {
+		if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
 			return err
 		}
 
@@ -640,7 +639,7 @@ func TestTxnRepeatGetWithRangeSplit(t *testing.T) {
 	go func() {
 		err := s.DB.Txn(func(txn *client.Txn) error {
 			// Use snapshot isolation.
-			if err := txn.SetIsolation(roachpb.SNAPSHOT); err != nil {
+			if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
 				return err
 			}
 			// Put transactional value.
@@ -652,10 +651,7 @@ func TestTxnRepeatGetWithRangeSplit(t *testing.T) {
 			// Wait for txnB notify us to put(c).
 			<-ch
 			// Write now to keyC, which will keep timestamp.
-			if err := txn.Put(keyC, "value2"); err != nil {
-				return err
-			}
-			return nil
+			return txn.Put(keyC, "value2")
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -669,7 +665,7 @@ func TestTxnRepeatGetWithRangeSplit(t *testing.T) {
 
 	err := s.DB.Txn(func(txn *client.Txn) error {
 		// Use snapshot isolation.
-		if err := txn.SetIsolation(roachpb.SNAPSHOT); err != nil {
+		if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
 			return err
 		}
 
@@ -694,7 +690,7 @@ func TestTxnRepeatGetWithRangeSplit(t *testing.T) {
 			if len(rows) >= 2 {
 				return nil
 			}
-			return util.Errorf("failed to split")
+			return errors.Errorf("failed to split")
 		})
 		// Notify txnA put(c).
 		ch <- struct{}{}

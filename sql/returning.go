@@ -17,6 +17,8 @@
 package sql
 
 import (
+	"fmt"
+
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
 )
@@ -28,12 +30,10 @@ type returningHelper struct {
 	// Expected columns.
 	columns []ResultColumn
 	// Processed copies of expressions from ReturningExprs.
-	untypedExprs parser.Exprs
-	exprs        []parser.TypedExpr
-	qvals        qvalMap
-	rowCount     int
-	desiredTypes []parser.Datum
-	table        *tableInfo
+	exprs    []parser.TypedExpr
+	qvals    qvalMap
+	rowCount int
+	source   *dataSourceInfo
 }
 
 func (p *planner) makeReturningHelper(
@@ -43,27 +43,27 @@ func (p *planner) makeReturningHelper(
 	tablecols []sqlbase.ColumnDescriptor,
 ) (returningHelper, error) {
 	rh := returningHelper{
-		p:            p,
-		desiredTypes: desiredTypes,
+		p: p,
 	}
 	if len(r) == 0 {
 		return rh, nil
 	}
 
-	rh.columns = make([]ResultColumn, 0, len(r))
-	rh.table = &tableInfo{
-		columns: makeResultColumns(tablecols),
-		alias:   alias,
+	for _, e := range r {
+		if p.parser.AggregateInExpr(e.Expr) {
+			return rh, fmt.Errorf("aggregate functions are not allowed in RETURNING")
+		}
 	}
+
+	rh.columns = make([]ResultColumn, 0, len(r))
+	rh.source = newSourceInfoForSingleTable(alias, makeResultColumns(tablecols))
 	rh.qvals = make(qvalMap)
-	rh.untypedExprs = make([]parser.Expr, 0, len(r))
-	for _, target := range r {
-		if isStar, cols, exprs, err := checkRenderStar(target, rh.table, rh.qvals); err != nil {
+	rh.exprs = make([]parser.TypedExpr, 0, len(r))
+	for i, target := range r {
+		if isStar, cols, typedExprs, err := checkRenderStar(target, rh.source, rh.qvals); err != nil {
 			return returningHelper{}, err
 		} else if isStar {
-			for _, expr := range exprs {
-				rh.untypedExprs = append(rh.untypedExprs, expr)
-			}
+			rh.exprs = append(rh.exprs, typedExprs...)
 			rh.columns = append(rh.columns, cols...)
 			continue
 		}
@@ -73,14 +73,18 @@ func (p *planner) makeReturningHelper(
 		// manipulations to the expression.
 		outputName := getRenderColName(target)
 
-		expr, err := resolveQNames(target.Expr, []*tableInfo{rh.table}, rh.qvals, &p.qnameVisitor)
+		desired := parser.NoTypePreference
+		if len(desiredTypes) > i {
+			desired = desiredTypes[i]
+		}
+
+		typedExpr, err := rh.p.analyzeExpr(target.Expr, multiSourceInfo{rh.source}, rh.qvals, desired, false, "")
 		if err != nil {
 			return returningHelper{}, err
 		}
-		rh.untypedExprs = append(rh.untypedExprs, expr)
-		rh.columns = append(rh.columns, ResultColumn{Name: outputName})
+		rh.exprs = append(rh.exprs, typedExpr)
+		rh.columns = append(rh.columns, ResultColumn{Name: outputName, Typ: typedExpr.ReturnType()})
 	}
-	rh.exprs = make([]parser.TypedExpr, len(rh.untypedExprs))
 	return rh, nil
 }
 
@@ -91,10 +95,10 @@ func (rh *returningHelper) cookResultRow(rowVals parser.DTuple) (parser.DTuple, 
 		rh.rowCount++
 		return rowVals, nil
 	}
-	rh.qvals.populateQVals(rh.table, rowVals)
+	rh.qvals.populateQVals(rh.source, rowVals)
 	resRow := make(parser.DTuple, len(rh.exprs))
 	for i, e := range rh.exprs {
-		d, err := e.Eval(rh.p.evalCtx)
+		d, err := e.Eval(&rh.p.evalCtx)
 		if err != nil {
 			return nil, err
 		}
@@ -103,28 +107,20 @@ func (rh *returningHelper) cookResultRow(rowVals parser.DTuple) (parser.DTuple, 
 	return resRow, nil
 }
 
-// TypeCheck ensures that the expressions mentioned in the
-// returningHelper have the right type.
-// TODO(knz): this both annotates the type of placeholders
-// (a task for prepare) and controls that provided values
-// for placeholders match their context (a task for exec). This
-// ought to be split into two phases.
-func (rh *returningHelper) TypeCheck() error {
-	for i, expr := range rh.untypedExprs {
-		desired := parser.NoTypePreference
-		if len(rh.desiredTypes) > i {
-			desired = rh.desiredTypes[i]
-		}
-		typedExpr, err := parser.TypeCheck(expr, rh.p.evalCtx.Args, desired)
-		if err != nil {
+func (rh *returningHelper) expandPlans() error {
+	for _, expr := range rh.exprs {
+		if err := rh.p.expandSubqueryPlans(expr); err != nil {
 			return err
 		}
-		typedExpr, err = rh.p.parser.NormalizeExpr(rh.p.evalCtx, typedExpr)
-		if err != nil {
+	}
+	return nil
+}
+
+func (rh *returningHelper) startPlans() error {
+	for _, expr := range rh.exprs {
+		if err := rh.p.startSubqueryPlans(expr); err != nil {
 			return err
 		}
-		rh.exprs[i] = typedExpr
-		rh.columns[i].Typ = typedExpr.ReturnType()
 	}
 	return nil
 }

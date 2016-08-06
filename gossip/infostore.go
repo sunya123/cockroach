@@ -18,17 +18,21 @@ package gossip
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"math"
 	"regexp"
-	"sync"
 	"time"
+
+	"golang.org/x/net/context"
+
+	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/syncutil"
 	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
@@ -67,13 +71,13 @@ type infoStore struct {
 	highWaterStamps map[roachpb.NodeID]int64 // Per-node information for gossip peers
 	callbacks       []*callback
 
-	callbackMu     sync.Mutex // Serializes callbacks
-	callbackWorkMu sync.Mutex // Protects callbackWork
+	callbackMu     syncutil.Mutex // Serializes callbacks
+	callbackWorkMu syncutil.Mutex // Protects callbackWork
 	callbackWork   []func()
 }
 
 var monoTime struct {
-	sync.Mutex
+	syncutil.Mutex
 	last int64
 }
 
@@ -113,7 +117,7 @@ func (is *infoStore) String() string {
 		prepend = ", "
 		return nil
 	}); err != nil {
-		log.Errorf("failed to properly construct string representation of infoStore: %s", err)
+		log.Errorf(context.TODO(), "failed to properly construct string representation of infoStore: %s", err)
 	}
 	return buf.String()
 }
@@ -140,7 +144,7 @@ func (is *infoStore) newInfo(val []byte, ttl time.Duration) *Info {
 	if ttl == 0 {
 		ttlStamp = math.MaxInt64
 	}
-	v := roachpb.MakeValueFromBytesAndTimestamp(val, roachpb.Timestamp{WallTime: now})
+	v := roachpb.MakeValueFromBytesAndTimestamp(val, hlc.Timestamp{WallTime: now})
 	return &Info{
 		Value:    v,
 		TTLStamp: ttlStamp,
@@ -182,7 +186,7 @@ func (is *infoStore) addInfo(key string, i *Info) error {
 		i.Value.InitChecksum([]byte(key))
 		i.OrigStamp = monotonicUnixNano()
 		if highWaterStamp, ok := is.highWaterStamps[i.NodeID]; ok && highWaterStamp >= i.OrigStamp {
-			panic(util.Errorf("high water stamp %d >= %d", highWaterStamp, i.OrigStamp))
+			panic(errors.Errorf("high water stamp %d >= %d", highWaterStamp, i.OrigStamp))
 		}
 	}
 	// Update info map.
@@ -269,7 +273,7 @@ func (is *infoStore) runCallbacks(key string, content roachpb.Value, callbacks .
 	// Run callbacks in a goroutine to avoid mutex reentry. We also guarantee
 	// callbacks are run in order such that if a key is updated twice in
 	// succession, the second callback will never be run before the first.
-	is.stopper.RunAsyncTask(func() {
+	if err := is.stopper.RunAsyncTask(func() {
 		// Grab the callback mutex to serialize execution of the callbacks.
 		is.callbackMu.Lock()
 		defer is.callbackMu.Unlock()
@@ -283,7 +287,9 @@ func (is *infoStore) runCallbacks(key string, content roachpb.Value, callbacks .
 		for _, w := range work {
 			w()
 		}
-	})
+	}); err != nil {
+		log.Warning(context.TODO(), err)
+	}
 }
 
 // visitInfos implements a visitor pattern to run the visitInfo
@@ -319,7 +325,7 @@ func (is *infoStore) combine(infos map[string]*Info, nodeID roachpb.NodeID) (fre
 		// Errors from addInfo here are not a problem; they simply
 		// indicate that the data in *is is newer than in *delta.
 		if infoCopy.OrigStamp == 0 {
-			panic(util.Errorf("combining info from node %d with 0 original timestamp", nodeID))
+			panic(errors.Errorf("combining info from node %d with 0 original timestamp", nodeID))
 		}
 		if addErr := is.addInfo(key, &infoCopy); addErr == nil {
 			freshCount++

@@ -17,7 +17,9 @@
 package sql
 
 import (
+	"bytes"
 	"fmt"
+	"math"
 
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/sql/parser"
@@ -38,7 +40,9 @@ type scanNode struct {
 	// Set if the NO_INDEX_JOIN hint was given.
 	noIndexJoin bool
 
-	// There is a 1-1 correspondence between desc.Columns and resultColumns.
+	// The table columns, possibly including ones currently in schema changes.
+	cols []sqlbase.ColumnDescriptor
+	// There is a 1-1 correspondence between cols and resultColumns.
 	resultColumns []ResultColumn
 	// Contains values for the current row. There is a 1-1 correspondence
 	// between resultColumns and values in row.
@@ -47,14 +51,13 @@ type scanNode struct {
 	// as an optimization when the upper layer doesn't need all values).
 	valNeededForCol []bool
 
-	// Map used to get the index for columns in desc.Columns.
+	// Map used to get the index for columns in cols.
 	colIdxMap map[sqlbase.ColumnID]int
 
 	spans            []sqlbase.Span
 	isSecondaryIndex bool
 	reverse          bool
 	ordering         orderingInfo
-	err              error
 
 	explain   explainMode
 	rowIndex  int // the index of the current row
@@ -69,6 +72,7 @@ type scanNode struct {
 	fetcher         sqlbase.RowFetcher
 
 	limitHint int64
+	limitSoft bool
 }
 
 func (p *planner) Scan() *scanNode {
@@ -102,60 +106,67 @@ func (n *scanNode) DebugValues() debugValues {
 }
 
 func (n *scanNode) SetLimitHint(numRows int64, soft bool) {
-	n.limitHint = numRows
-	if soft || n.filter != nil {
-		// Read a multiple of the limit if the limit is "soft".
-		n.limitHint *= 2
+	// Either a limitNode or EXPLAIN is pushing a limit down onto this
+	// node. The special value math.MaxInt64 means "no limit".
+	if numRows != math.MaxInt64 {
+		n.limitHint = numRows
+		// If we have a filter, some of the rows we retrieve may not pass the
+		// filter so the limit becomes "soft".
+		n.limitSoft = soft || n.filter != nil
 	}
 }
 
 func (n *scanNode) expandPlan() error {
-	return nil
+	return n.p.expandSubqueryPlans(n.filter)
 }
 
 func (n *scanNode) Start() error {
-	if err := n.fetcher.Init(&n.desc, n.colIdxMap, n.index, n.reverse,
-		n.isSecondaryIndex, n.valNeededForCol); err != nil {
+	err := n.fetcher.Init(&n.desc, n.colIdxMap, n.index, n.reverse, n.isSecondaryIndex, n.cols,
+		n.valNeededForCol)
+	if err != nil {
 		return err
 	}
 
-	return nil
+	return n.p.startSubqueryPlans(n.filter)
 }
 
-// initScan sets up the rowFetcher and starts a scan. On error, sets n.err and
-// returns false.
-func (n *scanNode) initScan() (success bool) {
-
+// initScan sets up the rowFetcher and starts a scan.
+func (n *scanNode) initScan() error {
 	if len(n.spans) == 0 {
 		// If no spans were specified retrieve all of the keys that start with our
 		// index key prefix. This isn't needed for the fetcher, but it is for
 		// other external users of n.spans.
-		start := roachpb.Key(sqlbase.MakeIndexKeyPrefix(n.desc.ID, n.index.ID))
+		start := roachpb.Key(sqlbase.MakeIndexKeyPrefix(&n.desc, n.index.ID))
 		n.spans = append(n.spans, sqlbase.Span{Start: start, End: start.PrefixEnd()})
 	}
 
-	n.err = n.fetcher.StartScan(n.p.txn, n.spans, n.limitHint)
-	if n.err != nil {
-		return false
+	limitHint := n.limitHint
+	if limitHint != 0 && n.limitSoft {
+		// Read a multiple of the limit if the limit is "soft".
+		limitHint *= 2
+	}
+
+	if err := n.fetcher.StartScan(n.p.txn, n.spans, limitHint); err != nil {
+		return err
 	}
 	n.scanInitialized = true
-	return true
+	return nil
 }
 
 // debugNext is a helper function used by Next() when in explainDebug mode.
-func (n *scanNode) debugNext() bool {
+func (n *scanNode) debugNext() (bool, error) {
 	// In debug mode, we output a set of debug values for each key.
 	n.debugVals.rowIdx = n.rowIndex
-	n.debugVals.key, n.debugVals.value, n.row, n.err = n.fetcher.NextKeyDebug()
-	if n.err != nil || n.debugVals.key == "" {
-		return false
+	var err error
+	n.debugVals.key, n.debugVals.value, n.row, err = n.fetcher.NextKeyDebug()
+	if err != nil || n.debugVals.key == "" {
+		return false, err
 	}
 
 	if n.row != nil {
-		passesFilter, err := sqlbase.RunFilter(n.filter, n.p.evalCtx)
+		passesFilter, err := sqlbase.RunFilter(n.filter, &n.p.evalCtx)
 		if err != nil {
-			n.err = err
-			return false
+			return false, err
 		}
 		if passesFilter {
 			n.debugVals.output = debugValueRow
@@ -166,19 +177,15 @@ func (n *scanNode) debugNext() bool {
 	} else {
 		n.debugVals.output = debugValuePartial
 	}
-	return true
+	return true, nil
 }
 
-func (n *scanNode) Next() bool {
+func (n *scanNode) Next() (bool, error) {
 	tracing.AnnotateTrace()
-
-	if n.err != nil {
-		return false
-	}
-
-	if !n.scanInitialized && !n.initScan() {
-		// Hit error during initScan
-		return false
+	if !n.scanInitialized {
+		if err := n.initScan(); err != nil {
+			return false, err
+		}
 	}
 
 	if n.explain == explainDebug {
@@ -187,23 +194,19 @@ func (n *scanNode) Next() bool {
 
 	// We fetch one row at a time until we find one that passes the filter.
 	for {
-		n.row, n.err = n.fetcher.NextRow()
-		if n.err != nil || n.row == nil {
-			return false
+		var err error
+		n.row, err = n.fetcher.NextRow()
+		if err != nil || n.row == nil {
+			return false, err
 		}
-		passesFilter, err := sqlbase.RunFilter(n.filter, n.p.evalCtx)
+		passesFilter, err := sqlbase.RunFilter(n.filter, &n.p.evalCtx)
 		if err != nil {
-			n.err = err
-			return false
+			return false, err
 		}
 		if passesFilter {
-			return true
+			return true, nil
 		}
 	}
-}
-
-func (n *scanNode) Err() error {
-	return n.err
 }
 
 func (n *scanNode) ExplainPlan(_ bool) (name, description string, children []planNode) {
@@ -212,8 +215,23 @@ func (n *scanNode) ExplainPlan(_ bool) (name, description string, children []pla
 	} else {
 		name = "scan"
 	}
-	description = fmt.Sprintf("%s@%s %s", n.desc.Name, n.index.Name, sqlbase.PrettySpans(n.spans, 2))
-	return name, description, nil
+	var desc bytes.Buffer
+	fmt.Fprintf(&desc, "%s@%s", n.desc.Name, n.index.Name)
+	spans := sqlbase.PrettySpans(n.spans, 2)
+	if spans != "" {
+		fmt.Fprintf(&desc, " %s", spans)
+	}
+	if n.limitHint > 0 && !n.limitSoft {
+		if n.limitHint == 1 {
+			desc.WriteString(" (max 1 row)")
+		} else {
+			fmt.Fprintf(&desc, " (max %d rows)", n.limitHint)
+		}
+	}
+
+	subplans := n.p.collectSubqueryPlans(n.filter, nil)
+
+	return name, desc.String(), subplans
 }
 
 func (n *scanNode) ExplainTypes(regTypes func(string, string)) {
@@ -225,14 +243,24 @@ func (n *scanNode) ExplainTypes(regTypes func(string, string)) {
 // Initializes a scanNode with a tableName. Returns the table or index name that can be used for
 // fully-qualified columns if an alias is not specified.
 func (n *scanNode) initTable(
-	p *planner, tableName *parser.QualifiedName, indexHints *parser.IndexHints,
+	p *planner,
+	tableName *parser.QualifiedName,
+	indexHints *parser.IndexHints,
+	scanVisibility scanVisibility,
 ) (string, error) {
-	var err error
-	n.desc, err = p.getTableLease(tableName)
-	if err != nil {
-		n.err = err
-		return "", n.err
+	descFunc := p.getTableLease
+	if p.asOf {
+		// AS OF SYSTEM TIME queries need to fetch the table descriptor at the
+		// specified time, and never lease anything. The proto transaction already
+		// has its timestamps set correctly so mustGetTableDesc will fetch with the
+		// correct timestamp.
+		descFunc = p.mustGetTableDesc
 	}
+	desc, err := descFunc(tableName)
+	if err != nil {
+		return "", err
+	}
+	n.desc = *desc
 
 	if err := p.checkPrivilege(&n.desc, privilege.SELECT); err != nil {
 		return "", err
@@ -252,13 +280,12 @@ func (n *scanNode) initTable(
 				}
 			}
 			if n.specifiedIndex == nil {
-				n.err = fmt.Errorf("index \"%s\" not found", indexName)
-				return "", n.err
+				return "", fmt.Errorf("index \"%s\" not found", indexName)
 			}
 		}
 	}
 	n.noIndexJoin = (indexHints != nil && indexHints.NoIndexJoin)
-	n.initDescDefaults()
+	n.initDescDefaults(scanVisibility)
 	return alias, nil
 }
 
@@ -272,20 +299,31 @@ func (n *scanNode) setNeededColumns(needed []bool) {
 }
 
 // Initializes the column structures.
-func (n *scanNode) initDescDefaults() {
+func (n *scanNode) initDescDefaults(scanVisibility scanVisibility) {
 	n.index = &n.desc.PrimaryIndex
-	cols := n.desc.Columns
-	n.resultColumns = makeResultColumns(cols)
-	n.colIdxMap = make(map[sqlbase.ColumnID]int, len(cols))
-	for i, c := range cols {
+	n.cols = make([]sqlbase.ColumnDescriptor, 0, len(n.desc.Columns)+len(n.desc.Mutations))
+	switch scanVisibility {
+	case publicColumns:
+		n.cols = append(n.cols, n.desc.Columns...)
+	case publicAndNonPublicColumns:
+		n.cols = append(n.cols, n.desc.Columns...)
+		for _, mutation := range n.desc.Mutations {
+			if c := mutation.GetColumn(); c != nil {
+				n.cols = append(n.cols, *c)
+			}
+		}
+	}
+	n.resultColumns = makeResultColumns(n.cols)
+	n.colIdxMap = make(map[sqlbase.ColumnID]int, len(n.cols))
+	for i, c := range n.cols {
 		n.colIdxMap[c.ID] = i
 	}
-	n.valNeededForCol = make([]bool, len(cols))
-	for i := range cols {
+	n.valNeededForCol = make([]bool, len(n.cols))
+	for i := range n.cols {
 		n.valNeededForCol[i] = true
 	}
-	n.row = make([]parser.Datum, len(cols))
-	n.filterVars = parser.MakeIndexedVarHelper(n, len(cols))
+	n.row = make([]parser.Datum, len(n.cols))
+	n.filterVars = parser.MakeIndexedVarHelper(n, len(n.cols))
 }
 
 // initOrdering initializes the ordering info using the selected index. This
@@ -331,7 +369,7 @@ func (n *scanNode) computeOrdering(
 // scanNode implements parser.IndexedVarContainer.
 var _ parser.IndexedVarContainer = &scanNode{}
 
-func (n *scanNode) IndexedVarEval(idx int, ctx parser.EvalContext) (parser.Datum, error) {
+func (n *scanNode) IndexedVarEval(idx int, ctx *parser.EvalContext) (parser.Datum, error) {
 	return n.row[idx].Eval(ctx)
 }
 
@@ -340,5 +378,13 @@ func (n *scanNode) IndexedVarReturnType(idx int) parser.Datum {
 }
 
 func (n *scanNode) IndexedVarString(idx int) string {
-	return string(n.resultColumns[idx].Name)
+	return n.resultColumns[idx].Name
 }
+
+// scanVisibility represents which table columns should be included in a scan.
+type scanVisibility int
+
+const (
+	publicColumns             scanVisibility = 0
+	publicAndNonPublicColumns scanVisibility = 1
+)

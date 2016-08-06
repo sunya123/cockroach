@@ -31,14 +31,17 @@ import (
 	"github.com/gogo/protobuf/jsonpb"
 
 	"github.com/cockroachdb/cockroach/base"
-	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/config"
+	"github.com/cockroachdb/cockroach/internal/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/kv"
 	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/server/serverpb"
 	"github.com/cockroachdb/cockroach/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/testutils"
+	"github.com/cockroachdb/cockroach/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/metric"
 	"github.com/cockroachdb/cockroach/util/tracing"
@@ -50,17 +53,21 @@ var nodeTestBaseContext = testutils.NewNodeTestBaseContext()
 // been specified.
 func TestSelfBootstrap(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, err := serverutils.StartServerRaw(base.TestServerArgs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stopper().Stop()
 }
 
 // TestHealth verifies that health endpoint returns an empty JSON response.
 func TestHealth(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
-	u := s.Ctx.HTTPRequestScheme() + "://" + s.HTTPAddr() + healthPath
-	httpClient, err := s.Ctx.GetHTTPClient()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+
+	u := s.AdminURL() + healthPath
+	httpClient, err := s.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +76,7 @@ func TestHealth(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	var data HealthResponse
+	var data serverpb.HealthResponse
 	if err := jsonpb.Unmarshal(resp.Body, &data); err != nil {
 		t.Error(err)
 	}
@@ -79,34 +86,30 @@ func TestHealth(t *testing.T) {
 // This is controlled by -cert=""
 func TestPlainHTTPServer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	// Create a custom context. The default one uses embedded certs.
-	ctx := NewContext()
-	ctx.Addr = "127.0.0.1:0"
-	ctx.HTTPAddr = "127.0.0.1:0"
-	ctx.Insecure = true
-	s := TestServer{Ctx: ctx}
-	if err := s.Start(); err != nil {
-		t.Fatalf("could not start plain http server: %v", err)
-	}
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		// The default context uses embedded certs.
+		Insecure: true,
+	})
+	defer s.Stopper().Stop()
+	ts := s.(*TestServer)
 
-	httpClient, err := ctx.GetHTTPClient()
+	httpClient, err := s.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	httpURL := "http://" + s.HTTPAddr() + healthPath
+	httpURL := "http://" + ts.Ctx.HTTPAddr + healthPath
 	if resp, err := httpClient.Get(httpURL); err != nil {
 		t.Fatalf("error requesting health at %s: %s", httpURL, err)
 	} else {
 		defer resp.Body.Close()
-		var data HealthResponse
+		var data serverpb.HealthResponse
 		if err := jsonpb.Unmarshal(resp.Body, &data); err != nil {
 			t.Error(err)
 		}
 	}
 
-	httpsURL := "https://" + s.HTTPAddr() + healthPath
+	httpsURL := "https://" + ts.Ctx.HTTPAddr + healthPath
 	if _, err := httpClient.Get(httpsURL); err == nil {
 		t.Fatalf("unexpected success fetching %s", httpsURL)
 	}
@@ -114,16 +117,17 @@ func TestPlainHTTPServer(t *testing.T) {
 
 func TestSecureHTTPRedirect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+	ts := s.(*TestServer)
 
-	httpClient, err := s.Ctx.GetHTTPClient()
+	httpClient, err := s.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	origURL := "http://" + s.HTTPAddr()
-	expURL := url.URL{Scheme: "https", Host: s.HTTPAddr(), Path: "/"}
+	origURL := "http://" + ts.Ctx.HTTPAddr
+	expURL := url.URL{Scheme: "https", Host: ts.Ctx.HTTPAddr, Path: "/"}
 
 	if resp, err := httpClient.Get(origURL); err != nil {
 		t.Fatal(err)
@@ -161,9 +165,9 @@ func TestSecureHTTPRedirect(t *testing.T) {
 // it conditionally via the request's Accept-Encoding headers.
 func TestAcceptEncoding(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
-	client, err := s.Ctx.GetHTTPClient()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+	client, err := s.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +192,7 @@ func TestAcceptEncoding(t *testing.T) {
 		},
 	}
 	for _, d := range testData {
-		req, err := http.NewRequest("GET", s.Ctx.HTTPRequestScheme()+"://"+s.HTTPAddr()+healthPath, nil)
+		req, err := http.NewRequest("GET", s.AdminURL()+healthPath, nil)
 		if err != nil {
 			t.Fatalf("could not create request: %s", err)
 		}
@@ -204,7 +208,7 @@ func TestAcceptEncoding(t *testing.T) {
 			t.Fatalf("unexpected content encoding: '%s' != '%s'", ce, d.acceptEncoding)
 		}
 		r := d.newReader(resp.Body)
-		var data HealthResponse
+		var data serverpb.HealthResponse
 		if err := jsonpb.Unmarshal(r, &data); err != nil {
 			t.Error(err)
 		}
@@ -215,19 +219,20 @@ func TestAcceptEncoding(t *testing.T) {
 // ranges are carried out properly.
 func TestMultiRangeScanDeleteRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+	ts := s.(*TestServer)
 	retryOpts := base.DefaultRetryOptions()
-	retryOpts.Closer = s.stopper.ShouldDrain()
+	retryOpts.Closer = ts.stopper.ShouldQuiesce()
 	ds := kv.NewDistSender(&kv.DistSenderContext{
 		Clock:           s.Clock(),
 		RPCContext:      s.RPCContext(),
 		RPCRetryOptions: &retryOpts,
-	}, s.Gossip())
-	tds := kv.NewTxnCoordSender(ds, s.Clock(), s.Ctx.Linearizable, tracing.NewTracer(),
-		s.stopper, kv.NewTxnMetrics(metric.NewRegistry()))
+	}, ts.Gossip())
+	tds := kv.NewTxnCoordSender(ds, s.Clock(), ts.Ctx.Linearizable, tracing.NewTracer(),
+		ts.stopper, kv.NewTxnMetrics(metric.NewRegistry()))
 
-	if err := s.node.ctx.DB.AdminSplit("m"); err != nil {
+	if err := ts.node.ctx.DB.AdminSplit("m"); err != nil {
 		t.Fatal(err)
 	}
 	writes := []roachpb.Key{roachpb.Key("a"), roachpb.Key("z")}
@@ -238,14 +243,14 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 	if _, err := client.SendWrapped(tds, nil, get); err == nil {
 		t.Errorf("able to call Get with a key range: %v", get)
 	}
-	var delTS roachpb.Timestamp
+	var delTS hlc.Timestamp
 	for i, k := range writes {
 		put := roachpb.NewPut(k, roachpb.MakeValueFromBytes(k))
 		reply, err := client.SendWrapped(tds, nil, put)
 		if err != nil {
 			t.Fatal(err)
 		}
-		scan := roachpb.NewScan(writes[0], writes[len(writes)-1].Next(), 0)
+		scan := roachpb.NewScan(writes[0], writes[len(writes)-1].Next())
 		reply, err = client.SendWrapped(tds, nil, scan)
 		if err != nil {
 			t.Fatal(err)
@@ -280,7 +285,7 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 		t.Errorf("expected %d keys to be deleted, but got %d instead", writes, dr.Keys)
 	}
 
-	scan := roachpb.NewScan(writes[0], writes[len(writes)-1].Next(), 0)
+	scan := roachpb.NewScan(writes[0], writes[len(writes)-1].Next())
 	txn := &roachpb.Transaction{Name: "MyTxn"}
 	reply, err = client.SendWrappedWith(tds, nil, roachpb.Header{Txn: txn}, scan)
 	if err != nil {
@@ -311,20 +316,21 @@ func TestMultiRangeScanWithMaxResults(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		s := StartTestServer(t)
-		defer s.Stop()
+		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+		defer s.Stopper().Stop()
+		ts := s.(*TestServer)
 		retryOpts := base.DefaultRetryOptions()
-		retryOpts.Closer = s.stopper.ShouldDrain()
+		retryOpts.Closer = ts.stopper.ShouldQuiesce()
 		ds := kv.NewDistSender(&kv.DistSenderContext{
 			Clock:           s.Clock(),
 			RPCContext:      s.RPCContext(),
 			RPCRetryOptions: &retryOpts,
-		}, s.Gossip())
-		tds := kv.NewTxnCoordSender(ds, s.Clock(), s.Ctx.Linearizable, tracing.NewTracer(),
-			s.stopper, kv.NewTxnMetrics(metric.NewRegistry()))
+		}, ts.Gossip())
+		tds := kv.NewTxnCoordSender(ds, ts.Clock(), ts.Ctx.Linearizable, tracing.NewTracer(),
+			ts.stopper, kv.NewTxnMetrics(metric.NewRegistry()))
 
 		for _, sk := range tc.splitKeys {
-			if err := s.node.ctx.DB.AdminSplit(sk); err != nil {
+			if err := ts.node.ctx.DB.AdminSplit(sk); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -340,9 +346,10 @@ func TestMultiRangeScanWithMaxResults(t *testing.T) {
 		for start := 0; start < len(tc.keys); start++ {
 			// Try every possible maxResults, from 1 to beyond the size of key array.
 			for maxResults := 1; maxResults <= len(tc.keys)-start+1; maxResults++ {
-				scan := roachpb.NewScan(tc.keys[start], tc.keys[len(tc.keys)-1].Next(),
-					int64(maxResults))
-				reply, err := client.SendWrapped(tds, nil, scan)
+				scan := roachpb.NewScan(tc.keys[start], tc.keys[len(tc.keys)-1].Next())
+				reply, err := client.SendWrappedWith(
+					tds, nil, roachpb.Header{MaxSpanRequestKeys: int64(maxResults)}, scan,
+				)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -359,17 +366,17 @@ func TestMultiRangeScanWithMaxResults(t *testing.T) {
 
 func TestSystemConfigGossip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s := StartTestServer(t)
-	defer s.Stop()
+	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop()
+	ts := s.(*TestServer)
 
-	db := s.db
 	key := sqlbase.MakeDescMetadataKey(keys.MaxReservedDescID)
 	valAt := func(i int) *sqlbase.DatabaseDescriptor {
 		return &sqlbase.DatabaseDescriptor{Name: "foo", ID: sqlbase.ID(i)}
 	}
 
 	// Register a callback for gossip updates.
-	resultChan := s.Gossip().RegisterSystemConfigChannel()
+	resultChan := ts.Gossip().RegisterSystemConfigChannel()
 
 	// The span gets gossiped when it first shows up.
 	select {
@@ -380,12 +387,12 @@ func TestSystemConfigGossip(t *testing.T) {
 	}
 
 	// Try a plain KV write first.
-	if err := db.Put(key, valAt(0)); err != nil {
+	if err := kvDB.Put(key, valAt(0)); err != nil {
 		t.Fatal(err)
 	}
 
 	// Now do it as part of a transaction, but without the trigger set.
-	if err := db.Txn(func(txn *client.Txn) error {
+	if err := kvDB.Txn(func(txn *client.Txn) error {
 		return txn.Put(key, valAt(1))
 	}); err != nil {
 		t.Fatal(err)
@@ -393,20 +400,20 @@ func TestSystemConfigGossip(t *testing.T) {
 
 	// Gossip channel should be dormant.
 	// TODO(tschottdorf): This test is likely flaky. Why can't some other
-	// process trigger gossip? It seems that a new leader lease being
+	// process trigger gossip? It seems that a new range lease being
 	// acquired will gossip a new system config since the hash changed and fail
 	// the test (seen in practice during some buggy WIP).
 	var systemConfig config.SystemConfig
 	select {
 	case <-resultChan:
-		systemConfig, _ = s.gossip.GetSystemConfig()
+		systemConfig, _ = ts.gossip.GetSystemConfig()
 		t.Fatalf("unexpected message received on gossip channel: %v", systemConfig)
 
 	case <-time.After(50 * time.Millisecond):
 	}
 
 	// This time mark the transaction as having a Gossip trigger.
-	if err := db.Txn(func(txn *client.Txn) error {
+	if err := kvDB.Txn(func(txn *client.Txn) error {
 		txn.SetSystemConfigTrigger()
 		return txn.Put(key, valAt(2))
 	}); err != nil {
@@ -416,7 +423,7 @@ func TestSystemConfigGossip(t *testing.T) {
 	// New system config received.
 	select {
 	case <-resultChan:
-		systemConfig, _ = s.gossip.GetSystemConfig()
+		systemConfig, _ = ts.gossip.GetSystemConfig()
 
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("did not receive gossip message")

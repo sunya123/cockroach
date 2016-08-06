@@ -53,9 +53,12 @@ func TestPrettyPrint(t *testing.T) {
 		{AbortCacheKey(roachpb.RangeID(1000001), txnID), fmt.Sprintf(`/Local/RangeID/1000001/r/AbortCache/%q`, txnID)},
 		{RaftTombstoneKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RaftTombstone"},
 		{RaftAppliedIndexKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RaftAppliedIndex"},
+		{LeaseAppliedIndexKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/LeaseAppliedIndex"},
 		{RaftTruncatedStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RaftTruncatedState"},
-		{RangeLeaderLeaseKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeLeaderLease"},
+		{RangeLeaseKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeLease"},
 		{RangeStatsKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeStats"},
+		{RangeFrozenStatusKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeFrozenStatus"},
+		{RangeLastGCKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeLastGC"},
 
 		{RaftHardStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RaftHardState"},
 		{RaftLastIndexKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RaftLastIndex"},
@@ -65,7 +68,6 @@ func TestPrettyPrint(t *testing.T) {
 
 		{MakeRangeKeyPrefix(roachpb.RKey("ok")), `/Local/Range/"ok"`},
 		{RangeDescriptorKey(roachpb.RKey("111")), `/Local/Range/"111"/RangeDescriptor`},
-		{RangeTreeNodeKey(roachpb.RKey("111")), `/Local/Range/"111"/RangeTreeNode`},
 		{TransactionKey(roachpb.Key("111"), txnID), fmt.Sprintf(`/Local/Range/"111"/Transaction/addrKey:/id:%q`, txnID)},
 
 		{LocalMax, `/Meta1/""`}, // LocalMax == Meta1Prefix
@@ -146,7 +148,7 @@ func TestPrettyPrint(t *testing.T) {
 		{makeKey([]byte("")), "/Min"},
 		{Meta1KeyMax, "/Meta1/Max"},
 		{Meta2KeyMax, "/Meta2/Max"},
-		{makeKey(MakeTablePrefix(42), roachpb.RKey([]byte{0x12, 'a', 0x00, 0x02})), "/Table/42/<util/encoding/encoding.go:9999: unknown escape sequence: 0x0 0x2>"},
+		{makeKey(MakeTablePrefix(42), roachpb.RKey([]byte{0x12, 'a', 0x00, 0x02})), "/Table/42/<unknown escape sequence: 0x0 0x2>"},
 	}
 	for i, test := range testCases {
 		keyInfo := MassagePrettyPrintedSpanForTest(PrettyPrint(test.key), nil)

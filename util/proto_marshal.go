@@ -20,8 +20,9 @@ import (
 	"io"
 	"io/ioutil"
 
-	gwruntime "github.com/gengo/grpc-gateway/runtime"
 	"github.com/gogo/protobuf/proto"
+	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
+	"github.com/pkg/errors"
 
 	"github.com/cockroachdb/cockroach/util/protoutil"
 )
@@ -41,7 +42,7 @@ func (*ProtoPb) Marshal(v interface{}) ([]byte, error) {
 	if p, ok := v.(proto.Message); ok {
 		return protoutil.Marshal(p)
 	}
-	return nil, Errorf("unexpected type %T does not implement %s", v, typeProtoMessage)
+	return nil, errors.Errorf("unexpected type %T does not implement %s", v, typeProtoMessage)
 }
 
 // Unmarshal implements gwruntime.Marshaler.
@@ -49,7 +50,7 @@ func (*ProtoPb) Unmarshal(data []byte, v interface{}) error {
 	if p, ok := v.(proto.Message); ok {
 		return proto.Unmarshal(data, p)
 	}
-	return Errorf("unexpected type %T does not implement %s", v, typeProtoMessage)
+	return errors.Errorf("unexpected type %T does not implement %s", v, typeProtoMessage)
 }
 
 type protoDecoder struct {
@@ -70,7 +71,7 @@ func (d *protoDecoder) Decode(v interface{}) error {
 		}
 		return err
 	}
-	return Errorf("unexpected type %T does not implement %s", v, typeProtoMessage)
+	return errors.Errorf("unexpected type %T does not implement %s", v, typeProtoMessage)
 }
 
 type protoEncoder struct {
@@ -91,5 +92,5 @@ func (e *protoEncoder) Encode(v interface{}) error {
 		}
 		return err
 	}
-	return Errorf("unexpected type %T does not implement %s", v, typeProtoMessage)
+	return errors.Errorf("unexpected type %T does not implement %s", v, typeProtoMessage)
 }
