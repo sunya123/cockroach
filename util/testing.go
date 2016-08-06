@@ -9,9 +9,8 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
 //
 // Author: Spencer Kimball (spencer.kimball@gmail.com)
 
@@ -20,119 +19,133 @@ package util
 import (
 	"fmt"
 	"io/ioutil"
-	"net"
 	"os"
+	"path/filepath"
 	"reflect"
 	"time"
 
-	"github.com/golang/glog"
+	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
-// tempUnixFile creates a temporary file for use with a unix domain socket.
-func tempUnixFile() string {
-	f, err := ioutil.TempFile("", "unix-socket")
+// Tester is a proxy for e.g. testing.T which does not introduce a dependency
+// on "testing".
+type Tester interface {
+	Error(args ...interface{})
+	Errorf(format string, args ...interface{})
+	Failed() bool
+	Fatal(args ...interface{})
+	Fatalf(format string, args ...interface{})
+}
+
+type panicTesterImpl struct{}
+
+// PanicTester is a Tester which panics.
+var PanicTester = panicTesterImpl{}
+
+func (panicTesterImpl) Failed() bool { return false }
+
+func (pt panicTesterImpl) Error(args ...interface{}) {
+	pt.Fatal(args...)
+}
+
+func (pt panicTesterImpl) Errorf(format string, args ...interface{}) {
+	pt.Fatalf(format, args...)
+}
+
+func (panicTesterImpl) Fatal(args ...interface{}) {
+	panic(fmt.Sprint(args...))
+}
+
+func (panicTesterImpl) Fatalf(format string, args ...interface{}) {
+	panic(fmt.Sprintf(format, args...))
+}
+
+// CreateTempDir creates a temporary directory and returns its path.
+// You should usually call defer CleanupDir(dir) right after.
+func CreateTempDir(t Tester, prefix string) string {
+	dir, err := ioutil.TempDir("", prefix)
 	if err != nil {
-		glog.Fatalf("unable to create temp file: %s", err)
+		t.Fatal(err)
 	}
-	f.Close()
-	os.Remove(f.Name())
-	return f.Name()
+	return dir
 }
 
-// tempLocalhostAddr creates an address to localhost using a monotonically
-// increasing port number in the range [minLocalhostPort, ...].
-func tempLocalhostAddr() string {
-	return "127.0.0.1:0"
-}
-
-// CreateTestAddr creates an unused address for testing. The "network"
-// parameter should be one of "tcp" or "unix".
-func CreateTestAddr(network string) net.Addr {
-	switch network {
-	case "tcp":
-		addr, err := net.ResolveTCPAddr("tcp", tempLocalhostAddr())
-		if err != nil {
-			panic(err)
+// CreateRestrictedFile creates a file on disk which contains the
+// supplied byte string as its content. The resulting file will have restrictive
+// permissions; specifically, u=rw (0600). Returns the path of the created file
+// along with a function that will delete the created file.
+//
+// This is needed for some Go libraries (e.g. postgres SQL driver) which will
+// refuse to open certificate files that have overly permissive permissions.
+func CreateRestrictedFile(t Tester, contents []byte, tempdir, name string) string {
+	tempPath := filepath.Join(tempdir, name)
+	if err := ioutil.WriteFile(tempPath, contents, 0600); err != nil {
+		if t == nil {
+			log.Fatal(err)
+		} else {
+			t.Fatal(err)
 		}
-		return addr
-	case "unix":
-		addr, err := net.ResolveUnixAddr("unix", tempUnixFile())
-		if err != nil {
-			panic(err)
-		}
-		return addr
 	}
-	panic(fmt.Sprintf("unknown network type: %s", network))
+	return tempPath
 }
 
-// IsTrueWithin returns an error if the supplied function fails to
-// evaluate to true within the specified duration. The function is
-// invoked at most 50 times over the course of the specified time
-// duration.
-func IsTrueWithin(trueFunc func() bool, duration time.Duration) error {
-	for i := 0; i < 50; i++ {
-		if trueFunc() {
+// CleanupDir removes the passed-in directory and all contents. Errors are ignored.
+func CleanupDir(dir string) {
+	_ = os.RemoveAll(dir)
+}
+
+const defaultSucceedsSoonDuration = 15 * time.Second
+
+// SucceedsSoon fails the test (with t.Fatal) unless the supplied
+// function runs without error within a preset maximum duration. The
+// function is invoked immediately at first and then successively with
+// an exponential backoff starting at 1ns and ending at the maximum
+// duration (currently 15s).
+func SucceedsSoon(t Tester, fn func() error) {
+	SucceedsSoonDepth(1, t, fn)
+}
+
+// SucceedsSoonDepth is like SucceedsSoon() but with an additional
+// stack depth offset.
+func SucceedsSoonDepth(depth int, t Tester, fn func() error) {
+	if err := RetryForDuration(defaultSucceedsSoonDuration, fn); err != nil {
+		t.Fatal(ErrorfSkipFrames(1+depth, "condition failed to evaluate within %s: %s", defaultSucceedsSoonDuration, err))
+	}
+}
+
+// RetryForDuration will retry the given function until it either returns
+// without error, or the given duration has elapsed. The function is invoked
+// immediately at first and then successively with an exponential backoff
+// starting at 1ns and ending at the specified duration.
+func RetryForDuration(duration time.Duration, fn func() error) error {
+	deadline := timeutil.Now().Add(duration)
+	var lastErr error
+	for wait := time.Duration(1); timeutil.Now().Before(deadline); wait *= 2 {
+		lastErr = fn()
+		if lastErr == nil {
 			return nil
 		}
-		time.Sleep(duration / 50)
+		if wait > time.Second {
+			wait = time.Second
+		}
+		time.Sleep(wait)
 	}
-	return fmt.Errorf("condition failed to evaluate true within %s", duration)
+	return lastErr
 }
 
-// ContainsSameElements compares, without taking order on the
-// first level, the contents of two slices of the same type.
-// The elements of the slice must have comparisons defined,
-// otherwise a panic will result.
-func ContainsSameElements(s1, s2 interface{}) bool {
-	// TODO add support for chans when needed.
-	// Preliminary checks to weed out incompatible inputs.
-	if reflect.TypeOf(s1).Kind() != reflect.Slice || reflect.TypeOf(s2).Kind() != reflect.Slice {
-		panic("received non-slice argument")
-	}
-	if reflect.TypeOf(s1) != reflect.TypeOf(s2) {
-		panic("received slices with incompatible types")
-	}
-
-	// Create a map that keeps a count of how often we see
-	// each element in the slices.
-	m := reflect.MakeMap(reflect.MapOf(reflect.TypeOf(s1).Elem(), reflect.TypeOf(uint64(0))))
-
-	// Get the actual slices we are comparing.
-	rs1 := reflect.ValueOf(s1)
-	rs2 := reflect.ValueOf(s2)
-
-	var zeroValue reflect.Value
-
-	if rs1.Len() != rs2.Len() {
-		return false
-	}
-
-	// Fill the counting hash map using the first slice.
-	for i := 0; i < rs1.Len(); i++ {
-		v := rs1.Index(i)
-		k := m.MapIndex(v)
-		if k == zeroValue {
-			// The entry did not exist, so the new count is 1.
-			m.SetMapIndex(v, reflect.ValueOf(uint64(1)))
-		} else {
-			m.SetMapIndex(v, reflect.ValueOf(k.Uint()+uint64(1)))
+// NoZeroField returns nil if none of the fields of the struct underlying the
+// interface are equal to the zero value, and an error otherwise.
+// It will panic if the struct has unexported fields and for any non-struct.
+func NoZeroField(v interface{}) error {
+	ele := reflect.Indirect(reflect.ValueOf(v))
+	eleT := ele.Type()
+	for i := 0; i < ele.NumField(); i++ {
+		f := ele.Field(i)
+		zero := reflect.Zero(f.Type())
+		if reflect.DeepEqual(f.Interface(), zero.Interface()) {
+			return fmt.Errorf("expected %s field to be non-zero", eleT.Field(i).Name)
 		}
 	}
-
-	// Compare the counts from s1 against the second slice.
-	for i := 0; i < rs2.Len(); i++ {
-		v := rs2.Index(i)
-		k := m.MapIndex(v)
-		if k == zeroValue {
-			return false
-		} else if k.Uint() == 1 {
-			// Setting the zero value removes the entry.
-			m.SetMapIndex(v, zeroValue)
-		} else {
-			m.SetMapIndex(v, reflect.ValueOf(k.Uint()-uint64(1)))
-		}
-	}
-
-	// If all went well until here, the map is now empty.
-	return m.Len() == 0
+	return nil
 }

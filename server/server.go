@@ -9,304 +9,567 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
 //
 // Author: Andrew Bonventre (andybons@gmail.com)
 // Author: Spencer Kimball (spencer.kimball@gmail.com)
 
-// Package server implements a basic HTTP server for interacting with a node.
 package server
 
 import (
 	"compress/gzip"
-	"flag"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
-	"os/signal"
-	"regexp"
-	"sort"
-	"strconv"
 	"strings"
+	"sync"
+	"time"
 
-	commander "code.google.com/p/go-commander"
+	"golang.org/x/net/context"
+
+	gwruntime "github.com/gengo/grpc-gateway/runtime"
+	opentracing "github.com/opentracing/opentracing-go"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+
+	"github.com/cockroachdb/cmux"
+	"github.com/cockroachdb/cockroach/base"
+	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/kv"
+	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/rpc"
+	"github.com/cockroachdb/cockroach/server/status"
+	"github.com/cockroachdb/cockroach/sql"
+	"github.com/cockroachdb/cockroach/sql/distsql"
+	"github.com/cockroachdb/cockroach/sql/pgwire"
 	"github.com/cockroachdb/cockroach/storage"
-	"github.com/cockroachdb/cockroach/structured"
+	"github.com/cockroachdb/cockroach/ts"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/golang/glog"
+	"github.com/cockroachdb/cockroach/util/hlc"
+	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/metric"
+	"github.com/cockroachdb/cockroach/util/sdnotify"
+	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/tracing"
 )
 
 var (
-	rpcAddr  = flag.String("rpc_addr", ":0", "host:port to bind for RPC traffic; 0 to pick unused port")
-	httpAddr = flag.String("http_addr", ":8080", "host:port to bind for HTTP traffic; 0 to pick unused port")
+	// Allocation pool for gzip writers.
+	gzipWriterPool sync.Pool
 
-	// stores is specified to enable durable storage via RocksDB-backed
-	// key-value stores. Memory-backed key value stores may be
-	// optionally specified via mem=<integer byte size>.
-	stores = flag.String("stores", "", "specify a comma-separated list of stores, "+
-		"specified by a colon-separated list of device attributes followed by '=' and "+
-		"either a filepath for a persistent store or an integer size in bytes for an "+
-		"in-memory store. Device attributes typically include whether the store is "+
-		"flash (ssd), spinny disk (hdd), fusion-io (fio), in-memory (mem); device "+
-		"attributes might also include speeds and other specs (7200rpm, 200kiops, etc.). "+
-		"For example, -store=hdd:7200rpm=/mnt/hda1,ssd=/mnt/ssd01,ssd=/mnt/ssd02,mem=1073741824")
-
-	// attrs specifies node topography or machine capabilities, used to
-	// match capabilities or location preferences specified in zone configs.
-	attrs = flag.String("attrs", "", "specify a comma-separated list of node "+
-		"attributes. Attributes are arbitrary strings specifying topography or "+
-		"machine capabilities. Topography might include datacenter designation (e.g. "+
-		"\"us-west-1a\", \"us-west-1b\", \"us-east-1c\"). Machine capabilities "+
-		"might include specialized hardware or number of cores (e.g. \"gpu\", "+
-		"\"x16c\"). For example: -attrs=us-west-1b,gpu")
-
-	// Regular expression for capturing data directory specifications.
-	storesRE = regexp.MustCompile(`([^=]+)=([^,]+)(,|$)`)
+	// GracefulDrainModes is the standard succession of drain modes entered
+	// for a graceful shutdown.
+	GracefulDrainModes = []DrainMode{DrainMode_CLIENT, DrainMode_LEADERSHIP}
 )
 
-// A CmdStart command starts nodes by joining the gossip network.
-var CmdStart = &commander.Command{
-	UsageLine: "start -gossip=host1:port1[,host2:port2...] " +
-		"-stores=(ssd=<data-dir>|hdd=<data-dir>|mem=<capacity-in-bytes>)[,...]",
-	Short: "start node by joining the gossip network",
-	Long: fmt.Sprintf(`
-
-Start Cockroach node by joining the gossip network and exporting key
-ranges stored on physical device(s). The gossip network is joined by
-contacting one or more well-known hosts specified by the -gossip
-command line flag. Every node should be run with the same list of
-bootstrap hosts to guarantee a connected network. An alternate
-approach is to use a single host for -gossip and round-robin DNS.
-
-Each node exports data from one or more physical devices. These
-devices are specified via the -stores command line flag. This is a
-comma-separated list of paths to storage directories or for in-memory
-stores, the number of bytes. Although the paths should be specified to
-correspond uniquely to physical devices, this requirement isn't
-strictly enforced.
-
-A node exports an HTTP API with the following endpoints:
-
-  Health check:           /healthz
-  Key-value REST:         %s
-  Structured Schema REST: %s
-`, kv.KVKeyPrefix, structured.StructuredKeyPrefix),
-	Run:  runStart,
-	Flag: *flag.CommandLine,
+// Server is the cockroach server node.
+type Server struct {
+	Tracer              opentracing.Tracer
+	ctx                 *Context
+	mux                 *http.ServeMux
+	clock               *hlc.Clock
+	rpcContext          *rpc.Context
+	grpc                *grpc.Server
+	gossip              *gossip.Gossip
+	storePool           *storage.StorePool
+	distSender          *kv.DistSender
+	db                  *client.DB
+	kvDB                *kv.DBServer
+	pgServer            *pgwire.Server
+	distSQLServer       *distsql.ServerImpl
+	node                *Node
+	recorder            *status.MetricsRecorder
+	runtime             status.RuntimeStatSampler
+	admin               *adminServer
+	status              *statusServer
+	tsDB                *ts.DB
+	tsServer            *ts.Server
+	raftTransport       *storage.RaftTransport
+	stopper             *stop.Stopper
+	sqlExecutor         *sql.Executor
+	leaseMgr            *sql.LeaseManager
+	schemaChangeManager *sql.SchemaChangeManager
+	parsedUpdatesURL    *url.URL
+	parsedReportingURL  *url.URL
 }
 
-type server struct {
-	host           string
-	mux            *http.ServeMux
-	rpc            *rpc.Server
-	gossip         *gossip.Gossip
-	kvDB           kv.DB
-	kvREST         *kv.RESTServer
-	node           *Node
-	admin          *adminServer
-	structuredDB   *structured.DB
-	structuredREST *structured.RESTServer
-	httpListener   *net.Listener // holds http endpoint information
-}
-
-// runStart starts the cockroach node using -stores as the list of
-// storage devices ("stores") on this machine and -gossip as the list
-// of "well-known" hosts used to join this node to the cockroach
-// cluster via the gossip network.
-func runStart(cmd *commander.Command, args []string) {
-	glog.Info("Starting cockroach cluster")
-	s, err := newServer()
-	if err != nil {
-		glog.Errorf("Failed to start Cockroach server: %v", err)
-		return
-	}
-	// Init engines from -stores.
-	engines, err := initEngines(*stores)
-	if err != nil {
-		glog.Errorf("Failed to initialize engines from -stores=%q: %v", *stores, err)
-		return
-	}
-	if len(engines) == 0 {
-		glog.Errorf("No valid engines specified after initializing from -stores=%q", *stores)
-		return
+// NewServer creates a Server from a server.Context.
+func NewServer(ctx *Context, stopper *stop.Stopper) (*Server, error) {
+	if ctx == nil {
+		return nil, util.Errorf("ctx must not be null")
 	}
 
-	err = s.start(engines, false)
-	defer s.stop()
-	if err != nil {
-		glog.Errorf("Cockroach server exited with error: %v", err)
-		return
+	if _, err := net.ResolveTCPAddr("tcp", ctx.Addr); err != nil {
+		return nil, util.Errorf("unable to resolve RPC address %q: %v", ctx.Addr, err)
 	}
 
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, os.Kill)
+	if ctx.Insecure {
+		log.Warning("running in insecure mode, this is strongly discouraged. See --insecure.")
+	}
+	// Try loading the TLS configs before anything else.
+	if _, err := ctx.GetServerTLSConfig(); err != nil {
+		return nil, err
+	}
+	if _, err := ctx.GetClientTLSConfig(); err != nil {
+		return nil, err
+	}
 
-	// Block until one of the signals above is received.
-	<-c
-}
+	s := &Server{
+		Tracer:  tracing.NewTracer(),
+		ctx:     ctx,
+		mux:     http.NewServeMux(),
+		clock:   hlc.NewClock(hlc.UnixNano),
+		stopper: stopper,
+	}
+	s.clock.SetMaxOffset(ctx.MaxOffset)
 
-// parseAttributes parses a colon-separated list of strings,
-// filtering empty strings (i.e. ",," will yield no attributes.
-// Returns the list of strings as Attributes.
-func parseAttributes(attrsStr string) storage.Attributes {
-	var filtered []string
-	for _, attr := range strings.Split(attrsStr, ":") {
-		if len(attr) != 0 {
-			filtered = append(filtered, attr)
+	s.rpcContext = rpc.NewContext(&ctx.Context, s.clock, stopper)
+	s.rpcContext.HeartbeatCB = func() {
+		if err := s.rpcContext.RemoteClocks.VerifyClockOffset(); err != nil {
+			log.Fatal(err)
 		}
 	}
-	sort.Strings(filtered)
-	return storage.Attributes(filtered)
-}
 
-// initEngines interprets the stores parameter to initialize a slice of
-// storage.Engine objects.
-func initEngines(stores string) ([]storage.Engine, error) {
-	// Error if regexp doesn't match.
-	storeSpecs := storesRE.FindAllStringSubmatch(stores, -1)
-	if storeSpecs == nil || len(storeSpecs) == 0 {
-		return nil, util.Errorf("invalid or empty engines specification %q", stores)
+	s.gossip = gossip.New(s.rpcContext, s.ctx.GossipBootstrapResolvers, stopper)
+	s.storePool = storage.NewStorePool(s.gossip, s.clock, ctx.TimeUntilStoreDead, stopper)
+
+	// A custom RetryOptions is created which uses stopper.ShouldDrain() as
+	// the Closer. This prevents infinite retry loops from occurring during
+	// graceful server shutdown
+	//
+	// Such a loop loop occurs with the DistSender attempts a connection to the
+	// local server during shutdown, and receives an internal server error (HTTP
+	// Code 5xx). This is the correct error for a server to return when it is
+	// shutting down, and is normally retryable in a cluster environment.
+	// However, on a single-node setup (such as a test), retries will never
+	// succeed because the only server has been shut down; thus, thus the
+	// DistSender needs to know that it should not retry in this situation.
+	retryOpts := base.DefaultRetryOptions()
+	retryOpts.Closer = stopper.ShouldDrain()
+	s.distSender = kv.NewDistSender(&kv.DistSenderContext{
+		Clock:           s.clock,
+		RPCContext:      s.rpcContext,
+		RPCRetryOptions: &retryOpts,
+	}, s.gossip)
+	txnRegistry := metric.NewRegistry()
+	txnMetrics := kv.NewTxnMetrics(txnRegistry)
+	sender := kv.NewTxnCoordSender(s.distSender, s.clock, ctx.Linearizable, s.Tracer,
+		s.stopper, txnMetrics)
+	s.db = client.NewDB(sender)
+
+	s.grpc = rpc.NewServer(s.rpcContext)
+	s.raftTransport = storage.NewRaftTransport(storage.GossipAddressResolver(s.gossip), s.grpc, s.rpcContext)
+
+	s.kvDB = kv.NewDBServer(&s.ctx.Context, sender, stopper)
+	roachpb.RegisterExternalServer(s.grpc, s.kvDB)
+
+	// Set up Lease Manager
+	var lmKnobs sql.LeaseManagerTestingKnobs
+	if ctx.TestingKnobs.SQLLeaseManager != nil {
+		lmKnobs = *ctx.TestingKnobs.SQLLeaseManager.(*sql.LeaseManagerTestingKnobs)
 	}
+	s.leaseMgr = sql.NewLeaseManager(0, *s.db, s.clock, lmKnobs)
+	s.leaseMgr.RefreshLeases(s.stopper, s.db, s.gossip)
 
-	engines := []storage.Engine{}
-	for _, store := range storeSpecs {
-		if len(store) != 4 {
-			return nil, util.Errorf("unable to parse attributes and path from store %q", store[0])
-		}
-		// There are two matches for each store specification: the colon-separated
-		// list of attributes and the path.
-		engine, err := initEngine(store[1], store[2])
-		if err != nil {
-			return nil, util.Errorf("unable to init engine for store %q: %v", store[0], err)
-		}
-		engines = append(engines, engine)
+	// Set up Executor
+	eCtx := sql.ExecutorContext{
+		DB:           s.db,
+		Gossip:       s.gossip,
+		LeaseManager: s.leaseMgr,
+		Clock:        s.clock,
 	}
-
-	return engines, nil
-}
-
-// initEngine parses the store attributes as a colon-separated list
-// and instantiates an engine based on the dir parameter. If dir parses
-// to an integer, it's taken to mean an in-memory engine; otherwise,
-// dir is treated as a path and a RocksDB engine is created.
-func initEngine(attrsStr, path string) (storage.Engine, error) {
-	attrs := parseAttributes(attrsStr)
-	var engine storage.Engine
-	if size, err := strconv.ParseUint(path, 10, 64); err == nil {
-		if size == 0 {
-			return nil, util.Errorf("unable to initialize an in-memory store with capacity 0")
-		}
-		engine = storage.NewInMem(attrs, int64(size))
+	if ctx.TestingKnobs.SQLExecutor != nil {
+		eCtx.TestingKnobs = ctx.TestingKnobs.SQLExecutor.(*sql.ExecutorTestingKnobs)
 	} else {
-		engine, err = storage.NewRocksDB(attrs, path)
-		if err != nil {
-			return nil, util.Errorf("unable to init rocksdb with data dir %q: %v", path, err)
-		}
+		eCtx.TestingKnobs = &sql.ExecutorTestingKnobs{}
 	}
 
-	return engine, nil
-}
+	sqlRegistry := metric.NewRegistry()
+	s.sqlExecutor = sql.NewExecutor(eCtx, s.stopper, sqlRegistry)
 
-func newServer() (*server, error) {
-	// Determine hostname in case it hasn't been specified in -rpc_addr or -http_addr.
-	host, err := os.Hostname()
-	if err != nil {
-		host = "127.0.0.1"
+	s.pgServer = pgwire.MakeServer(&s.ctx.Context, s.sqlExecutor, sqlRegistry)
+
+	distSQLCtx := distsql.ServerContext{
+		DB: s.db,
+	}
+	s.distSQLServer = distsql.NewServer(distSQLCtx)
+	distsql.RegisterDistSQLServer(s.grpc, s.distSQLServer)
+
+	// TODO(bdarnell): make StoreConfig configurable.
+	nCtx := storage.StoreContext{
+		Clock:                          s.clock,
+		DB:                             s.db,
+		Gossip:                         s.gossip,
+		Transport:                      s.raftTransport,
+		RaftTickInterval:               s.ctx.RaftTickInterval,
+		ScanInterval:                   s.ctx.ScanInterval,
+		ScanMaxIdleTime:                s.ctx.ScanMaxIdleTime,
+		ConsistencyCheckInterval:       s.ctx.ConsistencyCheckInterval,
+		ConsistencyCheckPanicOnFailure: s.ctx.ConsistencyCheckPanicOnFailure,
+		Tracer:    s.Tracer,
+		StorePool: s.storePool,
+		SQLExecutor: sql.InternalExecutor{
+			LeaseManager: s.leaseMgr,
+		},
+		LogRangeEvents: true,
+		AllocatorOptions: storage.AllocatorOptions{
+			AllowRebalance: true,
+		},
+	}
+	if ctx.TestingKnobs.Store != nil {
+		nCtx.TestingKnobs = *ctx.TestingKnobs.Store.(*storage.StoreTestingKnobs)
 	}
 
-	// Resolve
-	if strings.HasPrefix(*rpcAddr, ":") {
-		*rpcAddr = host + *rpcAddr
-	}
-	addr, err := net.ResolveTCPAddr("tcp", *rpcAddr)
-	if err != nil {
-		return nil, util.Errorf("unable to resolve RPC address %q: %v", *rpcAddr, err)
-	}
+	s.recorder = status.NewMetricsRecorder(s.clock)
+	s.recorder.AddNodeRegistry("sql.%s", sqlRegistry)
+	s.recorder.AddNodeRegistry("txn.%s", txnRegistry)
+	s.recorder.AddNodeRegistry("clock-offset.%s", s.rpcContext.RemoteClocks.Registry())
 
-	s := &server{
-		host: host,
-		mux:  http.NewServeMux(),
-		rpc:  rpc.NewServer(addr),
-	}
+	s.runtime = status.MakeRuntimeStatSampler(s.clock)
+	s.recorder.AddNodeRegistry("sys.%s", s.runtime.Registry())
 
-	s.gossip = gossip.New()
-	s.kvDB = kv.NewDB(s.gossip)
-	s.kvREST = kv.NewRESTServer(s.kvDB)
-	s.node = NewNode(s.kvDB, s.gossip)
-	s.admin = newAdminServer(s.kvDB)
-	s.structuredDB = structured.NewDB(s.kvDB)
-	s.structuredREST = structured.NewRESTServer(s.structuredDB)
+	s.node = NewNode(nCtx, s.recorder, s.stopper, txnMetrics, sql.MakeEventLogger(s.leaseMgr))
+	roachpb.RegisterInternalServer(s.grpc, s.node)
+
+	s.tsDB = ts.NewDB(s.db)
+	s.tsServer = ts.NewServer(s.tsDB)
+
+	s.admin = newAdminServer(s)
+	s.status = newStatusServer(s.db, s.gossip, s.recorder, s.ctx, s.rpcContext, s.node.stores)
+	for _, gw := range []grpcGatewayServer{s.admin, s.status} {
+		gw.RegisterService(s.grpc)
+	}
 
 	return s, nil
 }
 
-// start runs the RPC and HTTP servers, starts the gossip instance (if
-// selfBootstrap is true, uses the rpc server's address as the gossip
-// bootstrap), and starts the node using the supplied engines slice.
-func (s *server) start(engines []storage.Engine, selfBootstrap bool) error {
-	s.rpc.Start() // bind RPC socket and launch goroutine.
-	glog.Infof("Started RPC server at %s", s.rpc.Addr())
+// grpcGatewayServer represents a grpc service with HTTP endpoints through GRPC
+// gateway.
+type grpcGatewayServer interface {
+	RegisterService(g *grpc.Server)
+	RegisterGateway(
+		ctx context.Context,
+		mux *gwruntime.ServeMux,
+		addr string,
+		opts []grpc.DialOption,
+	) error
+}
 
-	// Handle self-bootstrapping case for a single node.
-	if selfBootstrap {
-		s.gossip.SetBootstrap([]net.Addr{s.rpc.Addr()})
+// Start starts the server on the specified port, starts gossip and
+// initializes the node using the engines from the server's context.
+func (s *Server) Start() error {
+	s.initHTTP()
+
+	tlsConfig, err := s.ctx.GetServerTLSConfig()
+	if err != nil {
+		return err
 	}
-	s.gossip.Start(s.rpc)
-	glog.Infoln("Started gossip instance")
 
-	// Init the engines specified via command line flags if not supplied.
-	if engines == nil {
-		var err error
-		engines, err = initEngines(*stores)
+	// The following code is a specialization of util/net.go's ListenAndServe
+	// which adds pgwire support. A single port is used to serve all protocols
+	// (pg, http, h2) via the following construction:
+	//
+	// non-TLS case:
+	// net.Listen -> cmux.New
+	//               |
+	//               -  -> pgwire.Match -> pgwire.Server.ServeConn
+	//               -  -> cmux.Any -> grpc.(*Server).Serve
+	//
+	// TLS case:
+	// net.Listen -> cmux.New
+	//               |
+	//               -  -> pgwire.Match -> pgwire.Server.ServeConn
+	//               -  -> cmux.Any -> grpc.(*Server).Serve
+	//
+	// Note that the difference between the TLS and non-TLS cases exists due to
+	// Go's lack of an h2c (HTTP2 Clear Text) implementation. See inline comments
+	// in util.ListenAndServe for an explanation of how h2c is implemented there
+	// and here.
+
+	ln, err := net.Listen("tcp", s.ctx.Addr)
+	if err != nil {
+		return err
+	}
+	unresolvedAddr, err := officialAddr(s.ctx.Addr, ln.Addr())
+	if err != nil {
+		return err
+	}
+	s.ctx.Addr = unresolvedAddr.String()
+	s.rpcContext.SetLocalInternalServer(s.node, s.ctx.Addr)
+
+	s.stopper.RunWorker(func() {
+		<-s.stopper.ShouldDrain()
+		if err := ln.Close(); err != nil {
+			log.Fatal(err)
+		}
+	})
+
+	m := cmux.New(ln)
+	pgL := m.Match(pgwire.Match)
+	anyL := m.Match(cmux.Any())
+
+	httpLn, err := net.Listen("tcp", s.ctx.HTTPAddr)
+	if err != nil {
+		return err
+	}
+	unresolvedHTTPAddr, err := officialAddr(s.ctx.HTTPAddr, httpLn.Addr())
+	if err != nil {
+		return err
+	}
+	s.ctx.HTTPAddr = unresolvedHTTPAddr.String()
+
+	s.stopper.RunWorker(func() {
+		<-s.stopper.ShouldDrain()
+		if err := httpLn.Close(); err != nil {
+			log.Fatal(err)
+		}
+	})
+
+	if tlsConfig != nil {
+		httpMux := cmux.New(httpLn)
+		clearL := httpMux.Match(cmux.HTTP1Fast())
+		tlsL := httpMux.Match(cmux.Any())
+
+		s.stopper.RunWorker(func() {
+			util.FatalIfUnexpected(httpMux.Serve())
+		})
+
+		util.ServeHandler(s.stopper, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// TODO(tamird): s/308/http.StatusPermanentRedirect/ when it exists.
+			http.Redirect(w, r, "https://"+r.Host+r.RequestURI, 308)
+		}), clearL, tlsConfig)
+
+		httpLn = tls.NewListener(tlsL, tlsConfig)
+	}
+
+	serveConn := util.ServeHandler(s.stopper, s, httpLn, tlsConfig)
+
+	s.stopper.RunWorker(func() {
+		util.FatalIfUnexpected(s.grpc.Serve(anyL))
+	})
+
+	s.stopper.RunWorker(func() {
+		util.FatalIfUnexpected(serveConn(pgL, func(conn net.Conn) {
+			if err := s.pgServer.ServeConn(conn); err != nil && !util.IsClosedConnection(err) {
+				log.Error(err)
+			}
+		}))
+	})
+
+	if len(s.ctx.SocketFile) != 0 {
+		// Unix socket enabled: postgres protocol only.
+		unixLn, err := net.Listen("unix", s.ctx.SocketFile)
 		if err != nil {
+			return err
+		}
+
+		s.stopper.RunWorker(func() {
+			<-s.stopper.ShouldDrain()
+			if err := unixLn.Close(); err != nil {
+				log.Fatal(err)
+			}
+		})
+
+		s.stopper.RunWorker(func() {
+			util.FatalIfUnexpected(serveConn(unixLn, func(conn net.Conn) {
+				if err := s.pgServer.ServeConn(conn); err != nil && !util.IsClosedConnection(err) {
+					log.Error(err)
+				}
+			}))
+		})
+	}
+
+	s.gossip.Start(s.grpc, unresolvedAddr)
+
+	if err := s.node.start(unresolvedAddr, s.ctx.Engines, s.ctx.NodeAttributes); err != nil {
+		return err
+	}
+
+	// Begin recording runtime statistics.
+	s.startSampleEnvironment(s.ctx.MetricsSampleInterval)
+
+	// Begin recording time series data collected by the status monitor.
+	s.tsDB.PollSource(s.recorder, s.ctx.MetricsSampleInterval, ts.Resolution10s, s.stopper)
+
+	// Begin recording status summaries.
+	s.node.startWriteSummaries(s.ctx.MetricsSampleInterval)
+
+	s.sqlExecutor.SetNodeID(s.node.Descriptor.NodeID)
+	// Create and start the schema change manager only after a NodeID
+	// has been assigned.
+	testingKnobs := &sql.SchemaChangeManagerTestingKnobs{}
+	if s.ctx.TestingKnobs.SQLSchemaChangeManager != nil {
+		testingKnobs =
+			s.ctx.TestingKnobs.SQLSchemaChangeManager.(*sql.SchemaChangeManagerTestingKnobs)
+	}
+	s.schemaChangeManager = sql.NewSchemaChangeManager(testingKnobs, *s.db, s.gossip, s.leaseMgr)
+	s.schemaChangeManager.Start(s.stopper)
+
+	s.periodicallyCheckForUpdates()
+
+	log.Infof("starting %s server at %s", s.ctx.HTTPRequestScheme(), unresolvedHTTPAddr)
+	log.Infof("starting grpc/postgres server at %s", unresolvedAddr)
+	if len(s.ctx.SocketFile) != 0 {
+		log.Infof("starting postgres server at unix:%s", s.ctx.SocketFile)
+	}
+
+	s.stopper.RunWorker(func() {
+		util.FatalIfUnexpected(m.Serve())
+	})
+
+	// Initialize grpc-gateway mux and context.
+	jsonpb := new(util.JSONPb)
+	protopb := new(util.ProtoPb)
+	gwMux := gwruntime.NewServeMux(
+		gwruntime.WithMarshalerOption(gwruntime.MIMEWildcard, jsonpb),
+		gwruntime.WithMarshalerOption(util.ProtoContentType, protopb),
+		gwruntime.WithMarshalerOption(util.AltProtoContentType, protopb),
+	)
+	gwCtx, gwCancel := context.WithCancel(context.Background())
+	s.stopper.AddCloser(stop.CloserFn(gwCancel))
+
+	// Setup HTTP<->gRPC handlers.
+	var opts []grpc.DialOption
+	if s.ctx.Insecure {
+		opts = append(opts, grpc.WithInsecure())
+	} else {
+		tlsConfig, err := s.ctx.GetClientTLSConfig()
+		if err != nil {
+			return err
+		}
+		opts = append(
+			opts,
+			// TODO(tamird): remove this timeout. It is currently necessary because
+			// GRPC will not actually bail on a bad certificate error - it will just
+			// retry indefinitely. See https://github.com/grpc/grpc-go/issues/622.
+			grpc.WithTimeout(base.NetworkTimeout),
+			grpc.WithBlock(),
+			grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
+		)
+	}
+
+	for _, gw := range []grpcGatewayServer{s.admin, s.status} {
+		if err := gw.RegisterGateway(gwCtx, gwMux, s.ctx.Addr, opts); err != nil {
 			return err
 		}
 	}
 
-	// Init the node attributes from the -attrs command line flag.
-	nodeAttrs := parseAttributes(*attrs)
+	if err := sdnotify.Ready(); err != nil {
+		log.Errorf("failed to signal readiness using systemd protocol: %s", err)
+	}
 
-	if err := s.node.start(s.rpc, engines, nodeAttrs); err != nil {
-		return err
-	}
-	glog.Infof("Initialized %d storage engine(s)", len(engines))
-
-	s.initHTTP()
-	if strings.HasPrefix(*httpAddr, ":") {
-		*httpAddr = s.host + *httpAddr
-	}
-	ln, err := net.Listen("tcp", *httpAddr)
-	if err != nil {
-		return util.Errorf("could not listen on %s: %s", *httpAddr, err)
-	}
-	// Obtaining the http end point listener is difficult using
-	// http.ListenAndServe(), so we are storing it with the server
-	s.httpListener = &ln
-	glog.Infof("Starting HTTP server at %s", ln.Addr())
-	go http.Serve(ln, s)
 	return nil
 }
 
-func (s *server) initHTTP() {
-	s.mux.HandleFunc(adminKeyPrefix+"healthz", s.admin.handleHealthz)
-	s.mux.HandleFunc(zoneKeyPrefix, s.admin.handleZoneAction)
-	s.mux.HandleFunc(kv.KVKeyPrefix, s.kvREST.HandleAction)
-	s.mux.HandleFunc(structured.StructuredKeyPrefix, s.structuredREST.HandleAction)
+func (s *Server) doDrain(modes []DrainMode, setTo bool) ([]DrainMode, error) {
+	for _, mode := range modes {
+		var err error
+		switch {
+		case mode == DrainMode_CLIENT:
+			err = s.pgServer.SetDraining(setTo)
+		case mode == DrainMode_LEADERSHIP:
+			err = s.node.SetDraining(setTo)
+		default:
+			err = util.Errorf("unknown drain mode: %v (%d)", mode, mode)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	var nowOn []DrainMode
+	if s.pgServer.IsDraining() {
+		nowOn = append(nowOn, DrainMode_CLIENT)
+	}
+	if s.node.IsDraining() {
+		nowOn = append(nowOn, DrainMode_LEADERSHIP)
+	}
+	return nowOn, nil
 }
 
-func (s *server) stop() {
-	// TODO(spencer): the http server should exit; this functionality is
-	// slated for go 1.3.
-	s.node.stop()
-	s.gossip.Stop()
-	s.rpc.Close()
+// Drain idempotently activates the given DrainModes on the Server in the order
+// in which they are supplied.
+// For example, Drain is typically called with [CLIENT,LEADERSHIP] before
+// terminating the process for graceful shutdown.
+// On success, returns all active drain modes after carrying out the request.
+// On failure, the system may be in a partially drained state and should be
+// recovered by calling Undrain() with the same (or a larger) slice of modes.
+func (s *Server) Drain(on []DrainMode) ([]DrainMode, error) {
+	return s.doDrain(on, true)
+}
+
+// Undrain idempotently deactivates the given DrainModes on the Server in the
+// order in which they are supplied.
+// On success, returns any remaining active drain modes.
+func (s *Server) Undrain(off []DrainMode) []DrainMode {
+	nowActive, err := s.doDrain(off, false)
+	if err != nil {
+		panic(fmt.Sprintf("error returned to Undrain: %s", err))
+	}
+	return nowActive
+}
+
+// startSampleEnvironment begins a worker that periodically instructs the
+// runtime stat sampler to sample the environment.
+func (s *Server) startSampleEnvironment(frequency time.Duration) {
+	// Immediately record summaries once on server startup.
+	s.stopper.RunWorker(func() {
+		ticker := time.NewTicker(frequency)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.runtime.SampleEnvironment()
+			case <-s.stopper.ShouldStop():
+				return
+			}
+		}
+	})
+}
+
+var uiFileSystem http.FileSystem
+
+// initHTTP registers http prefixes.
+func (s *Server) initHTTP() {
+	s.mux.Handle("/", http.FileServer(uiFileSystem))
+
+	// The admin server handles both /debug/ and /_admin/
+	// TODO(marc): when cookie-based authentication exists,
+	// apply it for all web endpoints.
+	s.mux.Handle(adminEndpoint, s.admin)
+	s.mux.Handle(debugEndpoint, s.admin)
+	s.mux.Handle(statusPrefix, s.status)
+	s.mux.Handle(healthEndpoint, s.status)
+	s.mux.Handle(ts.URLPrefix, s.tsServer)
+}
+
+// Stop stops the server.
+func (s *Server) Stop() {
+	s.stopper.Stop()
+}
+
+// ServeHTTP is necessary to implement the http.Handler interface.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// This is our base handler, so catch all panics and make sure they stick.
+	defer log.FatalOnPanic()
+
+	// Disable caching of responses.
+	w.Header().Set("Cache-control", "no-cache")
+
+	ae := r.Header.Get(util.AcceptEncodingHeader)
+	switch {
+	case strings.Contains(ae, util.GzipEncoding):
+		w.Header().Set(util.ContentEncodingHeader, util.GzipEncoding)
+		gzw := newGzipResponseWriter(w)
+		defer gzw.Close()
+		w = gzw
+	}
+	s.mux.ServeHTTP(w, r)
 }
 
 type gzipResponseWriter struct {
@@ -315,23 +578,60 @@ type gzipResponseWriter struct {
 }
 
 func newGzipResponseWriter(w http.ResponseWriter) *gzipResponseWriter {
-	gz := gzip.NewWriter(w)
+	var gz *gzip.Writer
+	if gzI := gzipWriterPool.Get(); gzI == nil {
+		gz = gzip.NewWriter(w)
+	} else {
+		gz = gzI.(*gzip.Writer)
+		gz.Reset(w)
+	}
 	return &gzipResponseWriter{WriteCloser: gz, ResponseWriter: w}
 }
 
-func (w gzipResponseWriter) Write(b []byte) (int, error) {
+func (w *gzipResponseWriter) Write(b []byte) (int, error) {
 	return w.WriteCloser.Write(b)
 }
 
-// ServeHTTP is necessary to implement the http.Handler interface. It
-// will gzip a response if the appropriate request headers are set.
-func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-		s.mux.ServeHTTP(w, r)
-		return
+func (w *gzipResponseWriter) Close() {
+	if w.WriteCloser != nil {
+		w.WriteCloser.Close()
+		gzipWriterPool.Put(w.WriteCloser)
+		w.WriteCloser = nil
 	}
-	w.Header().Set("Content-Encoding", "gzip")
-	gzw := newGzipResponseWriter(w)
-	defer gzw.Close()
-	s.mux.ServeHTTP(gzw, r)
+}
+
+func officialAddr(unresolvedAddr string, resolvedAddr net.Addr) (*util.UnresolvedAddr, error) {
+	unresolvedHost, unresolvedPort, err := net.SplitHostPort(unresolvedAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	resolvedHost, resolvedPort, err := net.SplitHostPort(resolvedAddr.String())
+	if err != nil {
+		return nil, err
+	}
+
+	var host string
+	if unresolvedHost != "" {
+		// A host was provided, use it.
+		host = unresolvedHost
+	} else {
+		// A host was not provided. Ask the system, and fall back to the listener.
+		if hostname, err := os.Hostname(); err == nil {
+			host = hostname
+		} else {
+			host = resolvedHost
+		}
+	}
+
+	var port string
+	if unresolvedPort != "0" {
+		// A port was provided, use it.
+		port = unresolvedPort
+	} else {
+		// A port was not provided, but the system assigned one.
+		port = resolvedPort
+	}
+
+	return util.NewUnresolvedAddr(resolvedAddr.Network(), net.JoinHostPort(host, port)), nil
 }

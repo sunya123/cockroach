@@ -9,145 +9,298 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
 //
 // Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package gossip
 
 import (
-	"bytes"
-	"encoding/gob"
 	"math/rand"
 	"net"
 	"sync"
-	"time"
 
-	"github.com/cockroachdb/cockroach/rpc"
+	"golang.org/x/net/context"
+	"google.golang.org/grpc"
+
+	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/golang/glog"
+	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/stop"
 )
 
 // server maintains an array of connected peers to which it gossips
 // newly arrived information on a periodic basis.
 type server struct {
-	interval      time.Duration       // Interval at which to gossip fresh info
-	mu            sync.Mutex          // Mutex protects is (infostore) & incoming
-	ready         *sync.Cond          // Broadcasts wakeup to waiting gossip requests
-	is            *infoStore          // The backing infostore
-	closed        bool                // True if server was closed
-	incoming      *addrSet            // Incoming client addresses
-	clientAddrMap map[string]net.Addr // Incoming client's local address -> client's server address
+	stopper *stop.Stopper
+
+	mu       sync.Mutex                             // Protects the fields below
+	is       *infoStore                             // The backing infostore
+	incoming nodeSet                                // Incoming client node IDs
+	nodeMap  map[util.UnresolvedAddr]roachpb.NodeID // Incoming client's local address -> node ID
+	tighten  chan roachpb.NodeID                    // Channel of too-distant node IDs
+	sent     int                                    // Count of infos sent from this server to clients
+	received int                                    // Count of infos received from clients
+	ready    chan struct{}                          // Broadcasts wakeup to waiting gossip requests
+
+	simulationCycler *sync.Cond // Used when simulating the network to signal next cycle
 }
 
 // newServer creates and returns a server struct.
-func newServer(interval time.Duration) *server {
-	s := &server{
-		is:            newInfoStore(nil),
-		interval:      interval,
-		incoming:      newAddrSet(MaxPeers),
-		clientAddrMap: make(map[string]net.Addr),
+func newServer(stopper *stop.Stopper) *server {
+	return &server{
+		stopper:  stopper,
+		is:       newInfoStore(0, util.UnresolvedAddr{}, stopper),
+		incoming: makeNodeSet(minPeers),
+		nodeMap:  make(map[util.UnresolvedAddr]roachpb.NodeID),
+		tighten:  make(chan roachpb.NodeID, 1),
+		ready:    make(chan struct{}),
 	}
-	s.ready = sync.NewCond(&s.mu)
-	return s
 }
 
-// Gossip receives gossipped information from a peer node.
+// Gossip receives gossiped information from a peer node.
 // The received delta is combined with the infostore, and this
 // node's own gossip is returned to requesting client.
-func (s *server) Gossip(args *GossipRequest, reply *GossipResponse) error {
+func (s *server) Gossip(stream Gossip_GossipServer) error {
+	args, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+	syncChan := make(chan struct{}, 1)
+	send := func(reply *Response) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case syncChan <- struct{}{}:
+			defer func() { <-syncChan }()
+			return stream.Send(reply)
+		}
+	}
+
+	defer func() { syncChan <- struct{}{} }()
+
+	// Verify that there aren't multiple incoming connections from the same
+	// node. This can happen when bootstrap connections are initiated through
+	// a load balancer.
+	s.mu.Lock()
+	_, ok := s.nodeMap[args.Addr]
+	s.mu.Unlock()
+	if ok {
+		return util.Errorf("duplicate connection from node at %s", args.Addr)
+	}
+
+	errCh := make(chan error, 1)
+
+	// Starting workers in a task prevents data races during shutdown.
+	s.stopper.RunTask(func() {
+		s.stopper.RunWorker(func() {
+			errCh <- s.gossipReceiver(&args, send, stream.Recv)
+		})
+	})
+
+	reply := new(Response)
+
+	for {
+		s.mu.Lock()
+
+		delta := s.is.delta(args.HighWaterStamps)
+
+		if infoCount := len(delta); infoCount > 0 {
+			if log.V(1) {
+				log.Infof("node %d returned %d info(s) to node %d", s.is.NodeID, infoCount, args.NodeID)
+			}
+
+			*reply = Response{
+				NodeID:          s.is.NodeID,
+				HighWaterStamps: s.is.getHighWaterStamps(),
+				Delta:           delta,
+			}
+
+			s.mu.Unlock()
+			if err := send(reply); err != nil {
+				return err
+			}
+			s.mu.Lock()
+			s.sent += infoCount
+		}
+
+		ready := s.ready
+		s.mu.Unlock()
+
+		select {
+		case <-s.stopper.ShouldDrain():
+			return nil
+		case err := <-errCh:
+			return err
+		case <-ready:
+		}
+	}
+}
+
+func (s *server) gossipReceiver(argsPtr **Request, senderFn func(*Response) error, receiverFn func() (*Request, error)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// If there is no more capacity to accept incoming clients, return
-	// a random already-being-serviced incoming client as an alternate.
-	if !s.incoming.hasAddr(args.Addr) {
-		if !s.incoming.hasSpace() {
-			reply.Alternate = s.incoming.selectRandom()
-			return nil
-		}
-		s.incoming.addAddr(args.Addr)
-		// This lookup map allows the incoming client to be removed from
-		// the incoming addr set when its connection is closed. See
-		// server.serveConn() below.
-		s.clientAddrMap[args.LAddr.String()] = args.Addr
-	}
+	reply := new(Response)
 
-	// Update infostore with gossipped infos.
-	if args.Delta != nil {
-		glog.V(1).Infof("received delta infostore from client %s: %s", args.Addr, args.Delta)
-		s.is.combine(args.Delta)
-	}
-	// If requested max sequence is not -1, wait for gossip interval to expire.
-	if args.MaxSeq != -1 {
-		s.ready.Wait()
-	}
-	// The exit condition for waiting clients.
-	if s.closed {
-		return util.Errorf("gossip server shutdown")
-	}
-	// Return reciprocal delta.
-	delta := s.is.delta(args.Addr, args.MaxSeq)
-	if delta != nil {
-		// If V(1), double check that we can gob-encode the infostore.
-		// Problems here seem to very confusingly disappear into the RPC internals.
-		if glog.V(1) {
-			var buf bytes.Buffer
-			if err := gob.NewEncoder(&buf).Encode(delta); err != nil {
-				glog.Fatalf("infostore could not be encoded: %v", err)
+	// This loop receives gossip from the client. It does not attempt to send the
+	// server's gossip to the client.
+	for {
+		args := *argsPtr
+		if args.NodeID != 0 {
+			// Decide whether or not we can accept the incoming connection
+			// as a permanent peer.
+			if args.NodeID == s.is.NodeID {
+				// This is an incoming loopback connection which should be closed by
+				// the client.
+			} else if s.incoming.hasNode(args.NodeID) {
+				// Do nothing.
+			} else if s.incoming.hasSpace() {
+				s.incoming.addNode(args.NodeID)
+				s.nodeMap[args.Addr] = args.NodeID
+
+				defer func(nodeID roachpb.NodeID, addr util.UnresolvedAddr) {
+					s.incoming.removeNode(nodeID)
+					delete(s.nodeMap, addr)
+				}(args.NodeID, args.Addr)
+			} else {
+				var alternateAddr util.UnresolvedAddr
+				var alternateNodeID roachpb.NodeID
+				// Choose a random peer for forwarding.
+				altIdx := rand.Intn(len(s.nodeMap))
+				for addr, id := range s.nodeMap {
+					if altIdx == 0 {
+						alternateAddr = addr
+						alternateNodeID = id
+						break
+					}
+					altIdx--
+				}
+
+				log.Infof("refusing gossip from node %d (max %d conns); forwarding to %d (%s)",
+					args.NodeID, s.incoming.maxSize, alternateNodeID, alternateAddr)
+
+				*reply = Response{
+					NodeID:          s.is.NodeID,
+					AlternateAddr:   &alternateAddr,
+					AlternateNodeID: alternateNodeID,
+				}
+
+				s.mu.Unlock()
+				err := senderFn(reply)
+				s.mu.Lock()
+				return err
 			}
 		}
-		reply.Delta = delta
-		glog.Infof("gossip: client %s sent %d info(s)", args.Addr, delta.infoCount())
+
+		s.received += len(args.Delta)
+		freshCount, err := s.is.combine(args.Delta, args.NodeID)
+		if err != nil {
+			log.Warningf("node %d failed to fully combine gossip delta from node %d: %s", s.is.NodeID, args.NodeID, err)
+		}
+		if log.V(1) {
+			log.Infof("node %d received %s from node %d (%d fresh)", s.is.NodeID, extractKeys(args.Delta), args.NodeID, freshCount)
+		}
+		s.maybeTighten()
+
+		*reply = Response{
+			NodeID:          s.is.NodeID,
+			HighWaterStamps: s.is.getHighWaterStamps(),
+		}
+
+		s.mu.Unlock()
+		err = senderFn(reply)
+		s.mu.Lock()
+		if err != nil {
+			return err
+		}
+
+		if cycler := s.simulationCycler; cycler != nil {
+			cycler.Wait()
+		}
+
+		s.mu.Unlock()
+		recvArgs, err := receiverFn()
+		s.mu.Lock()
+		if err != nil {
+			return err
+		}
+
+		// *argsPtr holds the remote peer state; we need to update it whenever we
+		// receive a new non-nil request. We avoid assigning to *argsPtr directly
+		// because the gossip sender above has closed over *argsPtr and will NPE if
+		// *argsPtr were set to nil.
+		*argsPtr = recvArgs
 	}
-	return nil
 }
 
-// jitteredGossipInterval returns a randomly jittered duration from
-// interval [0.75 * gossipInterval, 1.25 * gossipInterval).
-func (s *server) jitteredGossipInterval() time.Duration {
-	return time.Duration(float64(s.interval) * (0.75 + 0.5*rand.Float64()))
+// InfosSent returns the total count of infos sent to clients.
+func (s *server) InfosSent() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sent
+}
+
+// InfosReceived returns the total count of infos received from clients.
+func (s *server) InfosReceived() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.received
+}
+
+// maybeTighten examines the infostore for the most distant node and
+// if more distant than MaxHops, sends on the tightenNetwork channel
+// to start a new client connection.
+func (s *server) maybeTighten() {
+	distantNodeID, distantHops := s.is.mostDistant()
+	if log.V(2) {
+		log.Infof("@%d: distantHops: %d from %d", s.is.NodeID, distantHops, distantNodeID)
+	}
+	if distantHops > MaxHops {
+		select {
+		case s.tighten <- distantNodeID:
+			if log.V(1) {
+				log.Infof("if possible, tightening network to node %d (%d > %d)", distantNodeID, distantHops, MaxHops)
+			}
+		default:
+			// Do nothing.
+		}
+	}
 }
 
 // start initializes the infostore with the rpc server address and
 // then begins processing connecting clients in an infinite select
 // loop via goroutine. Periodically, clients connected and awaiting
 // the next round of gossip are awoken via the conditional variable.
-func (s *server) start(rpcServer *rpc.Server) {
-	s.is.NodeAddr = rpcServer.Addr()
-	rpcServer.RegisterName("Gossip", s)
-	rpcServer.AddCloseCallback(s.onClose)
-
-	go func() {
-		// Periodically wakeup blocked client gossip requests.
-		gossipTimeout := time.Tick(s.jitteredGossipInterval())
-		for {
-			select {
-			case <-gossipTimeout:
-				// Wakeup all blocked gossip requests.
-				s.ready.Broadcast()
-			}
-		}
-	}()
-}
-
-// stop sets the server's closed bool to true and broadcasts to
-// waiting gossip clients to wakeup and finish.
-func (s *server) stop() {
+func (s *server) start(grpcServer *grpc.Server, addr net.Addr) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.closed = true
-	s.ready.Broadcast() // wake up clients
-}
+	s.is.NodeAddr = util.MakeUnresolvedAddr(addr.Network(), addr.String())
+	s.mu.Unlock()
+	RegisterGossipServer(grpcServer, s)
 
-// onClose is invoked by the rpcServer each time a connected client
-// is closed. Remove the client from the incoming address set.
-func (s *server) onClose(conn net.Conn) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if clientAddr, ok := s.clientAddrMap[conn.RemoteAddr().String()]; ok {
-		s.incoming.removeAddr(clientAddr)
+	broadcast := func() {
+		ready := make(chan struct{})
+
+		s.mu.Lock()
+		close(s.ready)
+		s.ready = ready
+		s.mu.Unlock()
 	}
+	unregister := s.is.registerCallback(".*", func(_ string, _ roachpb.Value) {
+		broadcast()
+	})
+
+	s.stopper.RunWorker(func() {
+		<-s.stopper.ShouldDrain()
+
+		s.mu.Lock()
+		unregister()
+		s.mu.Unlock()
+
+		broadcast()
+	})
 }

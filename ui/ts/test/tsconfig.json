@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "target": "ES5",
+    "outFile": "../../build/test.js"
+  },
+  "files": [
+    "./util.ts",
+    "./components.ts"
+  ]
+}

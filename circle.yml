@@ -1,0 +1,90 @@
+machine:
+  pre:
+    - curl -sSL https://s3.amazonaws.com/circle-downloads/install-circleci-docker.sh | bash -s -- 1.10.0
+
+  services:
+    - docker
+
+checkout:
+  post:
+    - git fetch --unshallow || true
+    - git fetch --tags
+    # GOPATH is cached, so we need to clean out the version from the previous
+    # run or the subsequent `mv` will fail. We put our checkout in the correct
+    # location for the OSX build step.
+    - rm -rf         "${GOPATH%%:*}/src/github.com/cockroachdb/cockroach"
+    - mkdir -p       "${GOPATH%%:*}/src/github.com/cockroachdb/"
+    - mv ~/cockroach "${GOPATH%%:*}/src/github.com/cockroachdb/"
+    - ln -s          "${GOPATH%%:*}/src/github.com/cockroachdb/cockroach" ~/cockroach
+
+dependencies:
+  override:
+    - build/circle-deps.sh:
+        parallel: true
+  cache_directories:
+    - ~/builder
+    - ~/uicache
+
+test:
+  override:
+    - build/circle-test.sh:
+        parallel: true
+
+deployment:
+  master:
+    branch: master
+    commands:
+      - sed "s/<EMAIL>/$DOCKER_EMAIL/;s/<AUTH>/$DOCKER_AUTH/" < "resource/deploy_templates/.dockercfg.template" > ~/.dockercfg
+      - |
+          export VERSION=$(git describe || git rev-parse --short HEAD)
+          echo "Deploying ${VERSION}..."
+          if [ -n "$DOCKER_EMAIL" ]; then
+            build/push-docker-deploy.sh
+          fi
+      - aws configure set region us-east-1
+      - build/builder.sh build/build-static-binaries.sh
+      - mkdir -p "${CIRCLE_ARTIFACTS}/acceptance_deploy"
+      - time acceptance/acceptance.test -test.v -test.timeout 10m
+          -i cockroachdb/cockroach -nodes 3
+          -l "${CIRCLE_ARTIFACTS}"/acceptance_deploy 2>&1 >
+          "${CIRCLE_ARTIFACTS}/acceptance_deploy.log"
+      - build/build-osx.sh
+      - build/push-aws.sh
+  release:
+    tag: /beta-[0-9]+/
+    commands:
+      - sed "s/<EMAIL>/$DOCKER_EMAIL/;s/<AUTH>/$DOCKER_AUTH/" < "resource/deploy_templates/.dockercfg.template" > ~/.dockercfg
+      - |
+          export VERSION=$CIRCLE_TAG
+          echo "Deploying ${VERSION}..."
+          if [ -n "$DOCKER_EMAIL" ]; then
+            build/push-docker-deploy.sh
+          fi
+      - aws configure set region us-east-1
+      - build/builder.sh build/build-static-binaries.sh
+      - mkdir -p "${CIRCLE_ARTIFACTS}/acceptance_deploy"
+      - time acceptance/acceptance.test -test.v -test.timeout 10m
+          -i cockroachdb/cockroach -nodes 3
+          -l "${CIRCLE_ARTIFACTS}"/acceptance_deploy >
+          "${CIRCLE_ARTIFACTS}/acceptance_deploy.log" 2>&1
+
+      - build/build-osx.sh
+      - build/push-tagged-aws.sh
+  datarace:
+    branch: data-race
+    commands:
+      - aws configure set region us-east-1
+      - build/builder.sh build/build-race-binaries.sh
+      - build/push-one-binary.sh "${CIRCLE_SHA1-$(git rev-parse HEAD)}" cockroach cockroach.race
+  jemalloc:
+    branch: jemalloc
+    commands:
+      - aws configure set region us-east-1
+      - build/builder.sh build/build-jemalloc-binaries.sh
+      - build/push-one-binary.sh "${CIRCLE_SHA1-$(git rev-parse HEAD)}" cockroach cockroach.jemalloc
+  beta:
+    branch: /branch-beta-[0-9]+/
+    commands:
+      - aws configure set region us-east-1
+      - build/builder.sh build/build-static-binaries.sh
+      - build/push-one-binary.sh "${CIRCLE_SHA1-$(git rev-parse HEAD)}" cockroach cockroach.beta

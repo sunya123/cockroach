@@ -6,14 +6,23 @@
 .#*
 *.test
 
+# Log Files
+*.ERROR
+*.ERROR.*
+*.INFO
+*.INFO.*
+*.WARNING
+*.WARNING.*
+*.FATAL
+*.FATAL.*
+stderr.*
+
 # Folders
 _obj
 _test
+certs
 
-# Architecture specific extensions/prefixes
-*.[568vq]
-[568vq].out
-
+Architecture specific extensions/prefixes
 *.cgo1.go
 *.cgo2.c
 _cgo_defun.c
@@ -26,7 +35,9 @@ _testmain.go
 
 .DS_Store
 
-.vagrant
-
-cockroach
+/cockroach
+/cockroach-data
+/cockroach-darwin-10.9-amd64
 *.swp
+
+.bootstrap

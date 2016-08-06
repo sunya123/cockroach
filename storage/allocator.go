@@ -9,72 +9,385 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
 //
-// Author: Levon Lloyd (levon.lloyd@gmail.com)
 // Author: Spencer Kimball (spencer.kimball@gmail.com)
+// Author: Kathy Spradlin (kathyspradlin@gmail.com)
+// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package storage
 
 import (
+	"fmt"
 	"math/rand"
+	"sync"
+	"time"
 
+	"github.com/cockroachdb/cockroach/config"
+	"github.com/cockroachdb/cockroach/gossip"
+	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/envutil"
+	"github.com/cockroachdb/cockroach/util/log"
 )
 
-// StoreFinder finds the disks in a datacenter with the most available capacity.
-type StoreFinder func(Attributes) ([]*StoreDescriptor, error)
+const (
+	// maxFractionUsedThreshold: if the fraction used of a store descriptor
+	// capacity is greater than this value, it will never be used as a rebalance
+	// target and it will always be eligible to rebalance replicas to other
+	// stores.
+	maxFractionUsedThreshold = 0.95
 
-// allocator makes allocation decisions based on a zone configuration,
-// existing range metadata and available stores. Configuration
-// settings and range metadata information is stored directly in the
-// engine-backed range they describe. Information on suitability and
-// availability of servers is gleaned from the gossip network.
-type allocator struct {
-	storeFinder StoreFinder
-	rand        rand.Rand
+	// priorities for various repair operations.
+	removeDeadReplicaPriority  float64 = 10000
+	addMissingReplicaPriority  float64 = 1000
+	removeExtraReplicaPriority float64 = 100
+
+	// defaultMinRebalanceInterval is the minimum interval that must elapse
+	// between replica rebalances. This should be slightly larger than
+	// server.gossipStoresInterval.
+	defaultMinRebalanceInterval = gossip.DefaultGossipStoresInterval + 5*time.Second
+	// defaultMaxRebalanceInterval is the maximum interval that could elapse
+	// between opportunities for replica rebalances.
+	defaultMaxRebalanceInterval = defaultMinRebalanceInterval * 3
+)
+
+// AllocatorAction enumerates the various replication adjustments that may be
+// recommended by the allocator.
+type AllocatorAction int
+
+// These are the possible allocator actions.
+const (
+	_ AllocatorAction = iota
+	AllocatorNoop
+	AllocatorRemove
+	AllocatorAdd
+	AllocatorRemoveDead
+)
+
+// allocatorError indicates a retryable error condition which sends replicas
+// being processed through the replicate_queue into purgatory so that they
+// can be retried quickly as soon as new stores come online, or additional
+// space frees up.
+type allocatorError struct {
+	required         roachpb.Attributes
+	relaxConstraints bool
+	aliveStoreCount  int
 }
 
-// allocate returns a suitable store based on the supplied
-// attributes list. If none are available / suitable, returns an
-// error. It uses the allocator's StoreFinder to select the set of
-// available stores matching attributes for missing replicas and picks
-// using randomly weighted selection based on available capacities.
-func (a *allocator) allocate(required Attributes, existingReplicas []Replica) (
-	*StoreDescriptor, error) {
-	// Get a set of current nodes -- we never want to allocate on an existing node.
-	usedNodes := make(map[int32]struct{})
-	for _, replica := range existingReplicas {
-		usedNodes[replica.NodeID] = struct{}{}
+func (ae *allocatorError) Error() string {
+	anyAll := "all attributes"
+	if ae.relaxConstraints {
+		anyAll = "an attribute"
+	}
+	var auxInfo string
+	// Whenever the likely problem is not having enough nodes up, make the
+	// message really clear.
+	if ae.relaxConstraints || len(ae.required.Attrs) == 0 {
+		auxInfo = "; likely not enough nodes in cluster"
+	}
+	return fmt.Sprintf("0 of %d store%s with %s matching [%s]%s",
+		ae.aliveStoreCount, util.Pluralize(int64(ae.aliveStoreCount)),
+		anyAll, ae.required, auxInfo)
+}
+
+func (*allocatorError) purgatoryErrorMarker() {}
+
+var _ purgatoryError = &allocatorError{}
+
+// allocatorRand pairs a rand.Rand with a mutex.
+// TODO: Allocator is typically only accessed from a single thread (the
+// replication queue), but this assumption is broken in tests which force
+// replication scans. If those tests can be modified to suspend the normal
+// replication queue during the forced scan, then this rand could be used
+// without a mutex.
+type allocatorRand struct {
+	*sync.Mutex
+	*rand.Rand
+}
+
+func makeAllocatorRand(source rand.Source) allocatorRand {
+	return allocatorRand{
+		Mutex: &sync.Mutex{},
+		Rand:  rand.New(source),
+	}
+}
+
+// AllocatorOptions are configurable options which effect the way that the
+// replicate queue will handle rebalancing opportunities.
+type AllocatorOptions struct {
+	// AllowRebalance allows this store to attempt to rebalance its own
+	// replicas to other stores.
+	AllowRebalance bool
+
+	// Deterministic makes allocation decisions deterministic, based on
+	// current cluster statistics. If this flag is not set, allocation operations
+	// will have random behavior. This flag is intended to be set for testing
+	// purposes only.
+	Deterministic bool
+}
+
+// Allocator tries to spread replicas as evenly as possible across the stores
+// in the cluster.
+type Allocator struct {
+	storePool *StorePool
+	randGen   allocatorRand
+	options   AllocatorOptions
+
+	minRebalanceInterval  time.Duration
+	maxRebalanceInterval  time.Duration
+	nextRebalance         time.Time
+	proposedNextRebalance time.Time
+}
+
+// MakeAllocator creates a new allocator using the specified StorePool.
+func MakeAllocator(storePool *StorePool, options AllocatorOptions) Allocator {
+	var randSource rand.Source
+	if options.Deterministic {
+		randSource = rand.NewSource(777)
+	} else {
+		randSource = rand.NewSource(rand.Int63())
+	}
+	return Allocator{
+		storePool: storePool,
+		options:   options,
+		randGen:   makeAllocatorRand(randSource),
+		minRebalanceInterval: envutil.EnvOrDefaultDuration("min_rebalance_interval",
+			defaultMinRebalanceInterval),
+		maxRebalanceInterval: envutil.EnvOrDefaultDuration("max_rebalance_interval",
+			defaultMaxRebalanceInterval),
+	}
+}
+
+// ComputeAction determines the exact operation needed to repair the supplied
+// range, as governed by the supplied zone configuration. It returns the
+// required action that should be taken and a replica on which the action should
+// be performed.
+func (a *Allocator) ComputeAction(zone config.ZoneConfig, desc *roachpb.RangeDescriptor) (
+	AllocatorAction, float64) {
+	if a.storePool == nil {
+		// Do nothing if storePool is nil for some unittests.
+		return AllocatorNoop, 0
 	}
 
-	stores, err := a.storeFinder(required)
-	if err != nil {
-		return nil, err
+	deadReplicas := a.storePool.deadReplicas(desc.Replicas)
+	if len(deadReplicas) > 0 {
+		// The range has dead replicas, which should be removed immediately.
+		// Adjust the priority by the number of dead replicas the range has.
+		quorum := computeQuorum(len(desc.Replicas))
+		liveReplicas := len(desc.Replicas) - len(deadReplicas)
+		return AllocatorRemoveDead, removeDeadReplicaPriority + float64(quorum-liveReplicas)
 	}
 
-	// Randomly pick a node weighted by capacity.
-	var candidates []*StoreDescriptor
-	var capacityTotal float64
-	for _, s := range stores {
-		if _, ok := usedNodes[s.Node.NodeID]; !ok {
-			candidates = append(candidates, s)
-			capacityTotal += s.Capacity.PercentAvail()
+	// TODO(mrtracy): Handle non-homogeneous and mismatched attribute sets.
+	need := len(zone.ReplicaAttrs)
+	have := len(desc.Replicas)
+	if have < need {
+		// Range is under-replicated, and should add an additional replica.
+		// Priority is adjusted by the difference between the current replica
+		// count and the quorum of the desired replica count.
+		neededQuorum := computeQuorum(need)
+		return AllocatorAdd, addMissingReplicaPriority + float64(neededQuorum-have)
+	}
+	if have > need {
+		// Range is over-replicated, and should remove a replica.
+		// Ranges with an even number of replicas get extra priority because
+		// they have a more fragile quorum.
+		return AllocatorRemove, removeExtraReplicaPriority - float64(have%2)
+	}
+
+	// Nothing to do.
+	return AllocatorNoop, 0
+}
+
+// AllocateTarget returns a suitable store for a new allocation with the
+// required attributes. Nodes already accommodating existing replicas are ruled
+// out as targets. If relaxConstraints is true, then the required attributes
+// will be relaxed as necessary, from least specific to most specific, in order
+// to allocate a target. If needed, a filter function can be added that further
+// filter the results. The function will be passed the storeDesc and the used
+// and new counts. It returns a bool indicating inclusion or exclusion from the
+// set of stores being considered.
+func (a *Allocator) AllocateTarget(required roachpb.Attributes, existing []roachpb.ReplicaDescriptor, relaxConstraints bool,
+	filter func(storeDesc *roachpb.StoreDescriptor, count, used *stat) bool) (*roachpb.StoreDescriptor, error) {
+	existingNodes := make(nodeIDSet, len(existing))
+	for _, repl := range existing {
+		existingNodes[repl.NodeID] = struct{}{}
+	}
+
+	// Because more redundancy is better than less, if relaxConstraints, the
+	// matching here is lenient, and tries to find a target by relaxing an
+	// attribute constraint, from last attribute to first.
+	for attrs := append([]string(nil), required.Attrs...); ; attrs = attrs[:len(attrs)-1] {
+		sl, aliveStoreCount := a.storePool.getStoreList(roachpb.Attributes{Attrs: attrs}, a.options.Deterministic)
+		if target := a.selectGood(sl, existingNodes); target != nil {
+			return target, nil
+		}
+		if len(attrs) == 0 || !relaxConstraints {
+			return nil, &allocatorError{
+				required:         required,
+				relaxConstraints: relaxConstraints,
+				aliveStoreCount:  aliveStoreCount,
+			}
 		}
 	}
+}
 
-	var capacitySeen float64
-	targetCapacity := a.rand.Float64() * capacityTotal
+// RemoveTarget returns a suitable replica to remove from the provided replica
+// set. It attempts to consider which of the provided replicas would be the best
+// candidate for removal.
+//
+// TODO(mrtracy): removeTarget eventually needs to accept the attributes from
+// the zone config associated with the provided replicas. This will allow it to
+// make correct decisions in the case of ranges with heterogeneous replica
+// requirements (i.e. multiple data centers).
+func (a Allocator) RemoveTarget(existing []roachpb.ReplicaDescriptor) (roachpb.ReplicaDescriptor, error) {
+	if len(existing) == 0 {
+		return roachpb.ReplicaDescriptor{}, util.Errorf("must supply at least one replica to allocator.RemoveTarget()")
+	}
 
-	// Walk through candidates, stopping when
-	// we've passed the capacity target.
-	for _, c := range candidates {
-		capacitySeen += c.Capacity.PercentAvail()
-		if capacitySeen >= targetCapacity {
-			return c, nil
+	// Retrieve store descriptors for the provided replicas from the StorePool.
+	sl := StoreList{}
+	for i := range existing {
+		desc := a.storePool.getStoreDescriptor(existing[i].StoreID)
+		if desc == nil {
+			continue
+		}
+		sl.add(desc)
+	}
+
+	if bad := a.selectBad(sl); bad != nil {
+		for i := range existing {
+			if existing[i].StoreID == bad.StoreID {
+				return existing[i], nil
+			}
 		}
 	}
-	return nil, util.Errorf("unable to find an appropriate store for requested replica attributes")
+	return roachpb.ReplicaDescriptor{}, util.Errorf("RemoveTarget() could not select an appropriate replica to be remove")
+}
+
+// RebalanceTarget returns a suitable store for a rebalance target
+// with required attributes. Rebalance targets are selected via the
+// same mechanism as AllocateTarget(), except the chosen target must
+// follow some additional criteria. Namely, if chosen, it must further
+// the goal of balancing the cluster.
+//
+// The supplied parameters are the StoreID of the replica being rebalanced, the
+// required attributes for the replica being rebalanced, and a list of the
+// existing replicas of the range (which must include the replica being
+// rebalanced).
+//
+// Simply ignoring a rebalance opportunity in the event that the
+// target chosen by AllocateTarget() doesn't fit balancing criteria
+// is perfectly fine, as other stores in the cluster will also be
+// doing their probabilistic best to rebalance. This helps prevent
+// a stampeding herd targeting an abnormally under-utilized store.
+func (a Allocator) RebalanceTarget(
+	storeID roachpb.StoreID, required roachpb.Attributes, existing []roachpb.ReplicaDescriptor,
+) *roachpb.StoreDescriptor {
+	if !a.options.AllowRebalance {
+		return nil
+	}
+	existingNodes := make(nodeIDSet, len(existing))
+	for _, repl := range existing {
+		existingNodes[repl.NodeID] = struct{}{}
+	}
+	storeDesc := a.storePool.getStoreDescriptor(storeID)
+	sl, _ := a.storePool.getStoreList(required, a.options.Deterministic)
+	if replacement := a.improve(storeDesc, sl, existingNodes); replacement != nil {
+		return replacement
+	}
+	return nil
+}
+
+// ShouldRebalance returns whether the specified store should attempt to
+// rebalance a replica to another store.
+func (a *Allocator) ShouldRebalance(storeID roachpb.StoreID) bool {
+	if !a.options.AllowRebalance {
+		return false
+	}
+	if log.V(2) {
+		log.Infof("ShouldRebalance from store %d", storeID)
+	}
+	storeDesc := a.storePool.getStoreDescriptor(storeID)
+	if storeDesc == nil {
+		if log.V(2) {
+			log.Warningf(
+				"ShouldRebalance couldn't find store with id %d in StorePool",
+				storeID)
+		}
+		return false
+	}
+
+	now := a.storePool.Clock().Now().GoTime()
+	if now.Before(a.nextRebalance) {
+		if log.V(2) {
+			log.Infof("ineligible to rebalance for %s", a.nextRebalance.Sub(now))
+		}
+		return false
+	}
+
+	sl, _ := a.storePool.getStoreList(*storeDesc.CombinedAttrs(), a.options.Deterministic)
+
+	// ShouldRebalance is true if a suitable replacement can be found.
+	shouldRebalance := a.improve(storeDesc, sl, makeNodeIDSet(storeDesc.Node.NodeID)) != nil
+	if shouldRebalance {
+		// Store time for the next rebalance opportunity, so that we don't have to
+		// reconstruct the StoreList when updating nextRebalance later. The period
+		// of time between rebalances is inversely proportional to the standard
+		// deviation of the range counts. With the constant values below, the next
+		// rebalance will occur between 65 seconds and ~3 minutes after the current
+		// rebalance.
+		delta := a.minRebalanceInterval +
+			time.Second*time.Duration(.9/(.006*(sl.count.stddev()+1.2)))
+		if delta > a.maxRebalanceInterval {
+			delta = a.maxRebalanceInterval
+		}
+		a.proposedNextRebalance = now.Add(delta)
+	}
+	return shouldRebalance
+}
+
+// UpdateNextRebalance signals that because rebalance has just occurred, we
+// update the time at which the next rebalance can occur. This spreads out
+// rebalances to prevent excessive replica movement.
+func (a *Allocator) UpdateNextRebalance() {
+	a.nextRebalance = a.proposedNextRebalance
+	if log.V(2) {
+		log.Infof("next rebalance opportunity in %s", a.nextRebalance.Sub(a.storePool.Clock().Now().GoTime()))
+	}
+}
+
+// selectGood attempts to select a store from the supplied store list that it
+// considers to be 'Good' relative to the other stores in the list. Any nodes
+// in the supplied 'exclude' list will be disqualified from selection. Returns
+// the selected store or nil if no such store can be found.
+func (a Allocator) selectGood(sl StoreList, excluded nodeIDSet) *roachpb.StoreDescriptor {
+	rcb := rangeCountBalancer{a.randGen}
+	return rcb.selectGood(sl, excluded)
+}
+
+// selectBad attempts to select a store from the supplied store list that it
+// considers to be 'Bad' relative to the other stores in the list. Returns the
+// selected store or nil if no such store can be found.
+func (a Allocator) selectBad(sl StoreList) *roachpb.StoreDescriptor {
+	rcb := rangeCountBalancer{a.randGen}
+	return rcb.selectBad(sl)
+}
+
+// improve attempts to select an improvement over the given store from the
+// stores in the given store list. Any nodes in the supplied 'exclude' list
+// will be disqualified from selection. Returns the selected store, or nil if
+// no such store can be found.
+func (a Allocator) improve(
+	store *roachpb.StoreDescriptor, sl StoreList, excluded nodeIDSet,
+) *roachpb.StoreDescriptor {
+	rcb := rangeCountBalancer{a.randGen}
+	return rcb.improve(store, sl, excluded)
+}
+
+// computeQuorum computes the quorum value for the given number of nodes.
+func computeQuorum(nodes int) int {
+	return (nodes / 2) + 1
 }

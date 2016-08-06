@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "target": "ES5",
+    "outFile": "../build/app.js"
+  },
+  "files": [
+    "./app.ts"
+  ]
+}

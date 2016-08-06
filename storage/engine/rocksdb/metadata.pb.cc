@@ -1,0 +1,1 @@
+./cockroach/roachpb/metadata.pb.cc
