@@ -9,78 +9,33 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
+//
+// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package main
 
-import (
-	"flag"
-	"os"
-	"runtime"
+//go:generate make protobuf
 
-	commander "code.google.com/p/go-commander"
-	"github.com/cockroachdb/cockroach/server"
-	"github.com/golang/glog"
+import (
+	"fmt"
+	"math/rand"
+	"os"
+
+	"github.com/cockroachdb/cockroach/cli"
+	"github.com/cockroachdb/cockroach/util/randutil"
 )
 
-func init() {
-	// If log directory has not been set, set -alsologtostderr to true.
-	var hasLogDir, hasAlsoLogStderr bool
-	for _, arg := range os.Args[1:] {
-		switch arg {
-		case "-log_dir", "--log_dir":
-			hasLogDir = true
-		case "-alsologtostderr", "--alsologtostderr":
-			hasAlsoLogStderr = true
-		}
-	}
-	if !hasLogDir && !hasAlsoLogStderr {
-		flag.CommandLine.Set("alsologtostderr", "true")
-	}
-}
-
 func main() {
-	// Instruct Go to use all CPU cores.
-	// TODO(spencer): this may be excessive and result in worse
-	// performance. We should keep an eye on this as we move to
-	// production workloads.
-	numCPU := runtime.NumCPU()
-	runtime.GOMAXPROCS(numCPU)
-	glog.V(1).Infof("running using %d processor cores", numCPU)
-
-	c := commander.Commander{
-		Name: "cockroach",
-		Commands: []*commander.Command{
-			server.CmdInit,
-			server.CmdGetZone,
-			server.CmdLsZones,
-			server.CmdRmZone,
-			server.CmdSetZone,
-			server.CmdStart,
-			&commander.Command{
-				UsageLine: "listparams",
-				Short:     "list all available parameters and their default values",
-				Long: `
-List all available parameters and their default values.
-Note that parameter parsing stops after the first non-
-option after the command name. Hence, the options need
-to precede any additional arguments,
-
-  cockroach <command> [options] [arguments].`,
-				Run: func(cmd *commander.Command, args []string) {
-					flag.CommandLine.PrintDefaults()
-				},
-			},
-		},
-	}
+	// Seed the math/rand RNG from crypto/rand.
+	rand.Seed(randutil.NewPseudoSeed())
 
 	if len(os.Args) == 1 {
 		os.Args = append(os.Args, "help")
 	}
-	if err := c.Run(os.Args[1:]); err != nil {
-		glog.Errorf("Failed running command \"%s\": %v\n", os.Args[1:], err)
+	if err := cli.Run(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed running %q\n", os.Args[1])
 		os.Exit(1)
 	}
 }

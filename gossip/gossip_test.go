@@ -9,87 +9,45 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
 //
 // Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package gossip
 
 import (
-	"fmt"
+	"bytes"
+	"errors"
 	"testing"
 	"time"
-	"github.com/golang/glog"
+
+	"golang.org/x/net/context"
+	"google.golang.org/grpc"
+
+	"github.com/cockroachdb/cockroach/base"
+	"github.com/cockroachdb/cockroach/gossip/resolver"
+	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/rpc"
+	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/leaktest"
+	"github.com/cockroachdb/cockroach/util/stop"
 )
-
-const (
-	// Compressed simulation time scale for testing.
-	testGossipInterval = time.Millisecond * 10
-)
-
-// isNetworkConnected returns true if the network is fully connected with
-// no partitions.
-func isNetworkConnected(nodes map[string]*Gossip) bool {
-	for _, node := range nodes {
-		for infoKey := range nodes {
-			_, err := node.GetInfo(infoKey)
-			if err != nil {
-				glog.Infof("error: %v", err)
-				return false
-			}
-		}
-	}
-	return true
-}
-
-// verifyConvergence verifies that info from each node is visible from
-// every node in the network within numCycles cycles of the gossip protocol.
-func verifyConvergence(numNodes, maxCycles int, t *testing.T) {
-	var connectedAtCycle int
-	SimulateNetwork(numNodes, "unix", testGossipInterval, func(cycle int, nodes map[string]*Gossip) bool {
-		// Every node should gossip.
-		for addr, node := range nodes {
-			node.AddInfo(addr, int64(cycle), time.Hour)
-		}
-		if isNetworkConnected(nodes) {
-			connectedAtCycle = cycle
-			return false
-		}
-		return true
-	})
-
-	if connectedAtCycle > maxCycles {
-		t.Errorf("expected a fully-connected network within 5 cycles; took %d", connectedAtCycle)
-	}
-}
-
-// TestConvergence verifies a 10 node gossip network
-// converges within 5 cycles.
-func TestConvergence(t *testing.T) {
-	verifyConvergence(10, 5, t)
-}
 
 // TestGossipInfoStore verifies operation of gossip instance infostore.
 func TestGossipInfoStore(t *testing.T) {
-	g := New()
-	g.AddInfo("i", int64(1), time.Hour)
-	if val, err := g.GetInfo("i"); val.(int64) != int64(1) || err != nil {
-		t.Errorf("error fetching int64: %v", err)
+	defer leaktest.AfterTest(t)()
+	stopper := stop.NewStopper()
+	defer stopper.Stop()
+	rpcContext := rpc.NewContext(nil, nil, stopper)
+	g := New(rpcContext, nil, stopper)
+	// Have to call g.SetNodeID before call g.AddInfo
+	g.SetNodeID(roachpb.NodeID(1))
+	slice := []byte("b")
+	if err := g.AddInfo("s", slice, time.Hour); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := g.GetInfo("i2"); err == nil {
-		t.Errorf("expected error fetching nonexistent key \"i2\"")
-	}
-	g.AddInfo("f", float64(3.14), time.Hour)
-	if val, err := g.GetInfo("f"); val.(float64) != float64(3.14) || err != nil {
-		t.Errorf("error fetching float64: %v", err)
-	}
-	if _, err := g.GetInfo("f2"); err == nil {
-		t.Errorf("expected error fetching nonexistent key \"f2\"")
-	}
-	g.AddInfo("s", "b", time.Hour)
-	if val, err := g.GetInfo("s"); val.(string) != "b" || err != nil {
+	if val, err := g.GetInfo("s"); !bytes.Equal(val, slice) || err != nil {
 		t.Errorf("error fetching string: %v", err)
 	}
 	if _, err := g.GetInfo("s2"); err == nil {
@@ -97,65 +55,137 @@ func TestGossipInfoStore(t *testing.T) {
 	}
 }
 
-// TestGossipGroupsInfoStore verifies gossiping of groups via the
-// gossip instance infostore.
-func TestGossipGroupsInfoStore(t *testing.T) {
-	g := New()
+func TestGossipGetNextBootstrapAddress(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 
-	// For int64.
-	g.RegisterGroup("i", 3, MinGroup)
-	for i := 0; i < 3; i++ {
-		g.AddInfo(fmt.Sprintf("i.%d", i), int64(i), time.Hour)
-	}
-	values, err := g.GetGroupInfos("i")
-	if err != nil {
-		t.Errorf("error fetching int64 group: %v", err)
-	}
-	if len(values) != 3 {
-		t.Errorf("incorrect number of values in group: %v", values)
-	}
-	for i := 0; i < 3; i++ {
-		if values[i].(int64) != int64(i) {
-			t.Errorf("index %d has incorrect value: %d, expected %d", i, values[i].(int64), i)
-		}
-	}
-	if _, err := g.GetGroupInfos("i2"); err == nil {
-		t.Errorf("expected error fetching nonexistent key \"i2\"")
+	resolverSpecs := []string{
+		"127.0.0.1:9000",
+		"127.0.0.1:9001",
+		"localhost:9004",
 	}
 
-	// For float64.
-	g.RegisterGroup("f", 3, MinGroup)
-	for i := 0; i < 3; i++ {
-		g.AddInfo(fmt.Sprintf("f.%d", i), float64(i), time.Hour)
+	resolvers := []resolver.Resolver{}
+	for _, rs := range resolverSpecs {
+		resolver, err := resolver.NewResolver(&base.Context{Insecure: true}, rs)
+		if err == nil {
+			resolvers = append(resolvers, resolver)
+		}
 	}
-	values, err = g.GetGroupInfos("f")
-	if err != nil {
-		t.Errorf("error fetching float64 group: %v", err)
+	if len(resolvers) != 3 {
+		t.Errorf("expected 3 resolvers; got %d", len(resolvers))
 	}
-	if len(values) != 3 {
-		t.Errorf("incorrect number of values in group: %v", values)
+	g := New(nil, resolvers, nil)
+
+	// Using specified resolvers, fetch bootstrap addresses 3 times
+	// and verify the results match expected addresses.
+	expAddresses := []string{
+		"127.0.0.1:9000",
+		"127.0.0.1:9001",
+		"localhost:9004",
 	}
-	for i := 0; i < 3; i++ {
-		if values[i].(float64) != float64(i) {
-			t.Errorf("index %d has incorrect value: %f, expected %d", i, values[i].(float64), i)
+	for i := 0; i < len(expAddresses); i++ {
+		if addr := g.getNextBootstrapAddress(); addr == nil {
+			t.Errorf("%d: unexpected nil addr when expecting %s", i, expAddresses[i])
+		} else if addrStr := addr.String(); addrStr != expAddresses[i] {
+			t.Errorf("%d: expected addr %s; got %s", i, expAddresses[i], addrStr)
+		}
+	}
+}
+
+func TestGossipNoForwardSelf(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	stopper := stop.NewStopper()
+	defer stopper.Stop()
+	local := startGossip(1, stopper, t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start one loopback client plus enough additional clients to fill the
+	// incoming clients.
+	peers := []*Gossip{local}
+	for i := 0; i < local.server.incoming.maxSize; i++ {
+		peers = append(peers, startGossip(roachpb.NodeID(i+2), stopper, t))
+	}
+
+	for _, peer := range peers {
+		c := newClient(&local.is.NodeAddr)
+
+		util.SucceedsSoon(t, func() error {
+			conn, err := peer.rpcContext.GRPCDial(c.addr.String(), grpc.WithBlock())
+			if err != nil {
+				return err
+			}
+
+			stream, err := NewGossipClient(conn).Gossip(ctx)
+			if err != nil {
+				return err
+			}
+
+			if err := c.requestGossip(peer, peer.is.NodeAddr, stream); err != nil {
+				return err
+			}
+
+			// Wait until the server responds, so we know we're connected.
+			_, err = stream.Recv()
+			return err
+		})
+	}
+
+	numClients := len(peers) * 2
+	disconnectedCh := make(chan *client)
+	numFailedConns := 0
+
+	// Start a few overflow peers and assert that they don't get forwarded to us
+	// again.
+	for i := 0; i < numClients; i++ {
+		peer := startGossip(roachpb.NodeID(i+local.server.incoming.maxSize+2), stopper, t)
+
+		c := newClient(&local.is.NodeAddr)
+		c.start(peer, disconnectedCh, peer.rpcContext, stopper)
+
+		disconnectedClient := <-disconnectedCh
+		if disconnectedClient != c {
+			t.Fatalf("expected %p to be disconnected, got %p", c, disconnectedClient)
+		} else if c.forwardAddr == nil {
+			// Under high load, clients sometimes fail to connect for reasons
+			// unrelated to the test, so we need to permit some.
+			numFailedConns++
+			t.Logf("node #%d: got nil forwarding address", peer.is.NodeID)
+		} else if *c.forwardAddr == local.is.NodeAddr {
+			t.Errorf("node #%d: got local's forwarding address", peer.is.NodeID)
 		}
 	}
 
-	// For string.
-	g.RegisterGroup("s", 3, MinGroup)
-	for i := 0; i < 3; i++ {
-		g.AddInfo(fmt.Sprintf("s.%d", i), fmt.Sprintf("%d", i), time.Hour)
+	if numFailedConns > numClients/10 {
+		t.Errorf("%d clients disconnected for unexpected reasons", numFailedConns)
 	}
-	values, err = g.GetGroupInfos("s")
-	if err != nil {
-		t.Errorf("error fetching string group: %v", err)
+}
+
+// TestGossipCullNetwork verifies that a client will be culled from
+// the network periodically (at cullInterval duration intervals).
+func TestGossipCullNetwork(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	stopper := stop.NewStopper()
+	defer stopper.Stop()
+	local := startGossip(1, stopper, t)
+	local.SetCullInterval(5 * time.Millisecond)
+
+	local.mu.Lock()
+	for i := 0; i < minPeers; i++ {
+		peer := startGossip(roachpb.NodeID(i+2), stopper, t)
+		local.startClient(&peer.is.NodeAddr, stopper)
 	}
-	if len(values) != 3 {
-		t.Errorf("incorrect number of values in group: %v", values)
-	}
-	for i := 0; i < 3; i++ {
-		if values[i].(string) != fmt.Sprintf("%d", i) {
-			t.Errorf("index %d has incorrect value: %d, expected %s", i, values[i], fmt.Sprintf("%d", i))
+	local.mu.Unlock()
+	local.manage()
+
+	util.SucceedsSoon(t, func() error {
+		// Verify that a client is closed within the cull interval.
+		if len(local.Outgoing()) == minPeers-1 {
+			return nil
 		}
-	}
+		return errors.New("no network culling occurred")
+	})
 }

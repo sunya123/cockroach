@@ -9,9 +9,8 @@
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied.  See the License for the specific language governing
-// permissions and limitations under the License. See the AUTHORS file
-// for names of contributors.
+// implied. See the License for the specific language governing
+// permissions and limitations under the License.
 //
 // Author: Spencer Kimball (spencer.kimball@gmail.com)
 
@@ -19,8 +18,8 @@ package util
 
 import (
 	"fmt"
-	"path/filepath"
-	"runtime"
+
+	"github.com/cockroachdb/cockroach/util/caller"
 )
 
 const defaultSkip = 2
@@ -29,10 +28,8 @@ const errorPrefixFormat string = "%s:%d: "
 // getPrefix skips "skip" stack frames to get the file & line number
 // of original caller.
 func getPrefix(skip int, format string) string {
-	if _, file, line, ok := runtime.Caller(skip); ok {
-		return fmt.Sprintf(format, filepath.Base(file), line)
-	}
-	return ""
+	file, line, _ := caller.Lookup(skip)
+	return fmt.Sprintf(format, file, line)
 }
 
 // Errorf is a passthrough to fmt.Errorf, with an additional prefix
@@ -50,18 +47,27 @@ func ErrorfSkipFrames(skip int, format string, a ...interface{}) error {
 	return fmt.Errorf(getPrefix(defaultSkip+skip, errorPrefixFormat)+format, a...)
 }
 
-// Error is a passthrough to fmt.Error, with an additional prefix
-// containing the filename and line number.
-func Error(a ...interface{}) error {
-	return ErrorSkipFrames(1, a...)
+// UnimplementedWithIssueError is an error that links unimplemented functionality back
+// to its issue on GitHub.
+type UnimplementedWithIssueError struct {
+	issue int
+	msg   string
 }
 
-// ErrorSkipFrames allows the skip count for stack frames to be
-// specified. See the comments for ErrorfSkip.
-func ErrorSkipFrames(skip int, a ...interface{}) error {
-	prefix := getPrefix(defaultSkip+skip, errorPrefixFormat)
-	if prefix != "" {
-		a = append([]interface{}{prefix}, a...)
+func (e UnimplementedWithIssueError) Error() string {
+	var fmtMsg string
+	if e.msg != "" {
+		fmtMsg = fmt.Sprintf(": %s", e.msg)
 	}
-	return fmt.Errorf("%s", fmt.Sprint(a...))
+	return fmt.Sprintf("unimplemented%s (see issue "+
+		"https://github.com/cockroachdb/cockroach/issues/%d)", fmtMsg, e.issue)
+}
+
+// UnimplementedWithIssueErrorf constructs an UnimplementedWithIssueError with the
+// provided issue and formatted message.
+func UnimplementedWithIssueErrorf(issue int, msg string, args ...interface{}) error {
+	return UnimplementedWithIssueError{
+		issue: issue,
+		msg:   fmt.Sprintf(msg, args...),
+	}
 }
